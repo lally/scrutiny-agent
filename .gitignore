@@ -1,0 +1,9 @@
+build/
+build_*/
+CMakeUserPresets.json
+docker/out/
+docker/dist/
+__pycache__/
+.DS_Store
+*.profraw
+compile_commands.json

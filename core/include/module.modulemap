@@ -1,0 +1,5 @@
+module GitReviewCore {
+    header "GitReviewCore.h"
+    header "GitManipBridge.h"
+    export *
+}

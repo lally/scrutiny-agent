@@ -1,0 +1,6 @@
+.git
+build
+build_*
+docker/out
+docker/dist
+CMakeUserPresets.json

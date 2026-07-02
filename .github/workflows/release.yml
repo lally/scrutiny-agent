@@ -1,0 +1,102 @@
+# Tag-labeled releases: pushing a tag `v<version>` builds the portable
+# Linux binaries (debian:11 image -> glibc 2.31 floor, static C++
+# runtime) natively on each architecture's runner, proves each binary
+# over the wire with the conformance suite (built on debian:11, run on
+# the newer-glibc runner -- which also proves portability), and
+# publishes a GitHub Release carrying the binaries + .sha256 sidecars
+# named exactly as the Scrutiny bootstrap expects
+# (scrutiny-agent-<version>-<arch>).
+#
+# workflow_dispatch runs the same build for a chosen version and
+# uploads workflow artifacts, but does not publish a release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      agent_version:
+        description: "Agent version (drives scrutiny-agent-<ver>-<arch>)"
+        default: "0.0.0-test"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.agent_version }}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "building agent version $V for ${{ matrix.arch }}"
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build portable ${{ matrix.arch }} agent (debian:11 image)
+        env:
+          AGENT_VERSION: ${{ steps.ver.outputs.version }}
+          PLATFORMS: ${{ matrix.platform }}
+        run: bash docker/build-agent.sh
+
+      # First-class release gate: the binary built inside the debian:11
+      # (glibc 2.31) image must run on this newer-glibc runner and pass
+      # the full wire conformance suite, including the version check
+      # against the tag and the .sha256 sidecar hash-gate.
+      - name: Wire conformance against the release binary
+        env:
+          AGENT_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          BIN="docker/dist/scrutiny-agent-${AGENT_VERSION}-${{ matrix.arch }}"
+          test -x "$BIN"
+          git --version && python3 --version
+          python3 tests/conformance/conformance.py "$BIN" \
+            --agent-version "$AGENT_VERSION"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrutiny-agent-${{ matrix.arch }}
+          path: docker/dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "scrutiny-agent $GITHUB_REF_NAME" \
+            --generate-notes
