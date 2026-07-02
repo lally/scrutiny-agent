@@ -1,0 +1,69 @@
+# Build + test on every push/PR, natively on both release architectures.
+#
+# This is the fast correctness gate: host toolchain (clang/libstdc++ on
+# the runner), unit tests (gitmanip GTest + core indexer), and the wire
+# conformance suite against the freshly built agent. The portable
+# (debian:11 / glibc 2.31 floor) release binaries are built by
+# release.yml with the docker/ image instead.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build python3 git libsqlite3-dev
+          pipx install "conan>=2,<3"
+          conan --version && cmake --version && clang --version | head -1
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ matrix.arch }}-${{ hashFiles('conanfile.txt') }}
+          restore-keys: conan-${{ matrix.arch }}-
+
+      - name: Conan install
+        run: |
+          conan profile detect --force
+          conan install . --output-folder=build --build=missing \
+            -s build_type=Release -s compiler.cppstd=23
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake
+          cmake --build build -j"$(nproc)"
+
+      - name: Unit tests (gitmanip + core)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Wire conformance suite
+        run: |
+          VER="$(sed -n 's/^project(scrutiny-agent VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          test -n "$VER"
+          python3 tests/conformance/conformance.py \
+            build/agent/scrutiny-agent --agent-version "$VER"

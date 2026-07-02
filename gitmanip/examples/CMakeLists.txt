@@ -1,0 +1,8 @@
+add_executable(basic_example basic_example.cpp)
+target_link_libraries(basic_example PRIVATE gitmanip)
+
+add_executable(rebase_example rebase_example.cpp)
+target_link_libraries(rebase_example PRIVATE gitmanip)
+
+add_executable(interactive_rebase interactive_rebase.cpp)
+target_link_libraries(interactive_rebase PRIVATE gitmanip)
