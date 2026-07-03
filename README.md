@@ -15,6 +15,13 @@ every capability the agent advertises in `meta.hello` must have a
 passing conformance check, and the suite fails if the advertised set
 and the verified set drift apart in either direction.
 
+Besides the request-level API, the agent offers a **raw LSP tunnel**
+(`lsp.tunnel*`): it spawns the language server next to the code and
+pipes LSP bytes verbatim, so any real LSP client can speak its native
+protocol through the multiplexed channel. An Emacs client built on it
+lives in [emacs/](emacs/README.md) — eglot with the server running
+remotely, over a single Teleport/ssh session.
+
 Security posture, briefly (details in the protocol doc):
 
 - **Credentials never land on the agent.** git auth is brokered from
@@ -37,6 +44,7 @@ core/       GitReviewCore: shared C++ core (git bridge, LSP client,
 gitmanip/   modern C++23 wrapper over libgit2
 docs/       protocol.md — the normative wire API
 tests/      conformance/ — wire-protocol conformance suite
+emacs/      scrutiny-agent.el + eglot integration over the LSP tunnel
 docker/     portable-binary build image (debian:11, glibc 2.31 floor)
 scripts/    build-host.sh — plain Conan+CMake host build
 ```

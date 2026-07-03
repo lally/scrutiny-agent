@@ -222,6 +222,7 @@ Lane defaultLaneFor(const std::string& method) {
         method == "git.fetch" || method == "git.ensureRepository")
         return Lane::Bulk;                           // long-running / network
     if (method == "cred.selftest") return Lane::Normal;
+    if (method == "lsp.tunnelOpen") return Lane::Normal;  // server spawn
     return Lane::Interactive;  // incl. cred.provide (must unblock git fast)
 }
 
@@ -261,6 +262,35 @@ std::string base64Encode(const std::string& in) {
         out.push_back(T[(n >> 12) & 63]);
         out.push_back(two ? T[(n >> 6) & 63] : '=');
         out.push_back('=');
+    }
+    return out;
+}
+
+// Base64 decode (for lsp.tunnelSend payloads). Returns nullopt on any
+// malformed input -- the caller drops the frame rather than writing
+// corrupted bytes into a language server's stdin.
+std::optional<std::string> base64Decode(const std::string& in) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    std::string out;
+    out.reserve((in.size() / 4) * 3);
+    int buf = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\n' || c == '\r') continue;
+        int v = val(c);
+        if (v < 0) return std::nullopt;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
     }
     return out;
 }
@@ -370,9 +400,18 @@ public:
     void enqueue(Lane lane, std::string payload) {
         {
             std::lock_guard<std::mutex> l(m_);
+            bytes_.fetch_add(payload.size(), std::memory_order_relaxed);
             q_[static_cast<int>(lane)].push_back(std::move(payload));
         }
         cv_.notify_one();
+    }
+
+    // Bytes currently queued (all lanes). The LSP tunnel readers use
+    // this as a back-pressure signal: they stop pulling from a chatty
+    // language server while the transport is behind, which propagates
+    // to the server's stdout pipe -- bounded memory end to end.
+    size_t queuedBytes() const {
+        return bytes_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -399,6 +438,7 @@ private:
                         break;
                     }
                 }
+                bytes_.fetch_sub(frame.size(), std::memory_order_relaxed);
             }
             std::string header =
                 "Content-Length: " + std::to_string(frame.size()) + "\r\n\r\n";
@@ -415,6 +455,7 @@ private:
     std::mutex m_;
     std::condition_variable cv_;
     std::array<std::deque<std::string>, kLaneCount> q_;
+    std::atomic<size_t> bytes_{0};
     bool stop_ = false;
     std::thread thread_;
 };
@@ -576,6 +617,9 @@ void handleHello(const Responder& rsp, const json& params) {
                                                   "lsp.documentSymbols",
                                                   "lsp.workspaceSymbols",
                                                   "lsp.foldingRange",
+                                                  "lsp.tunnelOpen",
+                                                  "lsp.tunnelSend",
+                                                  "lsp.tunnelClose",
                                                   "meta.debug",
                                                   "meta.stat",
                                                   "meta.capabilities",
@@ -1577,6 +1621,340 @@ void handleLspFoldingRange(const Responder& rsp, const json& p) {
     rsp.result(json{{"ranges", arr}});
 }
 
+// ---- LSP tunnel (Phase 6 envelope) ------------------------------------
+//
+// Raw LSP passthrough. `lsp.tunnelOpen` spawns the language server for
+// a (workspacePath, language) with cwd = workspacePath; after that the
+// agent is a dumb byte pipe. `lsp.tunnelSend` notifications carry
+// base64 client->server bytes; the agent emits `lsp.tunnelRecv`
+// notifications (base64, <= 32 KiB per frame) for server->client bytes
+// and `lsp.tunnelClosed` when the server exits. The agent does NOT
+// parse or reframe LSP messages -- framing is the endpoints' contract
+// -- which is what lets a real LSP client (eglot, the Mac's LSPClient)
+// speak its native protocol through the multiplexed channel, with the
+// server running next to the code.
+//
+// Byte ORDER is guaranteed by construction: sends are enqueued by the
+// single reader thread in arrival order and drained by one
+// stdin-writer thread per tunnel; receives are produced by one
+// stdout-reader thread per tunnel and serialized by the single frame
+// writer. Back-pressure is end-to-end and bounded on both directions:
+// the stdout reader stops pulling from the server while the frame
+// writer is behind (kTunnelWriterHighWater), which backs up into the
+// server's stdout pipe; the outbound queue blocks the agent's reader
+// thread past kTunnelOutqMax (the client's own send discipline is the
+// real bound there).
+//
+// This intentionally coexists with the request-level lsp.* methods:
+// those serve clients that want six canned queries with agent-side
+// sessions; the tunnel serves clients that already speak LSP.
+
+constexpr size_t kTunnelChunk = 32 * 1024;
+constexpr size_t kTunnelWriterHighWater = 4 * 1024 * 1024;
+constexpr size_t kTunnelOutqMax = 8 * 1024 * 1024;
+
+struct Tunnel {
+    std::string id;
+    pid_t pid = -1;
+    int stdinFd = -1;
+    int stdoutFd = -1;
+    std::thread stdinWriter;
+    std::thread stdoutReader;
+    std::atomic<bool> closing{false};
+    std::atomic<bool> reaped{false};       // waitpid done (pid invalid)
+    std::atomic<bool> stdinDone{false};
+    std::atomic<bool> stdoutDone{false};
+    // Outbound (client -> server) byte queue, reader-thread order.
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> outq;
+    size_t outqBytes = 0;
+};
+
+std::mutex g_tunMu;
+std::map<std::string, std::shared_ptr<Tunnel>> g_tunnels;
+// Closed tunnels whose threads have not been joined yet. Joined
+// opportunistically once both threads flag done, and exhaustively at
+// shutdown (after SIGKILL guarantees prompt thread exit).
+std::vector<std::shared_ptr<Tunnel>> g_tunnelGraveyard;
+std::atomic<unsigned long> g_tunSeq{0};
+
+void tunnelStdinLoop(std::shared_ptr<Tunnel> t) {
+    while (true) {
+        std::string chunk;
+        {
+            std::unique_lock<std::mutex> l(t->mu);
+            t->cv.wait(l, [&] { return t->closing.load() || !t->outq.empty(); });
+            if (t->outq.empty()) break;  // closing and drained
+            chunk = std::move(t->outq.front());
+            t->outq.pop_front();
+            t->outqBytes -= chunk.size();
+        }
+        t->cv.notify_all();  // unblock a reader waiting on outqBytes
+        size_t off = 0;
+        bool failed = false;
+        while (off < chunk.size()) {
+            ssize_t w = ::write(t->stdinFd, chunk.data() + off,
+                                chunk.size() - off);
+            if (w <= 0) { failed = true; break; }
+            off += static_cast<size_t>(w);
+        }
+        if (failed) break;  // server stdin gone; reader will see EOF too
+    }
+    ::close(t->stdinFd);
+    t->stdinDone.store(true);
+}
+
+void tunnelStdoutLoop(std::shared_ptr<Tunnel> t) {
+    std::vector<char> buf(kTunnelChunk);
+    while (true) {
+        // Back-pressure: don't pull from a chatty server while the
+        // transport is behind.
+        while (g_writer.queuedBytes() > kTunnelWriterHighWater &&
+               !t->closing.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        ssize_t n = ::read(t->stdoutFd, buf.data(), buf.size());
+        if (n <= 0) break;
+        json note = {{"jsonrpc", "2.0"},
+                     {"method", "lsp.tunnelRecv"},
+                     {"params",
+                      {{"tunnelId", t->id},
+                       {"data", base64Encode(std::string(buf.data(),
+                                             static_cast<size_t>(n)))}}}};
+        g_writer.enqueue(Lane::Interactive, dumpSafe(note));
+    }
+    ::close(t->stdoutFd);
+    int status = 0;
+    int exitCode = -1;
+    std::string reason = "exit";
+    if (::waitpid(t->pid, &status, 0) == t->pid) {
+        if (WIFEXITED(status)) {
+            exitCode = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            exitCode = 128 + WTERMSIG(status);
+            reason = "signal " + std::to_string(WTERMSIG(status));
+        }
+    }
+    t->reaped.store(true);
+    json note = {{"jsonrpc", "2.0"},
+                 {"method", "lsp.tunnelClosed"},
+                 {"params", {{"tunnelId", t->id},
+                             {"exitCode", exitCode},
+                             {"reason", reason}}}};
+    g_writer.enqueue(Lane::Interactive, dumpSafe(note));
+    if (logOn(LogLevel::Info))
+        logWrite(LogLevel::Info, "lsp.tunnelClosed id=" + t->id +
+                 " exit=" + std::to_string(exitCode));
+    t->stdoutDone.store(true);
+}
+
+// Join and drop graveyard tunnels whose threads have both finished.
+// Caller holds g_tunMu.
+void reapTunnelGraveyardLocked() {
+    auto it = g_tunnelGraveyard.begin();
+    while (it != g_tunnelGraveyard.end()) {
+        auto& t = *it;
+        if (t->stdinDone.load() && t->stdoutDone.load()) {
+            if (t->stdinWriter.joinable()) t->stdinWriter.join();
+            if (t->stdoutReader.joinable()) t->stdoutReader.join();
+            it = g_tunnelGraveyard.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// lsp.tunnelOpen { workspacePath, language } -> { tunnelId, serverPath }
+void handleTunnelOpen(const Responder& rsp, const json& p) {
+    std::string ws;
+    if (!reqStr(rsp, p, "workspacePath", "lsp.tunnelOpen", ws)) return;
+    auto lit = p.find("language");
+    if (lit == p.end() || !lit->is_number_integer()) {
+        rsp.error(kInvalidRequest,
+                  "lsp.tunnelOpen requires int param 'language'");
+        return;
+    }
+    const int32_t lang = lit->get<int32_t>();
+    char* sp = grc_language_server_path(static_cast<GRCLanguage>(lang));
+    if (sp == nullptr) {
+        rsp.error(kLspFailed,
+                  "no language server known for language " +
+                      std::to_string(lang));
+        return;
+    }
+    std::string serverPath(sp);
+    grc_free_string(sp);
+    // grc_language_server_path returns an absolute path when the binary
+    // was actually found, and the bare name as a last resort. Only an
+    // executable absolute path is spawnable.
+    if (serverPath.find('/') == std::string::npos ||
+        ::access(serverPath.c_str(), X_OK) != 0) {
+        rsp.error(kLspFailed,
+                  "language server not installed: " + serverPath);
+        return;
+    }
+    // Per-server args, mirroring LSPClient::getServerConfig.
+    std::vector<std::string> args;
+    if (lang == GRC_LANG_TYPESCRIPT || lang == GRC_LANG_JAVASCRIPT)
+        args.push_back("--stdio");
+
+    // in[1] -> parent writes; out[0] -> parent reads. All parent-held
+    // ends are CLOEXEC immediately so concurrently forked children
+    // (git, askpass) can't hold a tunnel pipe open past our close.
+    int inPipe[2] = {-1, -1}, outPipe[2] = {-1, -1};
+    if (::pipe(inPipe) != 0 || ::pipe(outPipe) != 0) {
+        rsp.error(kInternal, "pipe() failed: " +
+                                 std::string(std::strerror(errno)));
+        return;
+    }
+    for (int fd : {inPipe[0], inPipe[1], outPipe[0], outPipe[1]})
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        for (int fd : {inPipe[0], inPipe[1], outPipe[0], outPipe[1]})
+            ::close(fd);
+        rsp.error(kInternal, "fork() failed: " +
+                                 std::string(std::strerror(errno)));
+        return;
+    }
+    if (pid == 0) {
+        // Child: stdio onto the pipes (dup2 clears CLOEXEC), stderr
+        // inherited (surfaces in the transport's stderr channel), cwd
+        // at the workspace.
+        ::dup2(inPipe[0], STDIN_FILENO);
+        ::dup2(outPipe[1], STDOUT_FILENO);
+        if (::chdir(ws.c_str()) != 0) _exit(126);
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(serverPath.c_str()));
+        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execv(serverPath.c_str(), argv.data());
+        _exit(127);
+    }
+    ::close(inPipe[0]);
+    ::close(outPipe[1]);
+
+    const std::string id = "t-" + std::to_string(g_tunSeq.fetch_add(1) + 1);
+    auto t = std::make_shared<Tunnel>();
+    t->id = id;
+    t->pid = pid;
+    t->stdinFd = inPipe[1];
+    t->stdoutFd = outPipe[0];
+    t->stdinWriter = std::thread(tunnelStdinLoop, t);
+    t->stdoutReader = std::thread(tunnelStdoutLoop, t);
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        g_tunnels.emplace(id, t);
+        reapTunnelGraveyardLocked();
+    }
+    if (logOn(LogLevel::Info))
+        logWrite(LogLevel::Info, "lsp.tunnelOpen id=" + id + " server='" +
+                 serverPath + "' ws='" + ws + "' pid=" +
+                 std::to_string(pid));
+    rsp.result(json{{"tunnelId", id}, {"serverPath", serverPath}});
+}
+
+// Client -> server bytes. Notification, handled on the reader thread:
+// arrival order IS the byte order. Unknown/closed tunnel -> the frame
+// is dropped and a lsp.tunnelClosed notification (re-)tells the client.
+void tunnelSend(const json& p) {
+    auto idIt = p.find("tunnelId");
+    auto dIt = p.find("data");
+    if (idIt == p.end() || !idIt->is_string() || dIt == p.end() ||
+        !dIt->is_string())
+        return;
+    const std::string id = idIt->get<std::string>();
+    std::shared_ptr<Tunnel> t;
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        auto it = g_tunnels.find(id);
+        if (it != g_tunnels.end()) t = it->second;
+    }
+    if (!t || t->closing.load()) {
+        json note = {{"jsonrpc", "2.0"},
+                     {"method", "lsp.tunnelClosed"},
+                     {"params", {{"tunnelId", id},
+                                 {"exitCode", nullptr},
+                                 {"reason", "unknown tunnel"}}}};
+        g_writer.enqueue(Lane::Interactive, dumpSafe(note));
+        return;
+    }
+    auto bytes = base64Decode(dIt->get<std::string>());
+    if (!bytes) {
+        if (logOn(LogLevel::Warn))
+            logWrite(LogLevel::Warn,
+                     "lsp.tunnelSend id=" + id + " invalid base64; dropped");
+        return;
+    }
+    {
+        std::unique_lock<std::mutex> l(t->mu);
+        // Bounded queue. Blocking the reader thread here is deliberate:
+        // it back-pressures the whole connection rather than letting a
+        // runaway client balloon agent memory.
+        t->cv.wait(l, [&] {
+            return t->closing.load() || t->outqBytes < kTunnelOutqMax;
+        });
+        if (t->closing.load()) return;
+        t->outqBytes += bytes->size();
+        t->outq.push_back(std::move(*bytes));
+    }
+    t->cv.notify_all();
+}
+
+// Shared by the lsp.tunnelClose request and shutdown. SIGTERM +
+// stdin-close is the polite path (LSP servers exit on stdin EOF);
+// `force` (shutdown) sends SIGKILL so joins are bounded.
+void closeTunnel(const std::string& id, bool force) {
+    std::shared_ptr<Tunnel> t;
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        auto it = g_tunnels.find(id);
+        if (it == g_tunnels.end()) return;
+        t = it->second;
+        g_tunnels.erase(it);
+        g_tunnelGraveyard.push_back(t);
+        reapTunnelGraveyardLocked();
+    }
+    t->closing.store(true);
+    t->cv.notify_all();
+    if (!t->reaped.load()) ::kill(t->pid, force ? SIGKILL : SIGTERM);
+    if (logOn(LogLevel::Info))
+        logWrite(LogLevel::Info, "lsp.tunnelClose id=" + id +
+                 (force ? " (forced)" : ""));
+}
+
+// lsp.tunnelClose { tunnelId } -> { ok } (idempotent)
+void handleTunnelClose(const Responder& rsp, const json& p) {
+    std::string id;
+    if (!reqStr(rsp, p, "tunnelId", "lsp.tunnelClose", id)) return;
+    closeTunnel(id, false);
+    rsp.result(json{{"ok", true}});
+}
+
+// Shutdown: SIGKILL every live server so both per-tunnel threads exit
+// promptly, then join everything. Runs after the worker pool has
+// drained and before the writer stops (the stdout readers enqueue
+// their final lsp.tunnelClosed frames).
+void shutdownTunnels() {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        for (auto& kv : g_tunnels) ids.push_back(kv.first);
+    }
+    for (const auto& id : ids) closeTunnel(id, true);
+    std::lock_guard<std::mutex> g(g_tunMu);
+    for (auto& t : g_tunnelGraveyard) {
+        if (!t->reaped.load()) ::kill(t->pid, SIGKILL);
+        t->closing.store(true);
+        t->cv.notify_all();
+        if (t->stdinWriter.joinable()) t->stdinWriter.join();
+        if (t->stdoutReader.joinable()) t->stdoutReader.join();
+    }
+    g_tunnelGraveyard.clear();
+}
+
 // ---- Workspace indexer (grc_indexer_*) -------------------------------
 //
 // Maps the Mac's BackendIndexer (runAsync + cancel) onto the agent. The
@@ -2312,11 +2690,17 @@ void handleMetaStat(const Responder& rsp, const json&) {
         std::lock_guard<std::mutex> g(g_lspMu);
         sessions = g_lspSessions.size();
     }
+    size_t tunnels;
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        tunnels = g_tunnels.size();
+    }
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - g_startTime).count();
     rsp.result(json{
         {"lanes", queueStat()},
         {"lspSessions", static_cast<int>(sessions)},
+        {"lspTunnels", static_cast<int>(tunnels)},
         {"uptimeMs", static_cast<long long>(ms)},
         {"gitParallel", !g_serializeGit.load(std::memory_order_relaxed)},
         {"logLevel", logLevelName(g_logLevel.load(std::memory_order_relaxed))},
@@ -2484,6 +2868,10 @@ void dispatch(const std::string& method, const Responder& rsp, const json& param
         handleLspWorkspaceSymbols(rsp, params);
     } else if (method == "lsp.foldingRange") {
         handleLspFoldingRange(rsp, params);
+    } else if (method == "lsp.tunnelOpen") {
+        handleTunnelOpen(rsp, params);
+    } else if (method == "lsp.tunnelClose") {
+        handleTunnelClose(rsp, params);
     } else if (method == "meta.debug") {
         handleDebug(rsp, params);
     } else if (method == "meta.stat") {
@@ -2709,6 +3097,10 @@ void handleIncoming(const std::string& frameBody) {
                 p->at("watchId").is_string()) {
                 stopWatch(p->at("watchId").get<std::string>());
             }
+        } else if (m == "lsp.tunnelSend") {
+            if (auto p = msg.find("params"); p != msg.end()) {
+                tunnelSend(*p);
+            }
         }
         return;  // other notifications ignored
     }
@@ -2893,6 +3285,9 @@ int main(int argc, char** argv) {
         }
         for (const auto& id : ids) stopWatch(id);
     }
+    // Kill + join every LSP tunnel (their reader threads enqueue final
+    // lsp.tunnelClosed frames, so this must precede the writer stop).
+    shutdownTunnels();
     g_writer.stop();
     return 0;
 }
