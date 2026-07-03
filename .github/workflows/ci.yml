@@ -38,6 +38,25 @@ jobs:
           pipx install "conan>=2,<3"
           conan --version && cmake --version && clang --version | head -1
 
+      # The unit tests exercise real behavior, so the runner needs a
+      # real environment: gitmanip's rebase/tag/commit-builder paths use
+      # libgit2's git_signature_default (reads user.name/user.email from
+      # git config), and the core indexer tests drive actual language
+      # servers over LSP (clangd for C++, pylsp for Python,
+      # rust-analyzer for Rust).
+      - name: Provision test environment
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+          sudo apt-get install -y --no-install-recommends clangd python3-pylsp
+          if command -v rustup >/dev/null 2>&1; then
+            rustup component add rust-analyzer || true
+          fi
+          if ! command -v rust-analyzer >/dev/null 2>&1; then
+            sudo apt-get install -y --no-install-recommends rust-analyzer cargo
+          fi
+          command -v clangd && command -v pylsp && command -v rust-analyzer
+
       - name: Cache Conan packages
         uses: actions/cache@v4
         with:
