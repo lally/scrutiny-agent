@@ -143,7 +143,7 @@ absolute; relative cache/install paths anchor under `$HOME`.
 | --- | --- | --- |
 | `meta.hello` | `clientVersion`, `supportedProtocolVersions[]`, `frameCap?` | `{ agentVersion, protocolVersion, frameCap, capabilities[] }` |
 | `meta.debug` | `sleepMs?`, `padBytes?` | `{ echoId, pad }` — diagnostics: sleeps (cancellable), pads the result to exercise chunking |
-| `meta.stat` | — | `{ lanes: {interactive,normal,bulk}, lspSessions, uptimeMs, gitParallel, logLevel, agentVersion }` |
+| `meta.stat` | — | `{ lanes: {interactive,normal,bulk}, lspSessions, lspTunnels, uptimeMs, gitParallel, logLevel, agentVersion }` |
 | `meta.capabilities` | — | `{ agentVersion, protocolVersion, outboundIO[], fileSystemAccess{}, languageServers{}, network, selftestMethod }` — the agent's security/IO posture |
 | `logs.tail` | `maxBytes?` (≤ 1 MiB) | `{ enabled, path?, level?, bytes?, text? }` — tail of the `--log` file; `{ enabled: false }` when logging is off |
 
@@ -185,12 +185,18 @@ lines: [{ origin (1-char), content, oldLineNo, newLineNo }] }] }`.
 | `fs.listDirectory` | `path` | `{ path (canonical absolute), entries: [{ name, isDir }] }` sorted by name; symlinks followed for `isDir` |
 | `fs.selftest` | — | `{ probe, succeeded, errorCode, firstBytesReadable, sampleSnippet }` — runtime sandbox probe of /etc/passwd |
 
-### lsp.*
+### lsp.* (request-level queries)
 
-Common params: `workspacePath`, `language` (GRCLanguage int),
-`filePath`, `fileContent`; positional methods add `line`, `character`.
-One language-server session per (workspace, language), spawned lazily;
-if no server binary is installed the call fails `LSP_FAILED`.
+Common params: `workspacePath`, `language` (int, see the language
+table below), `filePath`, `fileContent`; positional methods add
+`line`, `character`. One language-server session per (workspace,
+language), spawned lazily; if no server binary is installed the call
+fails `LSP_FAILED`.
+
+Language enum (`GRCLanguage`), used by both the query methods and the
+tunnel: `1` rust (rust-analyzer), `2` python (pylsp), `3` javascript /
+`4` typescript (typescript-language-server --stdio), `5` go (gopls),
+`6` cpp / `7` c (clangd), `8` swift (sourcekit-lsp).
 
 | Method | Extra params | Result |
 | --- | --- | --- |
@@ -200,6 +206,41 @@ if no server binary is installed the call fails `LSP_FAILED`.
 | `lsp.documentSymbols` | — | `{ symbols: [...] }` |
 | `lsp.workspaceSymbols` | `query` (no filePath/fileContent) | `{ symbols: [...] }` |
 | `lsp.foldingRange` | — | `{ ranges: [{ startLine, endLine, hasKind, kind }] }` |
+
+### lsp.tunnel* (raw LSP envelope)
+
+The tunnel is a raw byte pipe to a language server the agent spawns
+next to the code — the agent does **not** parse or reframe LSP
+messages; LSP framing (`Content-Length` etc.) is the contract between
+the two endpoints. This is what lets a real LSP client (eglot, an
+IDE) speak its native protocol through the multiplexed channel while
+the server runs on the remote box. It coexists with the request-level
+`lsp.*` queries above.
+
+| Method | Kind | Params | Result / behavior |
+| --- | --- | --- | --- |
+| `lsp.tunnelOpen` | request | `workspacePath`, `language` | `{ tunnelId, serverPath }` — spawns the server with cwd = workspacePath, stderr inherited. `LSP_FAILED` if no server binary is installed for the language. |
+| `lsp.tunnelSend` | notification | `tunnelId`, `data` (base64) | client → server bytes, written to the server's stdin in notification-arrival order. Invalid base64 is dropped (logged). Unknown/closed tunnelId elicits a `lsp.tunnelClosed { reason: "unknown tunnel" }` notification. |
+| `lsp.tunnelClose` | request | `tunnelId` | `{ ok }` (idempotent). Closes the server's stdin and sends SIGTERM; the server's exit then produces `lsp.tunnelClosed`. |
+
+Agent → client:
+
+- `lsp.tunnelRecv { tunnelId, data }` — server → client bytes, base64,
+  at most 32 KiB of raw bytes per notification, emitted in stream
+  order. The client concatenates decoded chunks and parses LSP framing
+  itself; chunk boundaries are arbitrary (they need not align with LSP
+  messages).
+- `lsp.tunnelClosed { tunnelId, exitCode, reason }` — the server
+  exited (`reason` `"exit"` or `"signal <n>"`; `exitCode` is the wait
+  status, 128+signal for signals, `null`/`"unknown tunnel"` for sends
+  to a nonexistent tunnel).
+
+Byte order is guaranteed in both directions. Back-pressure is bounded
+end-to-end: the agent stops reading a chatty server while the
+transport is behind (which backs up into the server's stdout pipe),
+and the client→server queue is capped at 8 MiB. Clients should split
+large writes into chunks well under the negotiated frame cap (32 KiB
+is the convention).
 
 ### index.*
 
@@ -249,3 +290,5 @@ immutable so there is no invalidation, only mtime-based pruning.
 | `index.progress` | `{ indexerId, filePath, current, total }` | during `index.run` (coalesced ≈ per percent) |
 | `watch.headChanged` | `{ watchId }` | watched HEAD file changed |
 | `cred.request` | `{ authOpId, credId, prompt }` | git prompts during a brokered op |
+| `lsp.tunnelRecv` | `{ tunnelId, data }` | server → client bytes on an open tunnel |
+| `lsp.tunnelClosed` | `{ tunnelId, exitCode, reason }` | tunnel's server exited (or a send targeted an unknown tunnel) |

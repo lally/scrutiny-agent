@@ -757,6 +757,137 @@ def t_lsp_folding_range(ctx):
     _lsp_method(ctx, "lsp.foldingRange", "ranges", with_pos=False)
 
 
+# ---- lsp.tunnel* (raw LSP envelope) -----------------------------------
+def _lsp_frame(payload):
+    body = json.dumps(payload).encode()
+    return b"Content-Length: %d\r\n\r\n" % len(body) + body
+
+
+def _tunnel_stream(ctx, tid):
+    """Decoded server->client byte stream for a tunnel, arrival order."""
+    out = b""
+    for m, p in ctx.a.notifications:
+        if m == "lsp.tunnelRecv" and p.get("tunnelId") == tid:
+            out += base64.b64decode(p["data"])
+    return out
+
+
+def _tunnel_wait_response(ctx, tid, want_id, timeout=45):
+    """Parse LSP frames out of the tunnel stream until a response with
+    id `want_id` appears (or the deadline passes -> None)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        buf = _tunnel_stream(ctx, tid)
+        while True:
+            hdr_end = buf.find(b"\r\n\r\n")
+            if hdr_end < 0:
+                break
+            n = 0
+            for line in buf[:hdr_end].split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    n = int(line.split(b":", 1)[1].strip())
+            if len(buf) < hdr_end + 4 + n:
+                break
+            body = buf[hdr_end + 4:hdr_end + 4 + n]
+            buf = buf[hdr_end + 4 + n:]
+            try:
+                msg = json.loads(body)
+            except ValueError:
+                continue
+            if msg.get("id") == want_id and "method" not in msg:
+                return msg
+        time.sleep(0.1)
+    return None
+
+
+@conformance("lsp.tunnelOpen", "lsp.tunnelSend", "lsp.tunnelClose")
+def t_lsp_tunnel(ctx):
+    ws = ctx.fx.tempdir("conf-tunws-")
+    check(ctx.a.call_error("lsp.tunnelOpen",
+                           {"language": 2}).code == INVALID_REQUEST,
+          "tunnelOpen missing workspacePath -> INVALID_REQUEST 1002")
+    check(ctx.a.call_error("lsp.tunnelOpen",
+                           {"workspacePath": ws}).code == INVALID_REQUEST,
+          "tunnelOpen missing language -> INVALID_REQUEST 1002")
+    check(ctx.a.call_error("lsp.tunnelOpen",
+                           {"workspacePath": ws,
+                            "language": 99}).code == LSP_FAILED,
+          "tunnelOpen unknown language -> LSP_FAILED 1004")
+    check(ctx.a.call_error("lsp.tunnelClose", {}).code == INVALID_REQUEST,
+          "tunnelClose missing tunnelId -> INVALID_REQUEST 1002")
+
+    # A send to a tunnel that never existed must be safe and tell the
+    # client, so a desynced client can notice.
+    ctx.a.notify("lsp.tunnelSend",
+                 {"tunnelId": "t-never", "data": base64.b64encode(
+                     b"x").decode()})
+    note = ctx.a.wait_notification(
+        "lsp.tunnelClosed",
+        lambda p: p.get("tunnelId") == "t-never", timeout=10)
+    check(note is not None and note.get("reason") == "unknown tunnel",
+          "send to unknown tunnel -> lsp.tunnelClosed 'unknown tunnel'")
+
+    # Full raw-LSP round trip against whichever real server this host
+    # has (python/swift/rust/cpp); with none installed, every open must
+    # fail with a clean LSP_FAILED -- never a hang or a crash.
+    opened = None
+    for lang in (2, 8, 1, 6):
+        try:
+            r = ctx.a.call("lsp.tunnelOpen",
+                           {"workspacePath": ws, "language": lang},
+                           timeout=30)
+            opened = (lang, r)
+            break
+        except AgentError as e:
+            check(e.code == LSP_FAILED,
+                  "tunnelOpen without server (lang %d) -> LSP_FAILED "
+                  "(got %s)" % (lang, e.code))
+    if opened is None:
+        print("  [PASS] no language server on this host; "
+              "clean-failure path verified")
+        return
+
+    lang, r = opened
+    tid = r.get("tunnelId")
+    check(isinstance(tid, str) and tid, "tunnelOpen returns a tunnelId")
+    check(isinstance(r.get("serverPath"), str) and
+          r["serverPath"].startswith("/"),
+          "tunnelOpen reports the spawned server's absolute path")
+
+    init = _lsp_frame({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"processId": None,
+                                  "rootUri": "file://" + ws,
+                                  "capabilities": {}}})
+    # Split the frame at an arbitrary byte boundary: chunk boundaries
+    # are explicitly NOT message boundaries, and order must hold.
+    cut = len(init) // 2
+    for part in (init[:cut], init[cut:]):
+        ctx.a.notify("lsp.tunnelSend",
+                     {"tunnelId": tid,
+                      "data": base64.b64encode(part).decode()})
+    rsp = _tunnel_wait_response(ctx, tid, 1, timeout=45)
+    check(rsp is not None,
+          "raw LSP initialize round-trips through the tunnel (lang %d)"
+          % lang)
+    if rsp is not None:
+        check(isinstance(rsp.get("result", {}).get("capabilities"), dict),
+              "initialize response carries server capabilities")
+
+    st = ctx.a.call("meta.stat", {})
+    check(st.get("lspTunnels", 0) >= 1, "meta.stat counts the open tunnel")
+
+    check(ctx.a.call("lsp.tunnelClose",
+                     {"tunnelId": tid}).get("ok") is True,
+          "tunnelClose -> ok")
+    closed = ctx.a.wait_notification(
+        "lsp.tunnelClosed", lambda p: p.get("tunnelId") == tid, timeout=15)
+    check(closed is not None,
+          "server exit after close -> lsp.tunnelClosed")
+    check(ctx.a.call("lsp.tunnelClose",
+                     {"tunnelId": tid}).get("ok") is True,
+          "tunnelClose is idempotent")
+
+
 # ---- index.* ---------------------------------------------------------
 @conformance("index.create")
 def t_index_create(ctx):

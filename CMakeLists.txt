@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(scrutiny-agent VERSION 0.1.0 LANGUAGES CXX)
+project(scrutiny-agent VERSION 0.2.0 LANGUAGES CXX)
 
 # gitmanip requires C++23; the whole tree builds with one standard so
 # every target and every Conan dependency share a single ABI.

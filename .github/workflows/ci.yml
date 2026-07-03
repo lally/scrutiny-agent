@@ -48,7 +48,8 @@ jobs:
         run: |
           git config --global user.name "CI"
           git config --global user.email "ci@example.com"
-          sudo apt-get install -y --no-install-recommends clangd python3-pylsp
+          sudo apt-get install -y --no-install-recommends \
+            clangd python3-pylsp emacs-nox
           if command -v rustup >/dev/null 2>&1; then
             rustup component add rust-analyzer || true
           fi
@@ -86,3 +87,18 @@ jobs:
           test -n "$VER"
           python3 tests/conformance/conformance.py \
             build/agent/scrutiny-agent --agent-version "$VER"
+
+      # Emacs client: byte-compile as a lint, then the ERT suite. The
+      # integration test does the REAL bootstrap over a local `sh`
+      # transport against the binary built above (base64 streaming,
+      # sha256 gate, exec, handshake, chunk reassembly, and a raw-LSP
+      # tunnel round trip against pylsp).
+      - name: Emacs client (byte-compile + ERT)
+        run: |
+          emacs --version | head -1
+          emacs -Q --batch -L emacs -f batch-byte-compile \
+            emacs/scrutiny-agent.el emacs/scrutiny-agent-eglot.el
+          rm -f emacs/*.elc
+          SCRUTINY_AGENT_BIN="$PWD/build/agent/scrutiny-agent" \
+            emacs -Q --batch -L emacs -l emacs/scrutiny-agent-tests.el \
+            -f ert-run-tests-batch-and-exit
