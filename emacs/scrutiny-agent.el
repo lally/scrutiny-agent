@@ -3,7 +3,11 @@
 ;; Author: Lally Singh
 ;; URL: https://github.com/lally/scrutiny-agent
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "28.1"))
+;; Package-Requires: ((emacs "29.1"))
+;;
+;; 29.1 is the PACKAGE's floor, because scrutiny-agent-ui.el uses
+;; `defvar-keymap' and scrutiny-agent-eglot.el needs eglot, both 29.1.
+;; This file on its own runs on 28.1.
 ;; Keywords: tools, processes
 
 ;; This file is part of scrutiny-agent (GPLv3).
@@ -60,8 +64,14 @@ integration).  PLIST keys:
                  expression (default \"$HOME/.scrutiny-agent\").
   :agent-args    list of extra agent argv strings, e.g.
                  (\"--allow-root\" \"src\" \"--log\" \"agent.log\").
-  :local-binary  path to a locally built agent binary to stream
-                 instead of downloading a release (development)."
+  :local-binary  a locally built agent binary to stream instead of
+                 downloading a release.  A string uses that file for
+                 this host; an alist keyed by architecture --
+                 ((\"x86_64\" . PATH) (\"aarch64\" . PATH)) -- picks by
+                 the arch probed on the remote.
+  :config        agent config file contents to install on this host,
+                 overriding `scrutiny-agent-default-config'.  Nil
+                 sends none."
   :type '(alist :key-type string :value-type plist))
 
 (defcustom scrutiny-agent-binary-version "0.2.0"
@@ -72,6 +82,29 @@ integration).  PLIST keys:
   "https://github.com/lally/scrutiny-agent/releases/download/v%s/scrutiny-agent-%s-%s"
   "Format for release-asset URLs: version, version, arch."
   :type 'string)
+
+(defcustom scrutiny-agent-download-releases t
+  "Whether to fetch a missing agent binary from the published releases.
+Nil keeps every connection offline: a binary must already be in
+`scrutiny-agent-cache-directory' (put there by
+`scripts/build-agents.sh') or named by `:local-binary'."
+  :type 'boolean)
+
+(defconst scrutiny-agent--source-directory
+  (file-name-directory (or load-file-name buffer-file-name
+                           (locate-library "scrutiny-agent") ""))
+  "Directory this file was loaded from.
+Captured at load time: a released package ships the agent binaries in
+a `bin/' subdirectory beside the Lisp, and that is where an installed
+package finds them without any network.")
+
+(defcustom scrutiny-agent-bundled-binary-directory
+  (and scrutiny-agent--source-directory
+       (expand-file-name "bin" scrutiny-agent--source-directory))
+  "Directory holding agent binaries shipped with this package.
+Searched before `scrutiny-agent-cache-directory', so a package
+installed from a release connects offline on the first try."
+  :type '(choice (const :tag "None" nil) directory))
 
 (defcustom scrutiny-agent-cache-directory
   (expand-file-name "scrutiny-agent" user-emacs-directory)
@@ -85,6 +118,15 @@ Called with the git prompt string (e.g. \"Password for ...\"); its
 return value is sent back via `cred.provide'.  Returning an empty
 string fails the underlying git operation."
   :type 'function)
+
+(defvar scrutiny-agent-notification-functions nil
+  "Abnormal hook run for every agent notification this client receives.
+Each function is called with (CONN METHOD PARAMS).  The client
+handles `rpc.chunk', `cred.request' and the `lsp.tunnel*' family
+itself; those are dispatched first and are not offered here.  The
+remaining ones -- `watch.headChanged', `index.progress' -- are how
+the agent tells a client that remote state moved, so a UI can react
+instead of polling.")
 
 (defconst scrutiny-agent-protocol-version 1)
 (defconst scrutiny-agent--tunnel-chunk (* 32 1024)
@@ -125,6 +167,19 @@ string fails the underlying git operation."
   (let ((body (encode-coding-string (json-serialize payload) 'utf-8)))
     (concat (format "Content-Length: %d\r\n\r\n" (length body)) body)))
 
+(defun scrutiny-agent--header-length (header)
+  "The Content-Length declared in HEADER, or nil if it declares none.
+Matched case-insensitively: the header spelling varies between LSP
+implementations, and rejecting a frame over its capitalization would
+end a session for a cosmetic reason."
+  (let ((lines (split-string header "\r\n"))
+        (found nil))
+    (while (and lines (not found))
+      (when (string-match "^[Cc]ontent-[Ll]ength: *\\([0-9]+\\)" (car lines))
+        (setq found (string-to-number (match-string 1 (car lines)))))
+      (setq lines (cdr lines)))
+    found))
+
 (defun scrutiny-agent--parse-frames (buffer)
   "Extract complete frames from unibyte BUFFER string.
 Return (MESSAGES . REMAINING) where MESSAGES is a list of parsed
@@ -138,13 +193,11 @@ JSON plists in arrival order."
       (while t
         (let ((hdr-end (string-search "\r\n\r\n" buffer)))
           (unless hdr-end (throw 'done nil))
-          (let ((len nil))
-            (dolist (line (split-string (substring buffer 0 hdr-end) "\r\n"))
-              (when (string-match "^[Cc]ontent-[Ll]ength: *\\([0-9]+\\)" line)
-                (setq len (string-to-number (match-string 1 line)))))
+          (let ((len (scrutiny-agent--header-length
+                      (substring buffer 0 hdr-end))))
             (unless len
               ;; A header block without Content-Length is unrecoverable.
-              (error "scrutiny-agent: malformed frame header %S"
+              (error "Scrutiny-agent: malformed frame header %S"
                      (substring buffer 0 hdr-end)))
             (when (< (length buffer) (+ hdr-end 4 len))
               (throw 'done nil))
@@ -212,7 +265,16 @@ JSON-RPC envelope they carry, parsed as a plist."
          (scrutiny-agent--on-tunnel-recv conn (plist-get msg :params)))
         ("lsp.tunnelClosed"
          (scrutiny-agent--on-tunnel-closed conn (plist-get msg :params)))
-        (_ (scrutiny-agent--log conn "notification %s (ignored)" method))))
+        (_
+         (scrutiny-agent--log conn "notification %s %S" method
+                              (plist-get msg :params))
+         ;; A handler that errors must not take down the reader.
+         (condition-case err
+             (run-hook-with-args 'scrutiny-agent-notification-functions
+                                 conn method (plist-get msg :params))
+           (error (scrutiny-agent--log
+                   conn "notification handler for %s failed: %S"
+                   method err))))))
      ;; Response.
      (id
       (let* ((result (plist-get msg :result))
@@ -242,8 +304,13 @@ JSON-RPC envelope they carry, parsed as a plist."
   (scrutiny-agent--send conn (list :jsonrpc "2.0" :method method
                                    :params params)))
 
-(cl-defun scrutiny-agent-async-request (conn method params &key callback)
-  "Send request METHOD; CALLBACK gets (RESULT ERR).  Returns the id."
+(defun scrutiny-agent-async-request (conn method params &optional callback)
+  "Send request METHOD; CALLBACK gets (RESULT ERR).  Returns the id.
+
+Plain `&optional' rather than a `cl-defun' keyword: Elsa cannot read
+a `cl-defun' arglist, so every call to one is reported as a function
+of unknown signature -- which was the single largest source of noise
+in this package."
   (let ((id (cl-incf (scrutiny-agent--conn-next-id conn))))
     (puthash id (or callback #'ignore)
              (scrutiny-agent--conn-pending conn))
@@ -251,29 +318,31 @@ JSON-RPC envelope they carry, parsed as a plist."
                                      :params params))
     id))
 
-(cl-defun scrutiny-agent-request (conn method params &key (timeout 30))
+(defun scrutiny-agent-request (conn method params &optional timeout)
   "Send request METHOD with PARAMS and block for the result.
+TIMEOUT is in seconds, defaulting to 30.
 Signals `scrutiny-agent-rpc-error' with (CODE MESSAGE) on an error
 response, or a plain error on timeout/disconnect."
   (let* ((done nil) (res nil) (err nil)
+         (timeout (or timeout 30))
          (proc (scrutiny-agent--conn-process conn)))
     (scrutiny-agent-async-request
      conn method params
-     :callback (lambda (r e) (setq res r err e done t)))
+     (lambda (r e) (setq res r err e done t)))
     (let ((deadline (+ (float-time) timeout)))
       (while (and (not done) (process-live-p proc))
         (when (> (float-time) deadline)
-          (error "scrutiny-agent: timeout (%ss) waiting for %s"
+          (error "Scrutiny-agent: timeout (%ss) waiting for %s"
                  timeout method))
         (accept-process-output proc 0.05)))
     (unless done
-      (error "scrutiny-agent: connection died during %s" method))
+      (error "Scrutiny-agent: connection died during %s" method))
     (when err
       (signal 'scrutiny-agent-rpc-error
               (list (plist-get err :code) (plist-get err :message))))
     res))
 
-(define-error 'scrutiny-agent-rpc-error "scrutiny-agent RPC error")
+(define-error 'scrutiny-agent-rpc-error "Scrutiny-agent RPC error")
 
 (defun scrutiny-agent-cancel (conn id)
   "Cancel in-flight request ID on CONN (wire-level $/cancelRequest)."
@@ -299,12 +368,83 @@ response, or a plain error on timeout/disconnect."
 ;; atomic-install, exec.  Every phase has a hard deadline and the whole
 ;; pre-exec transcript is kept in the host's log buffer.
 
+(defconst scrutiny-agent-machine-aliases
+  '(("x86_64" . "x86_64") ("amd64" . "x86_64") ("x64" . "x86_64")
+    ("aarch64" . "aarch64") ("arm64" . "aarch64") ("armv8l" . "aarch64"))
+  "`uname -m' spellings mapped to the architecture we name binaries by.
+Different kernels and userlands disagree about what to call the same
+machine -- amd64 and x86_64, arm64 and aarch64 -- so the raw string is
+normalized before anything is selected with it.")
+
+(defun scrutiny-agent--normalize-machine (uname-m)
+  "The canonical architecture for a `uname -m' string, or nil."
+  (cdr (assoc (downcase (or uname-m "")) scrutiny-agent-machine-aliases)))
+
 (defun scrutiny-agent--arch-asset (uname-s uname-m)
-  "Release-asset arch for a remote's (UNAME-S . UNAME-M), or nil."
+  "Release-asset architecture for a remote reporting UNAME-S / UNAME-M.
+
+Nil when no binary is published for that platform; the caller turns
+that into an error naming what was found: `no binary is published
+for this platform\' and `the binary is broken\' need different
+answers."
   (when (string= uname-s "Linux")
-    (pcase uname-m
-      ("x86_64" "x86_64")
-      ((or "aarch64" "arm64") "aarch64"))))
+    (scrutiny-agent--normalize-machine uname-m)))
+
+(defun scrutiny-agent--probe-script ()
+  "Shell command reporting the remote platform.
+
+`uname -s' and `uname -m' only: both are POSIX, and both exist on
+every system that could plausibly run this. Anything richer (`uname
+-o', /etc/os-release, ldd --version) is GNU-specific or absent
+somewhere that matters, and the verification step below establishes
+empirically what a probe could only guess at -- whether the binary
+we picked actually runs there."
+  "echo __SCRA_PROBE__ $(uname -s) $(uname -m)")
+
+(defun scrutiny-agent--verify-script (install-dir binary-name)
+  "Shell command running the installed binary to prove it works.
+
+`--version' is the no-op probe: it execs, exits 0, and prints the
+identity, so one line answers three separate questions -- does the
+file run at all (wrong architecture fails here with ENOEXEC), did
+dynamic linking resolve (a missing libc or libsqlite3 fails here),
+and is this the binary we think it is.
+
+Output is flattened to one line and prefixed with the exit status,
+so the client gets the failure reason rather than a timeout twenty
+seconds later at the handshake."
+  (format (concat "D=\"%s\"; B=\"$D/%s\"; "
+                  "V=$(\"$B\" --version 2>&1); R=$?; "
+                  "echo \"__SCRA_VERIFY__ $R $(echo \"$V\" | tr '\\n' ' ')\"")
+          install-dir binary-name))
+
+(defun scrutiny-agent--parse-verify (line expected-version)
+  "Interpret a `__SCRA_VERIFY__' LINE; nil when the binary is good.
+Returns a human-readable reason when it is not."
+  (let* ((parts (split-string (string-trim line) " " t))
+         (status (string-to-number (or (car parts) "1")))
+         (output (string-join (cdr parts) " ")))
+    (cond
+     ((and (= status 0)
+           (string-prefix-p (format "%s proto " expected-version) output))
+      nil)
+     ;; The shell's own words are more specific than anything inferred
+     ;; from the status: 126 covers both `Permission denied' and `Exec
+     ;; format error' (the wrong-architecture symptom), and 127 covers
+     ;; both a missing file and a missing shared library.
+     ((= status 126)
+      (format "the binary could not be executed there -- wrong \
+architecture, or not executable: %s" output))
+     ((= status 127)
+      (format "the binary could not be loaded -- the file, or a shared \
+library it needs, is missing: %s" output))
+     ((/= status 0)
+      (format "the binary exited %d: %s" status
+              (if (string-empty-p output) "(no output)" output)))
+     (t
+      (format "expected version %s, but the binary reports: %s"
+              expected-version
+              (if (string-empty-p output) "(nothing)" output))))))
 
 (defun scrutiny-agent--bootstrap-script (install-dir binary-name expected-hash)
   "Shell command that reports the install state of BINARY-NAME.
@@ -334,6 +474,83 @@ into a tmp file (the epilogue then hash-gates and installs it)."
                   "else rm -f \"$B.tmp\"; echo \"__SCRA_INST__ $H\"; fi")
           install-dir binary-name expected-hash))
 
+(defcustom scrutiny-agent-default-config
+  "# scrutiny-agent, installed by Emacs.
+#
+# One `key = value' per line; `#' starts a comment. Repeatable keys
+# (allow-root, git-exec) accumulate. Flags on the agent's exec line
+# are applied too, and add to what is here.
+#
+# This file is the policy for THIS host: what the agent may read and
+# write, and which git subcommands it may run. Edit it on the server
+# and the change survives reconnects; the client only rewrites it when
+# its own default changes.
+
+# Filesystem sandbox. Relative paths anchor under $HOME. Nothing
+# outside these is readable or writable, whatever a client asks for.
+allow-root = src
+
+# Let the agent write files, so saving does not fall back to TRAMP.
+# Remove this line for a strictly read-only agent.
+allow-write
+
+# Let magit drive git over the connection. `read-only' restricts this
+# to subcommands that cannot modify a repository.
+git-exec-preset = magit
+
+log-level = info
+"
+  "Default agent config streamed to a host that has none.
+
+Written to `<install-dir>/scrutiny-agent.conf' during bootstrap and
+passed to the agent as `--config'.  Nil sends nothing, leaving the
+host's existing file (or the exec line alone) in charge.
+
+The point of a file rather than more `:agent-args' is that the policy
+then lives on the server: it is reviewable there, it survives
+reconnects, and every client that bootstraps into the same install
+directory agrees about what the agent may touch.
+
+A host's own `:config' overrides this, and `:agent-args' still
+applies on top of whichever file is used."
+  :type '(choice (const :tag "Send nothing" nil) string))
+
+(defcustom scrutiny-agent-config-name "scrutiny-agent.conf"
+  "File name for the agent config inside the remote install directory."
+  :type 'string)
+
+(defun scrutiny-agent--config-script (install-dir config-name expected-hash)
+  "Shell command reporting whether the installed config matches.
+Prints `__SCRA_CFG__ OK' when it does, else `__SCRA_CFG__ <hash>'."
+  (format (concat "D=\"%s\"; C=\"$D/%s\"; "
+                  "if [ -f \"$C\" ]; then "
+                  "H=$( (sha256sum \"$C\" 2>/dev/null || shasum -a 256 \"$C\") "
+                  "| awk '{print $1}'); else H=MISSING; fi; "
+                  "if [ \"$H\" = \"%s\" ]; then echo \"__SCRA_CFG__ OK\"; "
+                  "else echo \"__SCRA_CFG__ $H\"; fi")
+          install-dir config-name expected-hash))
+
+(defun scrutiny-agent--config-install-script (install-dir config-name)
+  "Shell prologue consuming a base64 heredoc into the config file."
+  (format (concat "D=\"%s\"; mkdir -p \"$D\" && "
+                  "base64 -d > \"$D/%s\" <<'__SCRCFG64__'")
+          install-dir config-name))
+
+(defun scrutiny-agent--config-epilogue (install-dir config-name expected-hash)
+  "Shell epilogue verifying the streamed config and reporting the result.
+Also serves as the synchronization point: the exec line must not be
+sent until the shell has finished consuming the heredoc, or it races
+with it."
+  (format (concat "D=\"%s\"; C=\"$D/%s\"; "
+                  "H=$( (sha256sum \"$C\" 2>/dev/null || shasum -a 256 \"$C\") "
+                  "| awk '{print $1}'); "
+                  "if [ \"$H\" = \"%s\" ]; then echo \"__SCRA_CFGDONE__ OK\"; "
+                  "else echo \"__SCRA_CFGDONE__ $H\"; fi")
+          install-dir config-name expected-hash))
+
+(defun scrutiny-agent--string-sha256 (text)
+  (secure-hash 'sha256 (encode-coding-string text 'utf-8)))
+
 (defun scrutiny-agent--file-sha256 (file)
   (with-temp-buffer
     (set-buffer-multibyte nil)
@@ -341,20 +558,81 @@ into a tmp file (the epilogue then hash-gates and installs it)."
     (secure-hash 'sha256 (current-buffer))))
 
 (defun scrutiny-agent--local-binary (host-plist arch)
-  "Path to the agent binary to stream: :local-binary or a cached
-release download for ARCH.  Errors with instructions when neither
-is available."
-  (or (when-let ((local (plist-get host-plist :local-binary)))
-        (expand-file-name local))
+  "Path to the agent binary to stream to a host of architecture ARCH.
+
+Looked for in this order, so a locally built binary always wins over
+the network:
+
+  1. `:local-binary' on the host.  A string is used as-is (one host,
+     one binary).  An alist keyed by architecture -- ((\"x86_64\" . PATH)
+     (\"aarch64\" . PATH)) -- selects by ARCH, which is how one Emacs
+     drives both an x86 server and an ARM one.
+  2. `scrutiny-agent-bundled-binary-directory' -- the `bin/' shipped
+     inside a released package, so an install connects offline.
+  3. `scrutiny-agent-cache-directory', by the release file name.
+     `scripts/build-agents.sh' installs both architectures there.
+  4. The published release for ARCH, downloaded once and cached
+     alongside (3).
+
+Errors with something actionable when none of them produce a file --
+this is the step that fails first on a new machine."
+  (let* ((local (plist-get host-plist :local-binary))
+         (explicit (cond ((stringp local) local)
+                         ((consp local) (cdr (assoc arch local))))))
+    (cond
+     (explicit
+      (let ((path (expand-file-name explicit)))
+        (unless (file-exists-p path)
+          (error "Scrutiny-agent: :local-binary %s does not exist" path))
+        path))
+     (t
       (let* ((ver scrutiny-agent-binary-version)
              (name (format "scrutiny-agent-%s-%s" ver arch))
-             (cached (expand-file-name name scrutiny-agent-cache-directory))
-             (url (format scrutiny-agent-release-url-format ver ver arch)))
-        (unless (file-exists-p cached)
-          (make-directory scrutiny-agent-cache-directory t)
-          (message "scrutiny-agent: downloading %s..." url)
-          (url-copy-file url cached))
-        cached)))
+             (bundled (and scrutiny-agent-bundled-binary-directory
+                           (expand-file-name
+                            name scrutiny-agent-bundled-binary-directory)))
+             (cached (expand-file-name name
+                                       scrutiny-agent-cache-directory)))
+        (cond
+         ((and bundled (file-exists-p bundled)) bundled)
+         ((file-exists-p cached) cached)
+         (scrutiny-agent-download-releases
+          (let ((url (format scrutiny-agent-release-url-format
+                             ver ver arch)))
+            (make-directory scrutiny-agent-cache-directory t)
+            (message "scrutiny-agent: downloading %s..." url)
+            (condition-case err
+                (url-copy-file url cached)
+              (error
+               (error "Scrutiny-agent: no binary for %s.  Build one with \
+scripts/build-agents.sh, or set :local-binary.  (Download of %s failed: %s)"
+                      arch url (error-message-string err))))
+            cached))
+         (t
+          (error "Scrutiny-agent: no local binary for %s.  Expected %s; \
+build it with scripts/build-agents.sh --arch %s"
+                 arch cached
+                 (if (equal arch "aarch64") "arm64" "amd64")))))))))
+
+(defun scrutiny-agent-installed-binaries ()
+  "Alist of (ARCH . PATH) for locally available agent binaries.
+Whatever ships inside the package, plus whatever
+`scripts/build-agents.sh' installed or a connect downloaded.  Earlier
+directories win, matching the lookup order in
+`scrutiny-agent--local-binary'."
+  (let ((prefix (format "scrutiny-agent-%s-" scrutiny-agent-binary-version))
+        found)
+    (dolist (dir (list scrutiny-agent-bundled-binary-directory
+                       scrutiny-agent-cache-directory))
+      (when (and dir (file-directory-p dir))
+        (dolist (file (directory-files dir))
+          (when (and (string-prefix-p prefix file)
+                     (not (string-suffix-p ".sha256" file))
+                     (not (assoc (substring file (length prefix)) found)))
+            (push (cons (substring file (length prefix))
+                        (expand-file-name file dir))
+                  found)))))
+    (nreverse found)))
 
 (defun scrutiny-agent--wait-line (proc state marker timeout)
   "Wait until STATE's transcript contains a line starting with MARKER;
@@ -367,12 +645,56 @@ accumulates raw pre-exec output."
           (when (string-prefix-p marker line)
             (throw 'got (string-trim (substring line (length marker))))))
         (when (> (float-time) deadline)
-          (error "scrutiny-agent bootstrap: timed out waiting for %s; transcript:\n%s"
+          (error "Scrutiny-agent bootstrap: timed out waiting for %s; transcript:\n%s"
                  marker (car state)))
         (unless (process-live-p proc)
-          (error "scrutiny-agent bootstrap: transport died; transcript:\n%s"
+          (error "Scrutiny-agent bootstrap: transport died; transcript:\n%s"
                  (car state)))
         (accept-process-output proc 0.1)))))
+
+(defun scrutiny-agent--install-config (proc state host-plist name install-dir)
+  "Install the agent config on the far end; return its path, or nil.
+
+Nil when the host asked for no config, in which case the exec line
+carries the whole policy.  Hash-gated like the binary: an unchanged
+config costs one echo rather than a transfer, so edits made on the
+server survive reconnects."
+  (let ((config (if (plist-member host-plist :config)
+                    (plist-get host-plist :config)
+                  scrutiny-agent-default-config)))
+    (if (or (null config) (string-empty-p config))
+        nil
+      (let ((chash (scrutiny-agent--string-sha256 config)))
+        (process-send-string
+         proc (concat (scrutiny-agent--config-script
+                       install-dir scrutiny-agent-config-name chash)
+                      "\n"))
+        (unless (string= (scrutiny-agent--wait-line
+                          proc state "__SCRA_CFG__" 30)
+                         "OK")
+          (message "scrutiny-agent[%s]: installing config (%s)..."
+                   name scrutiny-agent-config-name)
+          (process-send-string
+           proc (concat (scrutiny-agent--config-install-script
+                         install-dir scrutiny-agent-config-name)
+                        "\n"))
+          (dolist (chunk (scrutiny-agent--split-bytes
+                          (base64-encode-string
+                           (encode-coding-string config 'utf-8) t)
+                          4096))
+            (process-send-string proc chunk)
+            (process-send-string proc "\n"))
+          (process-send-string proc "__SCRCFG64__\n")
+          (process-send-string
+           proc (concat (scrutiny-agent--config-epilogue
+                         install-dir scrutiny-agent-config-name chash)
+                        "\n"))
+          (let ((done (scrutiny-agent--wait-line
+                       proc state "__SCRA_CFGDONE__" 60)))
+            (unless (string= done "OK")
+              (error "Scrutiny-agent: config install mismatch (got %s)"
+                     done))))
+        (format "%s/%s" install-dir scrutiny-agent-config-name)))))
 
 (defun scrutiny-agent--bootstrap (proc host-plist name)
   "Run the pre-exec bootstrap dialogue on PROC.  Returns when the
@@ -383,16 +705,21 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
     (set-process-filter proc (lambda (_p out)
                                (setcar state (concat (car state) out))))
     ;; 1. Probe OS/arch (marker survives login banners/motd noise).
-    (process-send-string proc "echo __SCRA_PROBE__ $(uname -s) $(uname -m)\n")
+    (process-send-string proc (concat (scrutiny-agent--probe-script) "\n"))
     (let* ((probe (scrutiny-agent--wait-line proc state "__SCRA_PROBE__" 30))
            (parts (split-string probe))
            (uname-s (nth 0 parts)) (uname-m (nth 1 parts))
            (arch (or (scrutiny-agent--arch-asset uname-s uname-m)
-                     (if (and (string= uname-s "Darwin")
-                              (plist-get host-plist :local-binary))
-                         uname-m
-                       (error "scrutiny-agent: no release binary for %s/%s (set :local-binary?)"
-                              uname-s uname-m))))
+                     ;; A local binary can serve a platform we publish
+                     ;; nothing for -- notably a Darwin remote, or an
+                     ;; architecture built by hand.
+                     (and (plist-get host-plist :local-binary)
+                          (or (scrutiny-agent--normalize-machine uname-m)
+                              uname-m))
+                     (error "Scrutiny-agent[%s]: no agent binary for %s/%s.  \
+Supported: Linux on x86_64 or aarch64.  Build one and point :local-binary \
+at it if this platform is expected to work"
+                            name uname-s uname-m)))
            (binary (scrutiny-agent--local-binary host-plist arch))
            (hash (scrutiny-agent--file-sha256 binary))
            (bname (format "scrutiny-agent-%s-%s"
@@ -424,13 +751,63 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
                          install-dir bname hash) "\n"))
           (let ((inst (scrutiny-agent--wait-line proc state "__SCRA_INST__" 120)))
             (unless (string= inst "OK")
-              (error "scrutiny-agent: install hash mismatch (got %s)" inst)))))
-      ;; 4. Exec. The next bytes on the pipe are JSON-RPC frames.
-      (let ((args (mapconcat #'shell-quote-argument
+              (error "Scrutiny-agent: install hash mismatch (got %s)" inst)))))
+      ;; 4. Verify. Run the installed binary before trusting it: this
+      ;; is where a wrong architecture, a failed dynamic link, or a
+      ;; truncated transfer becomes a sentence the user can act on,
+      ;; rather than a twenty-second timeout at the handshake with
+      ;; nothing to show for it. Done on every connect, not just after
+      ;; an install -- it costs one exec and catches a host whose
+      ;; libraries moved under a previously working binary.
+      (process-send-string
+       proc (concat (scrutiny-agent--verify-script install-dir bname) "\n"))
+      (let* ((line (scrutiny-agent--wait-line proc state "__SCRA_VERIFY__" 60))
+             (problem (scrutiny-agent--parse-verify
+                       line scrutiny-agent-binary-version)))
+        (when problem
+          (error "Scrutiny-agent[%s]: the agent binary does not run on \
+%s/%s -- %s.  (Installed as %s/%s from %s.)"
+                 name uname-s uname-m problem install-dir bname binary)))
+
+      ;; 5. Config. Streamed the same way as the binary and gated the
+      ;; same way, so an unchanged config costs one echo rather than a
+      ;; transfer. The policy then lives on the server, where it can be
+      ;; read and edited, instead of only on this client's exec line.
+      ;;
+      ;; The step RETURNS the installed path rather than assigning to an
+      ;; outer variable: a value threaded through `let' is something a
+      ;; reader and a static analyser can both follow, where an
+      ;; assignment made inside a nested `when' is not. Elsa read the
+      ;; old form as leaving `config-path' permanently nil and called
+      ;; the `--config' argument below dead code.
+      ;; 6. Exec, with a handover marker.
+      ;;
+      ;; The marker is not decoration: it closes a race that otherwise
+      ;; loses the handshake intermittently. The shell is reading its
+      ;; script from the same pipe the protocol will use, so anything
+      ;; written before it has consumed the exec line may be swallowed
+      ;; by its read-ahead and never reach the agent -- which then sits
+      ;; waiting on stdin while the client times out on `meta.hello',
+      ;; with the agent's own startup output in the log to prove it
+      ;; started fine.
+      ;;
+      ;; Echoing on the same line means that when the marker appears
+      ;; the shell has read exactly up to that newline and no further.
+      ;; Everything after it is untouched in the pipe, and the agent
+      ;; inherits it across the exec.
+      (let ((config-path (scrutiny-agent--install-config
+                          proc state host-plist name install-dir))
+            (args (mapconcat #'shell-quote-argument
                              (plist-get host-plist :agent-args) " ")))
         (process-send-string
-         proc (format "exec \"%s/%s\" --rpc-stdio %s\n"
-                      install-dir bname args))))
+         proc (format "echo __SCRA_EXEC__; exec \"%s/%s\" --rpc-stdio%s %s\n"
+                      install-dir bname
+                      (if config-path
+                          (format " --config %s"
+                                  (shell-quote-argument config-path))
+                        "")
+                      args))
+        (scrutiny-agent--wait-line proc state "__SCRA_EXEC__" 30)))
     (car state)))
 
 ;; ---------------------------------------------------------------------
@@ -463,36 +840,50 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
                     :connection-type 'pipe
                     :noquery t
                     :stderr stderr-buf)))
-        (when-let ((sp (get-buffer-process stderr-buf)))
-          (set-process-query-on-exit-flag sp nil))
-        (let ((transcript (scrutiny-agent--bootstrap proc plist name))
-              (conn nil))
-          (setq conn (scrutiny-agent--conn-make :name name :process proc))
-          (scrutiny-agent--log conn "bootstrap transcript:\n%s" transcript)
-          (set-process-filter
-           proc (lambda (p out) (scrutiny-agent--filter conn p out)))
-          (set-process-sentinel
-           proc (lambda (p event)
-                  (scrutiny-agent--log conn "transport: %s" (string-trim event))
-                  (unless (process-live-p p)
-                    (scrutiny-agent--on-disconnect conn))))
-          (let ((hello (scrutiny-agent-request
-                        conn "meta.hello"
-                        (list :clientVersion "scrutiny-agent.el"
-                              :supportedProtocolVersions
-                              (vector scrutiny-agent-protocol-version)
-                              :frameCap 131072))))
-            (setf (scrutiny-agent--conn-capabilities conn)
-                  (append (plist-get hello :capabilities) nil)
-                  (scrutiny-agent--conn-agent-version conn)
-                  (plist-get hello :agentVersion)
-                  (scrutiny-agent--conn-frame-cap conn)
-                  (plist-get hello :frameCap)))
-          (puthash name conn scrutiny-agent--connections)
-          (message "scrutiny-agent[%s]: connected (agent %s, %d capabilities)"
-                   name (scrutiny-agent--conn-agent-version conn)
-                   (length (scrutiny-agent--conn-capabilities conn)))
-          conn))))
+        (let ((sp (get-buffer-process stderr-buf)))
+	  (when sp
+	    (set-process-query-on-exit-flag sp nil)))
+        (condition-case err
+            (scrutiny-agent--finish-connect proc plist name)
+          (error
+           ;; A bootstrap that fails must not leave the transport --
+           ;; and whatever it started on the far end -- running. Every
+           ;; failed connect would otherwise leak an ssh, and on a
+           ;; Teleport link those are not cheap.
+           (when (process-live-p proc) (delete-process proc))
+           (remhash name scrutiny-agent--connections)
+           (signal (car err) (cdr err)))))))
+
+(defun scrutiny-agent--finish-connect (proc plist name)
+  "Bootstrap PROC, handshake, and register the connection for NAME."
+  (let ((transcript (scrutiny-agent--bootstrap proc plist name))
+	(conn nil))
+    (setq conn (scrutiny-agent--conn-make :name name :process proc))
+    (scrutiny-agent--log conn "bootstrap transcript:\n%s" transcript)
+    (set-process-filter
+     proc (lambda (p out) (scrutiny-agent--filter conn p out)))
+    (set-process-sentinel
+     proc (lambda (p event)
+            (scrutiny-agent--log conn "transport: %s" (string-trim event))
+            (unless (process-live-p p)
+              (scrutiny-agent--on-disconnect conn))))
+    (let ((hello (scrutiny-agent-request
+                  conn "meta.hello"
+                  (list :clientVersion "scrutiny-agent.el"
+                        :supportedProtocolVersions
+                        (vector scrutiny-agent-protocol-version)
+                        :frameCap 131072))))
+      (setf (scrutiny-agent--conn-capabilities conn)
+            (append (plist-get hello :capabilities) nil)
+            (scrutiny-agent--conn-agent-version conn)
+            (plist-get hello :agentVersion)
+            (scrutiny-agent--conn-frame-cap conn)
+            (plist-get hello :frameCap)))
+    (puthash name conn scrutiny-agent--connections)
+    (message "scrutiny-agent[%s]: connected (agent %s, %d capabilities)"
+             name (scrutiny-agent--conn-agent-version conn)
+             (length (scrutiny-agent--conn-capabilities conn)))
+    conn))
 
 (defun scrutiny-agent--on-disconnect (conn)
   "Fail all pending requests and tunnels; drop the registry entry."
@@ -501,8 +892,9 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
            (scrutiny-agent--conn-pending conn))
   (clrhash (scrutiny-agent--conn-pending conn))
   (maphash (lambda (_tid tunnel)
-             (when-let ((cb (scrutiny-agent-tunnel-on-closed tunnel)))
-               (funcall cb "disconnected")))
+             (let ((cb (scrutiny-agent-tunnel-on-closed tunnel)))
+	       (when cb
+		 (funcall cb "disconnected"))))
            (scrutiny-agent--conn-tunnels conn))
   (clrhash (scrutiny-agent--conn-tunnels conn))
   (remhash (scrutiny-agent--conn-name conn) scrutiny-agent--connections))
@@ -513,12 +905,18 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
   (interactive (list (completing-read "Disconnect: "
                                       (hash-table-keys
                                        scrutiny-agent--connections))))
-  (when-let ((conn (gethash name scrutiny-agent--connections)))
-    (delete-process (scrutiny-agent--conn-process conn))))
+  (let ((conn (gethash name scrutiny-agent--connections)))
+    (when conn
+      (delete-process (scrutiny-agent--conn-process conn)))))
 
 ;;;###autoload
-(defun scrutiny-agent-status (name)
-  "Show meta.stat for host NAME."
+(defun scrutiny-agent-connection-status (name)
+  "Show `meta.stat' for host NAME: agent load, uptime, session counts.
+
+Named for the connection because the UI layer's
+`scrutiny-agent-status' reports a *repository's* state -- two
+different questions that must not share a symbol.
+`scrutiny-agent-info' is the fuller version of this one."
   (interactive (list (completing-read "Host: "
                                       (hash-table-keys
                                        scrutiny-agent--connections))))
@@ -556,16 +954,17 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
 (cl-defstruct scrutiny-agent-tunnel
   conn id server-path on-bytes on-closed)
 
-(cl-defun scrutiny-agent-tunnel-open (conn workspace language
-                                           &key on-bytes on-closed)
-  "Open an LSP tunnel on CONN for WORKSPACE (remote path) and LANGUAGE
-(protocol language int).  ON-BYTES is called with each unibyte chunk
+(defun scrutiny-agent-tunnel-open (conn workspace language
+                                        &optional on-bytes on-closed)
+  "Open an LSP tunnel on CONN for WORKSPACE (remote path) and LANGUAGE.
+LANGUAGE is the protocol language int.  ON-BYTES is called with each
+unibyte chunk
 of server output; ON-CLOSED with a reason string when the server
 exits.  Returns a `scrutiny-agent-tunnel'."
   (let* ((r (scrutiny-agent-request
              conn "lsp.tunnelOpen"
              (list :workspacePath workspace :language language)
-             :timeout 60))
+             60))
          (tunnel (make-scrutiny-agent-tunnel
                   :conn conn
                   :id (plist-get r :tunnelId)
@@ -598,19 +997,23 @@ if the transport dies first)."
        (list :tunnelId (scrutiny-agent-tunnel-id tunnel))))))
 
 (defun scrutiny-agent--on-tunnel-recv (conn params)
-  (when-let ((tunnel (gethash (plist-get params :tunnelId)
-                              (scrutiny-agent--conn-tunnels conn))))
-    (when-let ((cb (scrutiny-agent-tunnel-on-bytes tunnel)))
-      (funcall cb (base64-decode-string (plist-get params :data))))))
+  (let ((tunnel (gethash (plist-get params :tunnelId)
+                         (scrutiny-agent--conn-tunnels conn))))
+    (when tunnel
+      (let ((cb (scrutiny-agent-tunnel-on-bytes tunnel)))
+	(when cb
+	  (funcall cb (base64-decode-string (plist-get params :data))))))))
 
 (defun scrutiny-agent--on-tunnel-closed (conn params)
   (let ((tid (plist-get params :tunnelId)))
-    (when-let ((tunnel (gethash tid (scrutiny-agent--conn-tunnels conn))))
-      (remhash tid (scrutiny-agent--conn-tunnels conn))
-      (when-let ((cb (scrutiny-agent-tunnel-on-closed tunnel)))
-        (funcall cb (format "%s (exit %s)"
-                            (or (plist-get params :reason) "exit")
-                            (plist-get params :exitCode)))))))
+    (let ((tunnel (gethash tid (scrutiny-agent--conn-tunnels conn))))
+      (when tunnel
+	(remhash tid (scrutiny-agent--conn-tunnels conn))
+	(let ((cb (scrutiny-agent-tunnel-on-closed tunnel)))
+	  (when cb
+	    (funcall cb (format "%s (exit %s)"
+				(or (plist-get params :reason) "exit")
+				(plist-get params :exitCode)))))))))
 
 (provide 'scrutiny-agent)
 ;;; scrutiny-agent.el ends here

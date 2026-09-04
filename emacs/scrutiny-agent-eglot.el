@@ -3,7 +3,8 @@
 ;; Author: Lally Singh
 ;; URL: https://github.com/lally/scrutiny-agent
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "29.1"))
+;; (The package's requirements are declared in scrutiny-agent.el;
+;; a Package-Requires header outside the main file has no effect.)
 ;; Keywords: tools, languages
 
 ;; This file is part of scrutiny-agent (GPLv3).
@@ -74,11 +75,12 @@ pylsp, typescript-language-server, gopls, clangd, sourcekit-lsp."
 
 (defun scrutiny-agent-eglot--host (dir)
   "Configured scrutiny-agent host name serving remote DIR, or nil."
-  (when-let ((tramp-host (file-remote-p dir 'host)))
-    (let ((name (or (cdr (assoc tramp-host scrutiny-agent-eglot-host-alist))
-                    tramp-host)))
-      (when (assoc name scrutiny-agent-hosts)
-        name))))
+  (let ((tramp-host (file-remote-p dir 'host)))
+    (when tramp-host
+      (let ((name (or (cdr (assoc tramp-host scrutiny-agent-eglot-host-alist))
+                      tramp-host)))
+	(when (assoc name scrutiny-agent-hosts)
+          name)))))
 
 (defun scrutiny-agent-eglot--bridge (host workspace language)
   "Open a tunnel on HOST for WORKSPACE/LANGUAGE and return a local
@@ -123,19 +125,19 @@ it.  Closing either side tears down the other and the tunnel."
               (accept-process-output nil 0.05))
             (unless accepted
               (delete-process client)
-              (error "scrutiny-agent-eglot: loopback accept timed out")))
+              (error "Scrutiny-agent-eglot: loopback accept timed out")))
           (setq tunnel
                 (scrutiny-agent-tunnel-open
                  conn workspace language
-                 :on-bytes (lambda (bytes)
-                             (when (process-live-p accepted)
-                               (process-send-string accepted bytes)))
-                 :on-closed (lambda (reason)
-                              (scrutiny-agent--log
-                               conn "eglot tunnel closed: %s" reason)
-                              (setq tunnel nil)
-                              (when (process-live-p accepted)
-                                (delete-process accepted)))))
+                 (lambda (bytes)
+                   (when (process-live-p accepted)
+                     (process-send-string accepted bytes)))
+                 (lambda (reason)
+                   (scrutiny-agent--log
+                    conn "eglot tunnel closed: %s" reason)
+                   (setq tunnel nil)
+                   (when (process-live-p accepted)
+                     (delete-process accepted)))))
           (scrutiny-agent--log conn "eglot bridge up: ws=%s lang=%s server=%s"
                                workspace language
                                (scrutiny-agent-tunnel-server-path tunnel))
