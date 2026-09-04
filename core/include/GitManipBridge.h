@@ -25,6 +25,9 @@ typedef struct GMDiffLine GMDiffLine;
 GMRepository* gm_repository_open(const char* path);
 void gm_repository_free(GMRepository* repo);
 const char* gm_repository_path(GMRepository* repo);
+// The work tree ("<repo>/"), as opposed to gm_repository_path()'s
+// gitdir ("<repo>/.git/"). nullptr for a bare repository.
+const char* gm_repository_workdir(GMRepository* repo);
 bool gm_repository_is_bare(GMRepository* repo);
 const char* gm_repository_head_oid(GMRepository* repo);
 const char* gm_repository_current_branch(GMRepository* repo);
