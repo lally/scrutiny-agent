@@ -150,11 +150,26 @@ void logWrite(LogLevel lvl, const std::string& msg) {
 
 // Redact content-bearing params unless trace (paths/queries kept).
 json redactParams(const json& p) {
-    if (g_logLevel.load(std::memory_order_relaxed) >=
-        static_cast<int>(LogLevel::Trace))
-        return p;
     if (!p.is_object()) return p;
     json c = p;
+
+    // Secrets are redacted at EVERY log level, including trace. The
+    // agent's security claim is that a brokered credential exists only
+    // transiently in the broker pipe; writing it to the log file would
+    // both persist it on the remote box and hand it back over the wire
+    // to any client calling logs.tail. There is no debugging scenario
+    // that justifies either. (`diffcache.put` also carries a `value`,
+    // but an object, so the is_string() guard leaves it alone.)
+    for (const char* k : {"value", "secret", "password", "token"}) {
+        auto it = c.find(k);
+        if (it != c.end() && it->is_string()) *it = "<redacted>";
+    }
+
+    // File bodies are redacted for size and privacy, but are legitimate
+    // debugging material, so trace level keeps them.
+    if (g_logLevel.load(std::memory_order_relaxed) >=
+        static_cast<int>(LogLevel::Trace))
+        return c;
     for (const char* k : {"fileContent", "content"}) {
         auto it = c.find(k);
         if (it != c.end() && it->is_string())
@@ -222,6 +237,11 @@ Lane defaultLaneFor(const std::string& method) {
         method == "git.fetch" || method == "git.ensureRepository")
         return Lane::Bulk;                           // long-running / network
     if (method == "cred.selftest") return Lane::Normal;
+    // git.exec covers both quick reads (magit's refresh) and network
+    // work; the client picks with the top-level "lane" field, and
+    // Normal is the right default -- interactive stays reserved for
+    // the typed, latency-critical methods.
+    if (method == "git.exec") return Lane::Normal;
     if (method == "lsp.tunnelOpen") return Lane::Normal;  // server spawn
     return Lane::Interactive;  // incl. cred.provide (must unblock git fast)
 }
@@ -355,23 +375,61 @@ bool readHeaderLine(std::string& line) {
     }
 }
 
-std::optional<std::string> readFrame() {
+// Outcome of one framing attempt. Malformed headers must be
+// distinguishable from EOF: the transport is a shell pipe, so a late
+// login banner, a stray `motd` line, or a client with a differently
+// cased header would otherwise look exactly like "the transport
+// closed" and silently kill the agent mid-session.
+enum class FrameStatus { Ok, Eof, Malformed };
+
+struct FrameRead {
+    FrameStatus status = FrameStatus::Eof;
+    std::string body;
+    std::string reason;   // set when status == Malformed
+};
+
+// Case-insensitive prefix test, so `content-length:` and
+// `Content-length:` are accepted alongside the canonical spelling.
+// LSP clients in the wild differ here (this repo's own Emacs client
+// matches case-insensitively), and being strict costs a session.
+bool headerIs(const std::string& line, const char* name) {
+    const size_t n = std::strlen(name);
+    if (line.size() < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::tolower(static_cast<unsigned char>(line[i])) !=
+            std::tolower(static_cast<unsigned char>(name[i]))) return false;
+    }
+    return true;
+}
+
+FrameRead readFrame() {
     size_t contentLength = 0;
     bool haveLength = false;
+    bool sawAnyHeader = false;
     while (true) {
         std::string line;
-        if (!readHeaderLine(line)) return std::nullopt;
+        if (!readHeaderLine(line)) return {FrameStatus::Eof, {}, {}};
         if (line.empty()) break;  // blank line terminates headers
+        sawAnyHeader = true;
         constexpr const char* kCL = "Content-Length:";
-        if (line.rfind(kCL, 0) == 0) {
-            contentLength = std::strtoul(line.c_str() + std::strlen(kCL), nullptr, 10);
+        if (headerIs(line, kCL)) {
+            contentLength = std::strtoul(line.c_str() + std::strlen(kCL),
+                                         nullptr, 10);
             haveLength = true;
         }
     }
-    if (!haveLength) return std::nullopt;
+    if (!haveLength) {
+        // A header block with no Content-Length. Report it and let the
+        // caller resynchronize; the next well-formed frame is served
+        // normally. A bare "\r\n\r\n" (sawAnyHeader == false) is just
+        // padding between frames and is skipped without complaint.
+        if (!sawAnyHeader) return {FrameStatus::Malformed, {}, {}};
+        return {FrameStatus::Malformed, {},
+                "frame header block carried no Content-Length"};
+    }
     std::string body;
-    if (!readExact(body, contentLength)) return std::nullopt;
-    return body;
+    if (!readExact(body, contentLength)) return {FrameStatus::Eof, {}, {}};
+    return {FrameStatus::Ok, std::move(body), {}};
 }
 
 // ---- Writer thread (the single writer) -------------------------------
@@ -535,6 +593,18 @@ struct Responder {
     }
 };
 
+// Whether the fs write surface is served. The agent is read-only
+// unless the operator passes --allow-write; writes stay inside the
+// same --allow-root sandbox either way. Written once in main() before
+// any worker starts, read-only thereafter.
+bool g_allowWrite = false;
+
+// The git subcommands `git.exec` will run, from --git-exec /
+// --git-exec-preset. Empty (the default) means git.exec is disabled and
+// is not advertised in meta.hello. Written once in main() before any
+// worker starts, read-only thereafter -- no locking.
+std::vector<std::string> g_gitExecAllowed;
+
 // A null-id error (parse failure) goes straight to the writer at normal
 // priority; there is no Responder/lane context for it.
 void sendNullIdError(int code, const std::string& message) {
@@ -593,10 +663,7 @@ void handleHello(const Responder& rsp, const json& params) {
         cap = static_cast<size_t>(proposed);
     }
     g_frameCap.store(cap);
-    rsp.result(json{{"agentVersion", kAgentVersion},
-                    {"protocolVersion", kProtocolVersion},
-                    {"frameCap", cap},
-                    {"capabilities", json::array({"git.headSha",
+    json capabilities = json::array({"git.headSha",
                                                   "git.repoMetadata",
                                                   "git.remotes",
                                                   "git.branches",
@@ -611,6 +678,8 @@ void handleHello(const Responder& rsp, const json& params) {
                                                   "git.isAncestor",
                                                   "fs.readFile",
                                                   "fs.listDirectory",
+                                                  "fs.stat",
+                                                  "fs.statBatch",
                                                   "lsp.gotoDefinition",
                                                   "lsp.findReferences",
                                                   "lsp.hover",
@@ -637,7 +706,25 @@ void handleHello(const Responder& rsp, const json& params) {
                                                   "cred.provide",
                                                   "diffcache.get",
                                                   "diffcache.put",
-                                                  "diffcache.prune"})}});
+                                                  "diffcache.prune"});
+    // git.exec is served only when the operator allowlisted something,
+    // and `capabilities` is contractually the exhaustive list of what
+    // this agent actually serves -- so it is advertised only then. A
+    // client (the magit integration) uses its presence to decide
+    // whether it can route git through the agent at all.
+    if (!g_gitExecAllowed.empty()) capabilities.push_back("git.exec");
+    // The fs write surface, likewise advertised only when enabled: a
+    // client checks for it to decide whether it can serve save-buffer
+    // itself or must fall back to its own slower path.
+    if (g_allowWrite) {
+        for (const char* m : {"fs.writeFile", "fs.mkdir", "fs.delete",
+                              "fs.rename", "fs.copy", "fs.chmod"})
+            capabilities.push_back(m);
+    }
+    rsp.result(json{{"agentVersion", kAgentVersion},
+                    {"protocolVersion", kProtocolVersion},
+                    {"frameCap", cap},
+                    {"capabilities", capabilities}});
 }
 
 // git.headSha { path } -> { headSha }
@@ -691,8 +778,18 @@ void handleRepoMetadata(const Responder& rsp, const json& params) {
                       (err ? err : "unknown error"));
         return;
     }
+    // `path` is the work tree -- what the user (and every other git.*
+    // method's `path` param) means by "the repository". libgit2's
+    // repository path is the gitdir ("<repo>/.git/"), which is the
+    // right answer only for a bare repo; reporting it for a normal
+    // clone hands the client a path it did not ask about and that
+    // reads as wrong in any UI that displays it. `gitDir` carries the
+    // gitdir for callers that genuinely want it.
+    const char* workdir = gm_repository_workdir(repo);
+    const char* gitdir = gm_repository_path(repo);
     json result{
-        {"path", strOrNull(gm_repository_path(repo))},
+        {"path", strOrNull(workdir != nullptr ? workdir : gitdir)},
+        {"gitDir", strOrNull(gitdir)},
         {"isBare", gm_repository_is_bare(repo)},
         {"headSha", strOrNull(gm_repository_head_oid(repo))},
         {"currentBranch", strOrNull(gm_repository_current_branch(repo))},
@@ -1114,6 +1211,290 @@ bool reqStr(const Responder& rsp, const json& params,
     return true;
 }
 
+// Pull an optional string param. Returns false (silently) when the key
+// is absent or not a string -- the caller decides what that means.
+bool reqStrOptional(const json& params, const char* key, std::string& out) {
+    auto it = params.find(key);
+    if (it == params.end() || !it->is_string()) return false;
+    out = it->get<std::string>();
+    return true;
+}
+
+// Defined with the credential broker further down; git.exec needs it
+// for the subcommands that can hit the network.
+GitRun runGitBrokered(const std::vector<std::string>& args,
+                      const std::string& cwd, const std::string& authOpId);
+
+// ---- git.exec policy -------------------------------------------------
+//
+// `git.exec` lets a client run a git subcommand the agent has no typed
+// method for -- the point being that a real git UI (magit) can drive
+// the remote over the one multiplexed connection instead of opening a
+// TRAMP session per invocation.
+//
+// That is a genuinely wider surface than the rest of the protocol, so
+// it is OFF unless the operator turns it on, and even then it runs
+// only what the operator listed:
+//
+//   --git-exec <subcommand>     allow one subcommand (repeatable)
+//   --git-exec-preset <name>    read-only | magit  (expands to a set)
+//
+// Two checks, and the second is the one that actually matters:
+//
+//  1. The subcommand must be on the list.
+//  2. No argument may be one of git's "run this command for me"
+//     options. Whitelisting subcommands alone is NOT sufficient
+//     security: `git -c core.pager=... status`, `-c
+//     credential.helper=...`, `-c alias.x=!sh`, `--upload-pack=`,
+//     `--exec-path=` and friends all turn any allowed subcommand into
+//     arbitrary code execution. Those are refused wherever they appear.
+//
+// Repo-local config and hooks are a separate matter: they are the
+// user's own, already trusted by every other git.* method, and equally
+// reachable via `git.fetch`. What must not happen is the *client*
+// injecting them.
+
+// Subcommands that only read. Safe to expose on their own.
+const char* const kGitExecReadOnly[] = {
+    "blame", "branch", "cat-file", "check-ignore", "check-ref-format",
+    "count-objects", "describe", "diff", "diff-files", "diff-index",
+    "diff-tree", "for-each-ref", "grep", "log", "ls-files", "ls-remote",
+    "ls-tree", "merge-base", "name-rev", "rev-list", "rev-parse",
+    "shortlog", "show", "show-ref", "status", "symbolic-ref", "tag",
+    "var", "version", "whatchanged"};
+
+// What magit needs to be magit: the read-only set plus the working
+// operations. This is a broad grant -- close to "git" -- and is
+// documented as such; an operator who wants less lists subcommands
+// individually with --git-exec.
+const char* const kGitExecMagit[] = {
+    "add", "am", "apply", "bisect", "checkout", "cherry", "cherry-pick",
+    "clean", "commit", "fetch", "format-patch", "merge", "mv", "notes",
+    "pull", "push", "range-diff", "rebase", "reflog", "remote", "reset",
+    "restore", "revert", "rm", "stash", "submodule", "switch",
+    "update-index", "worktree"};
+
+// `-c <key>=<value>` config keys a request may set. Allowlisted by
+// key, never deny-listed: the keys that make git run a program
+// (core.pager, core.editor, core.sshCommand, credential.helper,
+// alias.*, diff.external, *.textconv, http.*, ...) are too many and
+// too easy to extend for a deny list to be trustworthy. Everything
+// here only affects formatting or local behavior.
+//
+// The set exists because a real git UI needs it: magit passes
+// `-c core.preloadIndex=true -c log.showSignature=false -c color.ui=false
+//  -c color.diff=false -c diff.noPrefix=false` on every single
+// invocation, so refusing -c outright would mean refusing magit.
+// Extend with --git-exec-config <key>.
+std::vector<std::string> g_gitExecConfigKeys;
+
+const char* const kGitExecConfigDefaults[] = {
+    "advice",                    // whole section: advisory messages only
+    "color",                     // whole section: output coloring only
+    "core.abbrev", "core.commitgraph", "core.preloadindex",
+    "core.quotepath", "core.untrackedcache",
+    "diff.algorithm", "diff.context", "diff.mnemonicprefix",
+    "diff.noprefix", "diff.renames", "diff.submodule",
+    "gc.auto",
+    "i18n.logoutputencoding",
+    "log.date", "log.showsignature",
+    "status.relativepaths", "status.showuntrackedfiles"};
+
+std::string asciiLower(std::string s) {
+    for (auto& ch : s)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return s;
+}
+
+// True if `setting` ("key=value") names a permitted config key. A bare
+// section in the allowlist ("color") permits every key under it.
+bool isAllowedGitConfig(const std::string& setting) {
+    const std::string key =
+        asciiLower(setting.substr(0, setting.find('=')));
+    if (key.empty()) return false;
+    const std::string section = key.substr(0, key.find('.'));
+    for (const auto& allowed : g_gitExecConfigKeys) {
+        if (key == allowed) return true;
+        if (allowed.find('.') == std::string::npos && section == allowed)
+            return true;
+    }
+    return false;
+}
+
+// Options that hand git a command to execute, or relocate what "the
+// repository" means. Refused anywhere in the argument list.
+bool isForbiddenGitArg(const std::string& arg) {
+    static const char* const kExactDeny[] = {
+        "-c", "--config-env", "--exec-path", "--upload-pack",
+        "--receive-pack", "--git-dir", "--work-tree", "--namespace", "-C",
+        "--ext-diff"};
+    for (const char* deny : kExactDeny)
+        if (arg == deny) return true;
+    static const char* const kPrefixDeny[] = {
+        "-c=", "--config-env=", "--exec-path=", "--upload-pack=",
+        "--receive-pack=", "--git-dir=", "--work-tree=", "--namespace=",
+        "--output=",         // writes wherever the client points it
+        "--gpg-sign=",       // invokes an arbitrary signing program
+        "--textconv"};
+    for (const char* deny : kPrefixDeny)
+        if (arg.rfind(deny, 0) == 0) return true;
+    return false;
+}
+
+// Global options accepted before the subcommand. Everything else in
+// that position is refused: the allowlist is what keeps a client from
+// reaching the denied options above by a spelling we did not predict.
+bool isAllowedGlobalGitArg(const std::string& arg) {
+    static const char* const kAllow[] = {
+        "--no-pager", "--paginate", "--no-replace-objects",
+        "--literal-pathspecs", "--no-optional-locks", "--bare"};
+    for (const char* ok : kAllow)
+        if (arg == ok) return true;
+    return false;
+}
+
+// Validate `args`. On success returns true and sets `subcommand`; on
+// failure fills `err` with a message naming the offending argument.
+bool gitExecPermitted(const std::vector<std::string>& args,
+                      std::string& subcommand, std::string& err) {
+    if (g_gitExecAllowed.empty()) {
+        err = "git.exec is disabled; start the agent with --git-exec "
+              "<subcommand> or --git-exec-preset <read-only|magit>";
+        return false;
+    }
+
+    // Pass 1: the global options, up to the subcommand. `-c` is handled
+    // here and ONLY here -- a config setting is meaningful before the
+    // subcommand, and confining it to this position keeps the check in
+    // one place rather than scattered through arbitrary argument
+    // grammars.
+    size_t i = 0;
+    while (i < args.size() && !args[i].empty() && args[i][0] == '-') {
+        if (args[i] == "-c") {
+            if (i + 1 >= args.size()) {
+                err = "-c requires a <key>=<value> argument";
+                return false;
+            }
+            const std::string& setting = args[i + 1];
+            if (!isAllowedGitConfig(setting)) {
+                err = "config setting '" + setting + "' is not permitted; "
+                      "this agent allows -c only for a fixed set of "
+                      "formatting and local-behavior keys (extend with "
+                      "--git-exec-config)";
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        if (!isAllowedGlobalGitArg(args[i])) {
+            err = "global option '" + args[i] + "' is not permitted before "
+                  "a git.exec subcommand";
+            return false;
+        }
+        ++i;
+    }
+    if (i >= args.size()) {
+        err = "git.exec requires a subcommand";
+        return false;
+    }
+
+    subcommand = args[i];
+    if (std::find(g_gitExecAllowed.begin(), g_gitExecAllowed.end(),
+                  subcommand) == g_gitExecAllowed.end()) {
+        err = "git subcommand '" + subcommand + "' is not in this agent's "
+              "git.exec allowlist";
+        return false;
+    }
+
+    // Pass 2: everything from the subcommand onward. `-c` is forbidden
+    // here (it was already consumed above if legitimate), as are the
+    // options that hand git a program to run or move the repository.
+    for (size_t j = i; j < args.size(); ++j) {
+        if (isForbiddenGitArg(args[j])) {
+            err = "argument '" + args[j] + "' is refused: it would let the "
+                  "request run an arbitrary command through git";
+            return false;
+        }
+    }
+    return true;
+}
+
+// Subcommands that may need to authenticate; those get the credential
+// broker wired up exactly as git.fetch does.
+bool gitExecNeedsCredentials(const std::string& subcommand) {
+    return subcommand == "fetch" || subcommand == "pull" ||
+           subcommand == "push" || subcommand == "ls-remote" ||
+           subcommand == "clone" || subcommand == "submodule";
+}
+
+// git.exec { repoPath, args[], authOpId? }
+//        -> { exitCode, stdout, stderr, truncated }
+// Runs one allowlisted git subcommand in repoPath. Output is capped so
+// a `git log` on a huge repository cannot exhaust memory; anything
+// over the cap sets `truncated` rather than silently losing the tail
+// without saying so.
+constexpr size_t kGitExecMaxOutput = 16 * 1024 * 1024;
+
+void handleGitExec(const Responder& rsp, const json& params) {
+    std::string repoPath;
+    if (!reqStr(rsp, params, "repoPath", "git.exec", repoPath)) return;
+    auto it = params.find("args");
+    if (it == params.end() || !it->is_array()) {
+        rsp.error(kInvalidRequest, "git.exec requires array param 'args'");
+        return;
+    }
+    std::vector<std::string> args;
+    for (const auto& arg : *it) {
+        if (!arg.is_string()) {
+            rsp.error(kInvalidRequest,
+                      "git.exec 'args' must contain only strings");
+            return;
+        }
+        args.push_back(arg.get<std::string>());
+    }
+
+    std::string subcommand, err;
+    if (!gitExecPermitted(args, subcommand, err)) {
+        rsp.error(kPermissionDenied, err);
+        return;
+    }
+    if (logOn(LogLevel::Info))
+        logWrite(LogLevel::Info,
+                 "git.exec " + subcommand + " in " + repoPath);
+
+    // Never let git page or prompt: both would hang a request forever
+    // on a pipe with no terminal.
+    std::vector<std::string> env{"GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0"};
+    std::vector<std::string> argv{"--no-pager"};
+    argv.insert(argv.end(), args.begin(), args.end());
+
+    GitRun g;
+    std::string authOpId;
+    if (gitExecNeedsCredentials(subcommand) &&
+        reqStrOptional(params, "authOpId", authOpId)) {
+        g = runGitBrokered(argv, repoPath, authOpId);
+    } else {
+        g = runGitEnv(argv, repoPath, env);
+    }
+
+    bool truncated = false;
+    if (g.out.size() > kGitExecMaxOutput) {
+        g.out.resize(kGitExecMaxOutput);
+        truncated = true;
+    }
+    if (g.err.size() > kGitExecMaxOutput) {
+        g.err.resize(kGitExecMaxOutput);
+        truncated = true;
+    }
+    // A non-zero exit is data, not a protocol error: git uses exit
+    // codes to answer questions (`diff --quiet`, `merge-base
+    // --is-ancestor`), and the caller needs the code, not an exception.
+    rsp.result(json{{"exitCode", g.exitCode},
+                    {"stdout", g.out},
+                    {"stderr", g.err},
+                    {"truncated", truncated}});
+}
+
 // git.showFile { path, sha, file } -> { content: string | null }
 // Mirrors LocalBackend.gitShowFile: `git show <sha>:<file>`; stdout on
 // exit 0, else null.
@@ -1219,6 +1600,10 @@ std::optional<std::string> resolveAndAuthorize(
     return std::nullopt;
 }
 
+// Defined with the fs metadata section below; the read handlers above
+// it report size/mtime through the same helper.
+json statJson(const std::string& path);
+
 // fs.readFile { path } -> { content }
 // Working-tree read via the Core fs surface (grc_fs_read_file). Pure
 // I/O, so no GitGuard (the kernel arbitrates; free parallelism). The
@@ -1249,7 +1634,28 @@ void handleFsReadFile(const Responder& rsp, const json& params) {
     }
     std::string content(buf, buf + (size > 0 ? static_cast<size_t>(size) : 0));
     grc_free_string(buf);
-    rsp.result(json{{"content", content}});
+
+    json out;
+    // `base64: true` returns the bytes verbatim. A JSON string cannot
+    // carry arbitrary bytes, so a client that must reproduce a file
+    // exactly -- an editor writing it back -- asks for base64 and does
+    // its own decoding. `content` stays the default for the callers
+    // that just want text.
+    if (params.value("base64", false)) {
+        out["contentBase64"] = base64Encode(content);
+    } else {
+        out["content"] = content;
+    }
+    // The modification time comes back with the bytes so a client can
+    // detect a concurrent change without a second round trip -- the
+    // whole point on a slow link.
+    if (params.value("stat", false)) {
+        json st = statJson(*canon);
+        out["size"] = st.value("size", 0LL);
+        out["mtime"] = st.value("mtime", 0LL);
+        out["mode"] = st.value("mode", 0);
+    }
+    rsp.result(out);
 }
 
 // fs.listDirectory { path } -> { path, entries: [{ name, isDir }] }
@@ -1285,6 +1691,7 @@ void handleFsListDirectory(const Responder& rsp, const json& params) {
                   "could not list '" + path + "': " + ec.message());
         return;
     }
+    const bool wantAttributes = params.value("attributes", false);
     std::vector<std::pair<std::string, bool>> kids;
     for (; !ec && it != end; it.increment(ec)) {
         std::error_code dec;
@@ -1294,9 +1701,470 @@ void handleFsListDirectory(const Responder& rsp, const json& params) {
     std::sort(kids.begin(), kids.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     json entries = json::array();
-    for (const auto& k : kids)
-        entries.push_back(json{{"name", k.first}, {"isDir", k.second}});
+    for (const auto& k : kids) {
+        json entry{{"name", k.first}, {"isDir", k.second}};
+        if (wantAttributes) {
+            // Attributes for the whole listing in one reply: dired and
+            // minibuffer completion would otherwise stat every entry
+            // individually, which is exactly the round-trip storm this
+            // method exists to avoid.
+            const std::string child = path + "/" + k.first;
+            json st = statJson(child);
+            for (const char* key : {"size", "mtime", "mode", "isSymlink",
+                                    "symlinkTarget", "isRegular", "uid",
+                                    "gid", "readable", "writable"}) {
+                if (st.contains(key)) entry[key] = st[key];
+            }
+            // The resolved path, so a client can answer file-truename
+            // from the listing instead of stat'ing every entry again.
+            char real[4096];
+            entry["path"] = ::realpath(child.c_str(), real) != nullptr
+                                ? std::string(real)
+                                : child;
+        }
+        entries.push_back(std::move(entry));
+    }
     rsp.result(json{{"path", path}, {"entries", entries}});
+}
+
+// ---- fs metadata and writes ------------------------------------------
+//
+// These exist so an Emacs file-name handler can serve find-file, save,
+// dired and completion over the agent channel instead of TRAMP's
+// shell protocol -- on a link where opening a session is expensive
+// that is the difference between remote editing being usable and not.
+//
+// Writes are OFF unless the operator passes --allow-write. The agent
+// was read-only by design, and turning that off is the operator's
+// decision, not a client's. Everything still goes through the same
+// --allow-root sandbox; --allow-write widens *what* may be done to a
+// path, never *which* paths are reachable.
+// Names the temp file an atomic write lands in. Only needs to be
+// unique among concurrent writes in this process.
+std::atomic<unsigned long> g_writeSeq{0};
+
+// Authorize a path that does not exist yet (a file about to be
+// created, a directory about to be made). realpath() fails on a
+// missing leaf, so the PARENT is resolved and authorized and the leaf
+// is appended to the canonical parent. The kernel then sees a path
+// whose every existing component was checked -- a symlinked parent
+// cannot redirect the write outside the roots.
+std::optional<std::string> resolveAndAuthorizeForCreate(
+    const std::string& userPath, int& code, std::string& err) {
+    const std::string anchored = resolveRoot(userPath);
+    // An existing path takes the ordinary route (this also covers
+    // overwriting a file that is already there).
+    {
+        char real[4096];
+        if (::realpath(anchored.c_str(), real) != nullptr)
+            return resolveAndAuthorize(userPath, code, err);
+    }
+    // Peel off trailing components until something exists. `mkdir -p`
+    // legitimately names several missing levels at once, so a helper
+    // that only handled a missing leaf would refuse it.
+    std::vector<std::string> missing;
+    std::string existing = anchored;
+    while (true) {
+        const size_t slash = existing.find_last_of('/');
+        if (slash == std::string::npos || slash == 0) {
+            code = kInvalidRequest;
+            err = "refusing to create '" + userPath +
+                  "' at the filesystem root";
+            return std::nullopt;
+        }
+        const std::string leaf = existing.substr(slash + 1);
+        existing = existing.substr(0, slash);
+        if (leaf.empty() || leaf == ".") continue;
+        if (leaf == "..") {
+            // A `..` below a component that does not exist cannot be
+            // resolved safely: there is no directory to step out of,
+            // so the check would be guessing.
+            code = kInvalidRequest;
+            err = "'" + userPath + "' traverses '..' through a missing "
+                  "directory";
+            return std::nullopt;
+        }
+        missing.push_back(leaf);
+        char real[4096];
+        if (::realpath(existing.c_str(), real) != nullptr) break;
+    }
+    if (missing.empty()) {
+        code = kInvalidRequest;
+        err = "'" + userPath + "' does not name a path to create";
+        return std::nullopt;
+    }
+    // Authorize the deepest component that actually exists; every
+    // symlink along it is resolved, so nothing below can escape.
+    auto canonExisting = resolveAndAuthorize(existing, code, err);
+    if (!canonExisting) return std::nullopt;
+    std::string out = *canonExisting;
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it)
+        out += "/" + *it;
+    return out;
+}
+
+// Authorize a path without resolving its own final component, so a
+// symlink can be described rather than followed. The parent is fully
+// canonicalized and checked, which is what keeps the sandbox intact:
+// no existing directory component can point outside the roots.
+std::optional<std::string> resolveAndAuthorizeNoFollow(
+    const std::string& userPath, int& code, std::string& err) {
+    const std::string anchored = resolveRoot(userPath);
+    const size_t slash = anchored.find_last_of('/');
+    if (slash == std::string::npos || slash == 0)
+        return resolveAndAuthorize(userPath, code, err);
+    const std::string leaf = anchored.substr(slash + 1);
+    // "." and ".." have no leaf to preserve, and a trailing slash means
+    // a directory was named; ordinary resolution is right for those.
+    if (leaf.empty() || leaf == "." || leaf == "..")
+        return resolveAndAuthorize(userPath, code, err);
+    int parentCode = 0;
+    std::string parentErr;
+    auto canonParent = resolveAndAuthorize(anchored.substr(0, slash),
+                                           parentCode, parentErr);
+    if (canonParent) return *canonParent + "/" + leaf;
+    // The parent may legitimately be outside the roots -- an allowed
+    // root's own parent always is. Fall back to authorizing the path
+    // itself, which is the stricter check, never a looser one.
+    return resolveAndAuthorize(userPath, code, err);
+}
+
+// Reject a write when the agent was not started with --allow-write.
+bool writesPermitted(const Responder& rsp, const char* method) {
+    if (g_allowWrite) return true;
+    rsp.error(kPermissionDenied,
+              std::string(method) + " is disabled; this agent is read-only "
+              "(start it with --allow-write to enable the fs write surface)");
+    return false;
+}
+
+// `struct stat` as the wire shape the Emacs handler turns into an
+// Emacs `file-attributes` list. mtime is seconds since the epoch;
+// `mode` is the permission bits only, so a client never has to know
+// the platform's S_IF* encoding.
+json statJson(const std::string& path) {
+    struct stat st{};
+    struct stat lst{};
+    const bool haveLink = (::lstat(path.c_str(), &lst) == 0);
+    if (::stat(path.c_str(), &st) != 0) {
+        // A dangling symlink: it exists as a link even though its
+        // target does not, and a client must be able to tell.
+        if (haveLink && S_ISLNK(lst.st_mode)) {
+            char buf[4096];
+            const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
+            return json{{"exists", true}, {"isDir", false},
+                        {"isRegular", false}, {"isSymlink", true},
+                        {"symlinkTarget", n > 0 ? std::string(buf, n) : ""},
+                        {"size", 0}, {"mtime", 0},
+                        {"mode", static_cast<int>(lst.st_mode & 07777)},
+                        {"readable", false}, {"writable", false}};
+        }
+        return json{{"exists", false}};
+    }
+    std::string target;
+    if (haveLink && S_ISLNK(lst.st_mode)) {
+        char buf[4096];
+        const ssize_t n = ::readlink(path.c_str(), buf, sizeof(buf) - 1);
+        if (n > 0) target.assign(buf, n);
+    }
+    return json{{"exists", true},
+                {"isDir", S_ISDIR(st.st_mode)},
+                {"isRegular", S_ISREG(st.st_mode)},
+                {"isSymlink", haveLink && S_ISLNK(lst.st_mode)},
+                {"symlinkTarget", target},
+                {"size", static_cast<long long>(st.st_size)},
+                {"mtime", static_cast<long long>(st.st_mtime)},
+                {"mode", static_cast<int>(st.st_mode & 07777)},
+                {"uid", static_cast<int>(st.st_uid)},
+                {"gid", static_cast<int>(st.st_gid)},
+                {"readable", ::access(path.c_str(), R_OK) == 0},
+                {"writable", ::access(path.c_str(), W_OK) == 0}};
+}
+
+// fs.stat { path } -> the shape above, or { exists: false }.
+// A path outside the roots is PERMISSION_DENIED; a path inside them
+// that simply is not there answers { exists: false } rather than an
+// error, because "does this exist?" is the question being asked.
+void handleFsStat(const Responder& rsp, const json& params) {
+    std::string path;
+    if (!reqStr(rsp, params, "path", "fs.stat", path)) return;
+    int code = 0;
+    std::string err;
+    // Authorize via the parent, NOT via the path itself: canonicalizing
+    // the final component resolves a symlink away, so the answer would
+    // describe the target and `isSymlink` would always be false. Every
+    // directory component is still resolved and checked, so nothing
+    // below the roots becomes reachable.
+    auto canon = resolveAndAuthorizeNoFollow(path, code, err);
+    if (!canon) {
+        if (code == kNotFound) { rsp.result(json{{"exists", false}}); return; }
+        rsp.error(code, err);
+        return;
+    }
+    json out = statJson(*canon);
+    // `path` is the canonical name of the target, which is what a
+    // client wants for file-truename; the stat fields above describe
+    // the link itself.
+    char real[4096];
+    out["path"] = ::realpath(canon->c_str(), real) != nullptr
+                      ? std::string(real)
+                      : *canon;
+    rsp.result(out);
+}
+
+// fs.statBatch { paths[] } -> { stats: [...] } in the same order.
+// dired and minibuffer completion stat every entry in a directory;
+// one round trip for all of them is the entire point on a slow link.
+void handleFsStatBatch(const Responder& rsp, const json& params) {
+    auto it = params.find("paths");
+    if (it == params.end() || !it->is_array()) {
+        rsp.error(kInvalidRequest, "fs.statBatch requires array param 'paths'");
+        return;
+    }
+    json stats = json::array();
+    for (const auto& entry : *it) {
+        if (!entry.is_string()) {
+            stats.push_back(json{{"exists", false},
+                                 {"error", "path is not a string"}});
+            continue;
+        }
+        int code = 0;
+        std::string err;
+        auto canon = resolveAndAuthorizeForCreate(entry.get<std::string>(),
+                                                  code, err);
+        if (!canon) {
+            // One bad path must not fail the batch: the caller gets a
+            // per-entry answer and decides what to do about it.
+            json bad{{"exists", false}};
+            if (code == kPermissionDenied) bad["denied"] = true;
+            stats.push_back(bad);
+            continue;
+        }
+        json one = statJson(*canon);
+        one["path"] = *canon;
+        stats.push_back(one);
+    }
+    rsp.result(json{{"stats", stats}});
+}
+
+// fs.writeFile { path, content | contentBase64, mode?, createDirs? }
+//            -> { ok, size, mtime }
+// Atomic: the bytes land in a temp file beside the target, are fsync'd,
+// then renamed over it. A crash or a dropped transport therefore leaves
+// either the old file or the new one -- never a truncated buffer, which
+// is the failure mode that loses a user's work.
+void handleFsWriteFile(const Responder& rsp, const json& params) {
+    if (!writesPermitted(rsp, "fs.writeFile")) return;
+    std::string path;
+    if (!reqStr(rsp, params, "path", "fs.writeFile", path)) return;
+
+    std::string bytes;
+    if (auto it = params.find("contentBase64");
+        it != params.end() && it->is_string()) {
+        auto decoded = base64Decode(it->get<std::string>());
+        if (!decoded) {
+            rsp.error(kInvalidRequest,
+                      "fs.writeFile 'contentBase64' is not valid base64");
+            return;
+        }
+        bytes = std::move(*decoded);
+    } else if (auto ct = params.find("content");
+               ct != params.end() && ct->is_string()) {
+        bytes = ct->get<std::string>();
+    } else {
+        rsp.error(kInvalidRequest,
+                  "fs.writeFile requires string param 'content' or "
+                  "'contentBase64'");
+        return;
+    }
+
+    int code = 0;
+    std::string err;
+    auto canon = resolveAndAuthorizeForCreate(path, code, err);
+    if (!canon) { rsp.error(code, err); return; }
+
+    const size_t slash = canon->find_last_of('/');
+    const std::string dir = canon->substr(0, slash);
+    if (params.value("createDirs", false)) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+    }
+
+    // The temp file must share a filesystem with the target for
+    // rename() to be atomic, so it goes in the same directory.
+    std::string tmp = dir + "/.scrutiny-write-" +
+                      std::to_string(static_cast<long long>(::getpid())) +
+                      "-" + std::to_string(g_writeSeq.fetch_add(1) + 1);
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        rsp.error(kInternal, "could not create '" + tmp + "': " +
+                                 std::strerror(errno));
+        return;
+    }
+    size_t written = 0;
+    bool failed = false;
+    while (written < bytes.size()) {
+        const ssize_t n = ::write(fd, bytes.data() + written,
+                                  bytes.size() - written);
+        if (n <= 0) { failed = true; break; }
+        written += static_cast<size_t>(n);
+    }
+    // fsync before rename: without it the rename can be durable while
+    // the contents are not, which is how "the file is there but empty"
+    // happens after a crash.
+    if (!failed && ::fsync(fd) != 0) failed = true;
+    const std::string writeErr = failed ? std::strerror(errno) : "";
+    ::close(fd);
+    if (failed) {
+        ::unlink(tmp.c_str());
+        rsp.error(kInternal, "write to '" + *canon + "' failed: " + writeErr);
+        return;
+    }
+
+    // Preserve the existing mode when overwriting; otherwise honor an
+    // explicit mode, else fall back to the process umask's 0644.
+    mode_t mode = 0644;
+    struct stat st{};
+    if (::stat(canon->c_str(), &st) == 0) mode = st.st_mode & 07777;
+    if (auto it = params.find("mode");
+        it != params.end() && it->is_number_integer())
+        mode = static_cast<mode_t>(it->get<int>() & 07777);
+    ::chmod(tmp.c_str(), mode);
+
+    if (::rename(tmp.c_str(), canon->c_str()) != 0) {
+        const std::string reason = std::strerror(errno);
+        ::unlink(tmp.c_str());
+        rsp.error(kInternal,
+                  "could not install '" + *canon + "': " + reason);
+        return;
+    }
+    json out = statJson(*canon);
+    rsp.result(json{{"ok", true},
+                    {"size", out.value("size", 0LL)},
+                    {"mtime", out.value("mtime", 0LL)}});
+}
+
+// fs.mkdir { path, parents? } -> { ok }
+void handleFsMkdir(const Responder& rsp, const json& params) {
+    if (!writesPermitted(rsp, "fs.mkdir")) return;
+    std::string path;
+    if (!reqStr(rsp, params, "path", "fs.mkdir", path)) return;
+    int code = 0;
+    std::string err;
+    auto canon = resolveAndAuthorizeForCreate(path, code, err);
+    if (!canon) { rsp.error(code, err); return; }
+    std::error_code ec;
+    if (params.value("parents", false)) {
+        std::filesystem::create_directories(*canon, ec);
+    } else {
+        std::filesystem::create_directory(*canon, ec);
+    }
+    if (ec && !std::filesystem::is_directory(*canon)) {
+        rsp.error(kInternal,
+                  "could not create '" + *canon + "': " + ec.message());
+        return;
+    }
+    rsp.result(json{{"ok", true}});
+}
+
+// fs.delete { path, recursive? } -> { ok, removed }
+void handleFsDelete(const Responder& rsp, const json& params) {
+    if (!writesPermitted(rsp, "fs.delete")) return;
+    std::string path;
+    if (!reqStr(rsp, params, "path", "fs.delete", path)) return;
+    int code = 0;
+    std::string err;
+    auto canon = resolveAndAuthorize(path, code, err);
+    if (!canon) { rsp.error(code, err); return; }
+    std::error_code ec;
+    std::uintmax_t removed = 0;
+    if (params.value("recursive", false)) {
+        removed = std::filesystem::remove_all(*canon, ec);
+    } else {
+        // remove() on a non-empty directory fails, which is what the
+        // caller asked for by not passing recursive.
+        removed = std::filesystem::remove(*canon, ec) ? 1 : 0;
+    }
+    if (ec) {
+        rsp.error(kInternal,
+                  "could not delete '" + *canon + "': " + ec.message());
+        return;
+    }
+    rsp.result(json{{"ok", true},
+                    {"removed", static_cast<long long>(removed)}});
+}
+
+// fs.rename { from, to } -> { ok }. BOTH ends are authorized: renaming
+// is a write to the destination as much as to the source.
+void handleFsRename(const Responder& rsp, const json& params) {
+    if (!writesPermitted(rsp, "fs.rename")) return;
+    std::string from, to;
+    if (!reqStr(rsp, params, "from", "fs.rename", from)) return;
+    if (!reqStr(rsp, params, "to", "fs.rename", to)) return;
+    int code = 0;
+    std::string err;
+    auto canonFrom = resolveAndAuthorize(from, code, err);
+    if (!canonFrom) { rsp.error(code, err); return; }
+    auto canonTo = resolveAndAuthorizeForCreate(to, code, err);
+    if (!canonTo) { rsp.error(code, err); return; }
+    std::error_code ec;
+    std::filesystem::rename(*canonFrom, *canonTo, ec);
+    if (ec) {
+        rsp.error(kInternal, "could not rename '" + *canonFrom + "' to '" +
+                                 *canonTo + "': " + ec.message());
+        return;
+    }
+    rsp.result(json{{"ok", true}});
+}
+
+// fs.copy { from, to, overwrite? } -> { ok }
+void handleFsCopy(const Responder& rsp, const json& params) {
+    if (!writesPermitted(rsp, "fs.copy")) return;
+    std::string from, to;
+    if (!reqStr(rsp, params, "from", "fs.copy", from)) return;
+    if (!reqStr(rsp, params, "to", "fs.copy", to)) return;
+    int code = 0;
+    std::string err;
+    auto canonFrom = resolveAndAuthorize(from, code, err);
+    if (!canonFrom) { rsp.error(code, err); return; }
+    auto canonTo = resolveAndAuthorizeForCreate(to, code, err);
+    if (!canonTo) { rsp.error(code, err); return; }
+    std::error_code ec;
+    auto options = params.value("overwrite", false)
+                       ? std::filesystem::copy_options::overwrite_existing
+                       : std::filesystem::copy_options::none;
+    if (std::filesystem::is_directory(*canonFrom))
+        options |= std::filesystem::copy_options::recursive;
+    std::filesystem::copy(*canonFrom, *canonTo, options, ec);
+    if (ec) {
+        rsp.error(kInternal, "could not copy '" + *canonFrom + "' to '" +
+                                 *canonTo + "': " + ec.message());
+        return;
+    }
+    rsp.result(json{{"ok", true}});
+}
+
+// fs.chmod { path, mode } -> { ok }
+void handleFsChmod(const Responder& rsp, const json& params) {
+    if (!writesPermitted(rsp, "fs.chmod")) return;
+    std::string path;
+    if (!reqStr(rsp, params, "path", "fs.chmod", path)) return;
+    auto it = params.find("mode");
+    if (it == params.end() || !it->is_number_integer()) {
+        rsp.error(kInvalidRequest, "fs.chmod requires int param 'mode'");
+        return;
+    }
+    int code = 0;
+    std::string err;
+    auto canon = resolveAndAuthorize(path, code, err);
+    if (!canon) { rsp.error(code, err); return; }
+    if (::chmod(canon->c_str(),
+                static_cast<mode_t>(it->get<int>() & 07777)) != 0) {
+        rsp.error(kInternal, "could not chmod '" + *canon + "': " +
+                                 std::strerror(errno));
+        return;
+    }
+    rsp.result(json{{"ok", true}});
 }
 
 // ---- LSP session manager (grc_lsp_client_*) --------------------------
@@ -2247,9 +3115,25 @@ struct CredBroker {
     std::atomic<bool> running{true};
     std::thread th;
 
+    // The socket lives in a short-pathed temp directory, NOT in the
+    // repository. Two reasons, both load-bearing:
+    //   * sockaddr_un::sun_path is 108 bytes on Linux (104 on macOS).
+    //     Anchoring in the repo made every credential-brokered git op
+    //     fail for any checkout deeper than ~85 characters -- an
+    //     ordinary path on a dev box -- with an opaque setup error.
+    //   * It kept a socket file inside the user's work tree for the
+    //     duration of the operation, which shows up as untracked
+    //     state in exactly the repo the user is reviewing.
+    // `dir` is still taken so the broker's lifetime stays tied to the
+    // op that owns it; it is no longer where the socket goes.
     bool start(const std::string& opId, const std::string& dir) {
         authOpId = opId;
-        sockPath = dir + "/.scrutiny-cred-" +
+        (void)dir;
+        const char* tmp = ::getenv("TMPDIR");
+        std::string base = (tmp != nullptr && *tmp != '\0') ? tmp : "/tmp";
+        while (base.size() > 1 && base.back() == '/') base.pop_back();
+        sockPath = base + "/.scrutiny-cred-" +
+                   std::to_string(static_cast<long long>(::getpid())) + "-" +
                    std::to_string(g_credSeq.fetch_add(1) + 1) + ".sock";
         ::unlink(sockPath.c_str());
         listenFd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -2257,6 +3141,11 @@ struct CredBroker {
         sockaddr_un addr{};
         addr.sun_family = AF_UNIX;
         if (sockPath.size() >= sizeof(addr.sun_path)) {
+            logWrite(LogLevel::Error,
+                     "cred broker: socket path too long (" +
+                         std::to_string(sockPath.size()) + " >= " +
+                         std::to_string(sizeof(addr.sun_path)) +
+                         "): " + sockPath);
             ::close(listenFd); listenFd = -1; return false;
         }
         std::strncpy(addr.sun_path, sockPath.c_str(),
@@ -2738,6 +3627,19 @@ void handleMetaCapabilities(const Responder& rsp, const json&) {
         {"fileSystemAccess", json{
             {"absolutePathsAllowed", true},
             {"relativeAnchoredUnderHome", true},
+            // The roots this process is actually running with, not the
+            // documented default: a client (and the Security pane) can
+            // then show what this agent can reach without guessing at
+            // the bootstrap line.
+            {"allowedRoots", g_allowedRoots},
+            {"writable", g_allowWrite},
+            // The remote $HOME. A client needs it to expand "~" and to
+            // abbreviate names, and cannot get it from fs.listDirectory
+            // when $HOME is not itself inside the allowed roots.
+            {"home", []() {
+                 const char* h = ::getenv("HOME");
+                 return std::string(h != nullptr ? h : "");
+             }()},
             {"description",
              "fs.readFile and fs.listDirectory resolve symlinks, then "
              "require the canonical path to lie inside a configured "
@@ -2762,11 +3664,33 @@ void handleMetaCapabilities(const Responder& rsp, const json&) {
 // promise — the audit is grounded in the binary that's actually
 // running, not the docs. Reads at most a few hundred bytes so we don't
 // blast the user's transport with a leaked /etc/passwd.
+//
+// The probe MUST take the same route a client request takes
+// (resolveAndAuthorize, then read the canonical path) — probing the
+// Core FS API directly measures libc's permissions rather than this
+// agent's sandbox, which reports "no FS sandbox" on a correctly
+// sandboxed agent and leaks a snippet of an out-of-roots file to the
+// client. This is the whole point of the method, so it is worth the
+// duplication with handleFsReadFile.
 void handleFsSelftest(const Responder& rsp, const json&) {
     constexpr const char* kProbePath = "/etc/passwd";
+    int authCode = 0;
+    std::string authErr;
+    auto canon = resolveAndAuthorize(kProbePath, authCode, authErr);
+    if (!canon) {
+        rsp.result(json{
+            {"probe", kProbePath},
+            {"succeeded", false},
+            {"errorCode", authCode == kPermissionDenied ? "PERMISSION_DENIED"
+                                                        : "NOT_FOUND"},
+            {"reason", authErr},
+            {"firstBytesReadable", 0},
+            {"sampleSnippet", ""}});
+        return;
+    }
     char* buf = nullptr;
     int64_t size = 0;
-    GRCError e = grc_fs_read_file(kProbePath, &buf, &size);
+    GRCError e = grc_fs_read_file(canon->c_str(), &buf, &size);
     bool succeeded = (e == GRC_SUCCESS);
     int firstBytes = 0;
     std::string sample;
@@ -2850,6 +3774,8 @@ void dispatch(const std::string& method, const Responder& rsp, const json& param
         handleShowFile(rsp, params);
     } else if (method == "git.diff") {
         handleGitDiff(rsp, params);
+    } else if (method == "git.exec") {
+        handleGitExec(rsp, params);
     } else if (method == "git.isAncestor") {
         handleIsAncestor(rsp, params);
     } else if (method == "fs.readFile") {
@@ -2878,6 +3804,22 @@ void dispatch(const std::string& method, const Responder& rsp, const json& param
         handleMetaStat(rsp, params);
     } else if (method == "meta.capabilities") {
         handleMetaCapabilities(rsp, params);
+    } else if (method == "fs.stat") {
+        handleFsStat(rsp, params);
+    } else if (method == "fs.statBatch") {
+        handleFsStatBatch(rsp, params);
+    } else if (method == "fs.writeFile") {
+        handleFsWriteFile(rsp, params);
+    } else if (method == "fs.mkdir") {
+        handleFsMkdir(rsp, params);
+    } else if (method == "fs.delete") {
+        handleFsDelete(rsp, params);
+    } else if (method == "fs.rename") {
+        handleFsRename(rsp, params);
+    } else if (method == "fs.copy") {
+        handleFsCopy(rsp, params);
+    } else if (method == "fs.chmod") {
+        handleFsChmod(rsp, params);
     } else if (method == "fs.selftest") {
         handleFsSelftest(rsp, params);
     } else if (method == "logs.tail") {
@@ -3123,6 +4065,109 @@ void handleIncoming(const std::string& frameBody) {
 
 }  // namespace
 
+// ---- Startup options -------------------------------------------------
+//
+// The agent is configured two ways: flags on the exec line, and a
+// config file streamed to the host alongside the binary. Both feed the
+// SAME table below -- a setting that works one way works the other,
+// and neither can quietly gain an option the other lacks.
+
+struct StartupOptions;
+bool applyConfigFile(const std::string& path, StartupOptions& opts);
+
+struct StartupOptions {
+    std::string logPath;
+    LogLevel logLevel = LogLevel::Info;   // default once --log is given
+    std::vector<std::string> allowedRoots;
+};
+
+bool optionIsBoolean(const std::string& key) {
+    return key == "allow-write";
+}
+
+// Apply one setting. Returns false with a reason for anything unknown;
+// callers warn rather than exit, so one stale line in a shared config
+// file cannot stop an agent from starting.
+bool applyOption(const std::string& key, const std::string& value,
+                 StartupOptions& opts, std::string& err) {
+    if (key == "log") { opts.logPath = value; return true; }
+    if (key == "log-level") { opts.logLevel = parseLogLevel(value); return true; }
+    if (key == "allow-root") { opts.allowedRoots.push_back(value); return true; }
+    if (key == "allow-write") {
+        g_allowWrite = !(value == "false" || value == "no" || value == "0");
+        return true;
+    }
+    if (key == "git-exec") { g_gitExecAllowed.push_back(value); return true; }
+    if (key == "git-exec-config") {
+        g_gitExecConfigKeys.push_back(asciiLower(value));
+        return true;
+    }
+    if (key == "git-exec-preset") {
+        if (value == "read-only" || value == "magit") {
+            for (const char* sub : kGitExecReadOnly)
+                g_gitExecAllowed.emplace_back(sub);
+        }
+        if (value == "magit") {
+            for (const char* sub : kGitExecMagit)
+                g_gitExecAllowed.emplace_back(sub);
+        }
+        if (value != "read-only" && value != "magit") {
+            err = "unknown git-exec-preset '" + value +
+                  "' (read-only|magit); ignoring";
+            return false;
+        }
+        return true;
+    }
+    if (key == "config") return applyConfigFile(value, opts);
+    err = "unknown option '" + key + "'; ignoring";
+    return false;
+}
+
+// A config file is `key = value`, one per line, `#` to end of line for
+// comments. Repeatable keys (allow-root, git-exec) accumulate. A bare
+// `key` means true, for the booleans.
+//
+// Deliberately not JSON: this is written by hand and read by humans
+// deciding what a machine may touch.
+bool applyConfigFile(const std::string& path, StartupOptions& opts) {
+    const std::string resolved = resolveRoot(path);
+    std::ifstream in(resolved);
+    if (!in) {
+        std::fprintf(stderr, "scrutiny-agent: cannot read config %s\n",
+                     resolved.c_str());
+        return true;   // not fatal: the exec line may carry everything
+    }
+    auto trim = [](std::string& text) {
+        const char* ws = " \t\r\n";
+        const auto begin = text.find_first_not_of(ws);
+        if (begin == std::string::npos) { text.clear(); return; }
+        text = text.substr(begin, text.find_last_not_of(ws) - begin + 1);
+    };
+    std::string line;
+    int lineNo = 0;
+    while (std::getline(in, line)) {
+        ++lineNo;
+        if (auto hash = line.find('#'); hash != std::string::npos)
+            line.erase(hash);
+        trim(line);
+        if (line.empty()) continue;
+        std::string key = line, value = "true";
+        if (auto eq = line.find('='); eq != std::string::npos) {
+            key = line.substr(0, eq);
+            value = line.substr(eq + 1);
+            trim(key);
+            trim(value);
+        }
+        std::string err;
+        if (!applyOption(asciiLower(key), value, opts, err)) {
+            std::fprintf(stderr, "scrutiny-agent: %s:%d: %s\n",
+                         resolved.c_str(), lineNo, err.c_str());
+        }
+    }
+    std::fprintf(stderr, "scrutiny-agent: config: %s\n", resolved.c_str());
+    return true;
+}
+
 int main(int argc, char** argv) {
     // askpass mode: git invoked us as `$GIT_ASKPASS "<prompt>"` with
     // SCRUTINY_CRED_SOCK set (the credential broker). Handle and exit
@@ -3145,23 +4190,74 @@ int main(int argc, char** argv) {
     // symlink resolution, lie inside one of these roots. Relative
     // values anchor under $HOME (same convention as the cache/clone
     // roots). If no --allow-root is given the floor is $HOME.
-    std::string wantLogPath;
-    LogLevel wantLogLevel = LogLevel::Info;  // default when --log is given
-    std::vector<std::string> rawAllowedRoots;
+    StartupOptions opts;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
+            // Also the client's post-install verification probe: it
+            // proves the file execs, that dynamic linking resolved,
+            // and that the binary is the version that was intended --
+            // all before a single protocol frame is sent.
             std::printf("%s proto %d\n", kAgentVersion, kProtocolVersion);
             return 0;
         }
-        if (std::strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
-            wantLogPath = argv[++i];
-        } else if (std::strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
-            wantLogLevel = parseLogLevel(argv[++i]);
-        } else if (std::strcmp(argv[i], "--allow-root") == 0 && i + 1 < argc) {
-            rawAllowedRoots.emplace_back(argv[++i]);
+        if (std::strcmp(argv[i], "--help") == 0 ||
+            std::strcmp(argv[i], "-h") == 0) {
+            std::printf(
+                "scrutiny-agent %s (protocol %d)\n"
+                "\n"
+                "The remote backend for Scrutiny. Speaks JSON-RPC 2.0 over\n"
+                "LSP-style Content-Length framing on stdin/stdout; a client\n"
+                "spawns it over ssh/tsh/kubectl-exec and talks to it there.\n"
+                "Not interactive -- running it by hand just waits on stdin.\n"
+                "\n"
+                "Usage: scrutiny-agent --rpc-stdio [options]\n"
+                "\n"
+                "  --config <path>          read options from a file\n"
+                "                           (key = value, # comments)\n"
+                "  --allow-root <path>      filesystem sandbox root; repeatable.\n"
+                "                           Relative paths anchor under $HOME.\n"
+                "                           Defaults to $HOME.\n"
+                "  --allow-write            serve the fs write methods\n"
+                "                           (off by default: read-only)\n"
+                "  --git-exec <subcommand>  allow one git subcommand via\n"
+                "                           git.exec; repeatable\n"
+                "  --git-exec-preset <name> read-only | magit\n"
+                "  --git-exec-config <key>  extra `-c' key git.exec may set\n"
+                "  --log <path>             write a log file\n"
+                "  --log-level <level>      off|error|warn|info|debug|trace\n"
+                "  --version                print '<version> proto <n>'\n"
+                "  --help                   this text\n"
+                "\n"
+                "Every option has a config-file key of the same name without\n"
+                "the leading dashes. See docs/protocol.md for the wire API.\n",
+                kAgentVersion, kProtocolVersion);
+            return 0;
         }
-        // --rpc-stdio (default mode) and anything else: fall through.
+        const std::string flag = argv[i];
+        if (flag.rfind("--", 0) != 0) continue;   // --rpc-stdio, stray words
+        const std::string key = flag.substr(2);
+        if (key == "rpc-stdio") continue;
+        // Booleans take no value; everything else consumes the next
+        // argument. One table drives this and the config file both, so
+        // the two can never drift apart.
+        const bool wantsValue = !optionIsBoolean(key);
+        std::string value = "true";
+        if (wantsValue) {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "scrutiny-agent: %s needs a value\n",
+                             flag.c_str());
+                continue;
+            }
+            value = argv[++i];
+        }
+        std::string err;
+        if (!applyOption(key, value, opts, err)) {
+            std::fprintf(stderr, "scrutiny-agent: %s\n", err.c_str());
+        }
     }
+    const std::string wantLogPath = opts.logPath;
+    const LogLevel wantLogLevel = opts.logLevel;
+    std::vector<std::string>& rawAllowedRoots = opts.allowedRoots;
     if (!wantLogPath.empty() && wantLogLevel != LogLevel::Off) {
         g_logPath = wantLogPath;
         g_logLevel.store(static_cast<int>(wantLogLevel),
@@ -3206,6 +4302,29 @@ int main(int argc, char** argv) {
         } else {
             for (const auto& r : g_allowedRoots)
                 std::fprintf(stderr, " %s", r.c_str());
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+    for (const char* key : kGitExecConfigDefaults)
+        g_gitExecConfigKeys.emplace_back(key);
+    {
+        std::vector<std::string> uniq;
+        for (auto& sub : g_gitExecAllowed) {
+            if (std::find(uniq.begin(), uniq.end(), sub) == uniq.end())
+                uniq.emplace_back(std::move(sub));
+        }
+        std::sort(uniq.begin(), uniq.end());
+        g_gitExecAllowed = std::move(uniq);
+        std::fprintf(stderr, "scrutiny-agent: fs writes: %s\n",
+                     g_allowWrite ? "enabled (--allow-write)"
+                                  : "disabled (read-only)");
+        std::fprintf(stderr, "scrutiny-agent: git.exec:");
+        if (g_gitExecAllowed.empty()) {
+            std::fprintf(stderr, " disabled");
+        } else {
+            for (const auto& sub : g_gitExecAllowed)
+                std::fprintf(stderr, " %s", sub.c_str());
         }
         std::fprintf(stderr, "\n");
         std::fflush(stderr);
@@ -3262,10 +4381,21 @@ int main(int argc, char** argv) {
     for (int i = 0; i < kPoolSize; ++i) pool.emplace_back(workerLoop);
 
     // Reader loop (this thread). Reads frames, classifies, routes.
+    // Only EOF ends the session: a malformed header block is reported
+    // and skipped, exactly as a malformed JSON body is, so one bad line
+    // on the pipe cannot take down a long-lived connection.
     while (true) {
-        auto frame = readFrame();
-        if (!frame) break;  // clean EOF -> transport closed
-        handleIncoming(*frame);
+        FrameRead frame = readFrame();
+        if (frame.status == FrameStatus::Eof) break;  // transport closed
+        if (frame.status == FrameStatus::Malformed) {
+            if (!frame.reason.empty()) {
+                if (logOn(LogLevel::Warn))
+                    logWrite(LogLevel::Warn, "framing error: " + frame.reason);
+                sendNullIdError(kInvalidRequest, frame.reason);
+            }
+            continue;
+        }
+        handleIncoming(frame.body);
     }
 
     // Shutdown: no more input. Let workers drain the queue and finish

@@ -11,10 +11,69 @@ The agent is spawned over a user-supplied stdio transport (ssh /
 `ssh -J` / tsh / `kubectl exec` / a local shell / ...) as:
 
 ```
-scrutiny-agent --rpc-stdio [--log <path>] [--log-level <lvl>] [--allow-root <path>]...
+scrutiny-agent --rpc-stdio [--config <path>] [--log <path>] [--log-level <lvl>]
+                           [--allow-root <path>]... [--allow-write]
+                           [--git-exec <sub>]... [--git-exec-preset <name>]
+                           [--git-exec-config <key>]...
 ```
 
+`--config <path>` reads settings from a file: one `key = value` per
+line, `#` to end of line for comments, a bare `key` meaning true.
+Every flag above has a config key with the same name minus the
+leading dashes (`allow-root`, `allow-write`, `git-exec-preset`, …),
+and repeatable flags accumulate. Flags and file feed the same table,
+so neither can gain an option the other lacks; both apply, in the
+order they are read. Relative config paths anchor under `$HOME`. An
+unreadable file or an unknown key warns on stderr rather than
+aborting — one stale line in a shared config must not stop an agent
+from starting.
+
+The point of a file is that policy lives on the host: it is readable
+and editable where the agent runs, it survives reconnects, and every
+client bootstrapping into the same install directory agrees about
+what the agent may touch.
+
 `--version` prints `<agentVersion> proto <protocolVersion>` and exits.
+
+## Bootstrap
+
+Before any frame is exchanged, a client gets the right binary onto the
+host and proves it runs. The sequence is fixed, and every step is a
+marker-terminated line with its own deadline, so a failure names
+itself instead of surfacing as a timeout at the handshake.
+
+| # | Step | Sent | Reply |
+| --- | --- | --- | --- |
+| 1 | **Probe the platform** | `echo __SCRA_PROBE__ $(uname -s) $(uname -m)` | `__SCRA_PROBE__ Linux x86_64` |
+| 2 | **Check what is installed** | sha256 the installed binary | `__SCRA_ST__ OK` \| `__SCRA_ST__ <hash>` \| `__SCRA_ST__ MISSING` |
+| 3 | **Install** (only if 2 was not `OK`) | base64 heredoc, then hash-gate and atomic rename | `__SCRA_INST__ OK` \| `__SCRA_INST__ <hash>` |
+| 4 | **Verify it runs** | `"$B" --version` | `__SCRA_VERIFY__ <status> <output>` |
+| 5 | **Install the config** (hash-gated like 2/3) | base64 heredoc | `__SCRA_CFG__ …`, `__SCRA_CFGDONE__ OK` |
+| 6 | **Hand over** | `echo __SCRA_EXEC__; exec "$B" --rpc-stdio …` | `__SCRA_EXEC__` |
+
+**Step 1** uses only `uname -s` and `uname -m`: both are POSIX, and
+both exist everywhere this could run. `uname -o`/`-i`/`-p` are not
+portable. `uname -m` spellings are normalized (`amd64` → `x86_64`,
+`arm64` → `aarch64`) before selecting an asset. A platform with no
+published binary is an error naming what was found — distinct from a
+binary that is present but broken.
+
+**Step 4** is what makes a bad binary diagnosable. `--version` is the
+no-op probe because one line answers three questions at once: the file
+execs (a wrong architecture fails here with `Exec format error`),
+dynamic linking resolved (a missing `libc`/`libsqlite3` fails here),
+and the binary is the version that was intended. The exit status is
+returned with the output flattened to one line, so the client reports
+*why* rather than timing out at `meta.hello` twenty seconds later.
+
+**Step 6**'s marker closes a real race. The shell reads its script
+from the same pipe the protocol will use; anything written before it
+has consumed the exec line can be swallowed by its read-ahead and
+never reach the agent, which then waits on stdin while the client
+times out on a handshake it did send. Echoing on the *same line* as
+the exec means that when the marker arrives the shell has read exactly
+up to that newline and no further, leaving everything after it
+untouched in the pipe for the agent to inherit.
 
 ## Framing
 
@@ -49,6 +108,15 @@ A frame that is not valid JSON is answered with a null-id
 with an `id` but no string `method` is answered `INVALID_REQUEST`. An
 unknown method is answered `NOT_FOUND` with message
 `unknown method: <name>`.
+
+The `Content-Length` header is matched case-insensitively. A header
+block that carries no `Content-Length` at all is answered with a
+null-id `INVALID_REQUEST` and skipped -- it does **not** end the
+session. This matters because the transport is a shell pipe: a late
+login banner or a stray `motd` line arriving on stdin must not be
+indistinguishable from the transport closing. Only EOF ends a
+session. A bare `\r\n\r\n` between frames is padding and is
+ignored silently.
 
 ### Streaming large bodies (`rpc.chunk`)
 
@@ -132,6 +200,13 @@ When git prompts, the agent emits a `cred.request` notification
 `cred.provide` request `{ credId, value }`. The secret exists on the
 agent only transiently, in the broker→askpass pipe.
 
+Two consequences the implementation must preserve: the broker's unix
+socket lives in `$TMPDIR` (not in the repository -- `sun_path` is 108
+bytes, and anchoring in the repo broke every brokered op for
+checkouts deeper than ~85 characters, besides littering the work
+tree), and `value` is redacted from the agent's log at **every** log
+level, since `logs.tail` streams that log back to the client.
+
 ## Methods
 
 Reference of request params → result shape. All `path` params are
@@ -144,7 +219,7 @@ absolute; relative cache/install paths anchor under `$HOME`.
 | `meta.hello` | `clientVersion`, `supportedProtocolVersions[]`, `frameCap?` | `{ agentVersion, protocolVersion, frameCap, capabilities[] }` |
 | `meta.debug` | `sleepMs?`, `padBytes?` | `{ echoId, pad }` — diagnostics: sleeps (cancellable), pads the result to exercise chunking |
 | `meta.stat` | — | `{ lanes: {interactive,normal,bulk}, lspSessions, lspTunnels, uptimeMs, gitParallel, logLevel, agentVersion }` |
-| `meta.capabilities` | — | `{ agentVersion, protocolVersion, outboundIO[], fileSystemAccess{}, languageServers{}, network, selftestMethod }` — the agent's security/IO posture |
+| `meta.capabilities` | — | `{ agentVersion, protocolVersion, outboundIO[], fileSystemAccess{}, languageServers{}, network, selftestMethod }` — the agent's security/IO posture. `fileSystemAccess` carries `allowedRoots` (the roots **this process** is running with, so a client reports fact rather than default), `writable` (whether the write surface is served), and `home` (the remote `$HOME` — a client needs it to expand `~`, and cannot discover it by listing when `$HOME` is not itself inside the roots). |
 | `logs.tail` | `maxBytes?` (≤ 1 MiB) | `{ enabled, path?, level?, bytes?, text? }` — tail of the `--log` file; `{ enabled: false }` when logging is off |
 
 ### git.* (read surfaces)
@@ -152,7 +227,7 @@ absolute; relative cache/install paths anchor under `$HOME`.
 | Method | Params | Result |
 | --- | --- | --- |
 | `git.headSha` | `path` | `{ headSha }` |
-| `git.repoMetadata` | `path` | `{ path, isBare, headSha, currentBranch, hasUncommittedChanges }` |
+| `git.repoMetadata` | `path` | `{ path, gitDir, isBare, headSha, currentBranch, hasUncommittedChanges }` — `path` is the **work tree** (what every other `git.*` `path` param means, and what a UI should display); `gitDir` is libgit2's repository path (`<repo>/.git/`). For a bare repo both are the gitdir. |
 | `git.remotes` | `path` | `{ remotes: [{ name, url, pushUrl }] }` (pushUrl falls back to url) |
 | `git.branches` | `path`, `local?`, `remote?` | `{ branches: [{ name, refname, targetOid, isRemote, isHead, upstream\|null, remoteName\|null }] }` |
 | `git.commits` | `path`, `branch?`, `limit?` (default 100) | `{ commits: [{ oid, shortOid, message, summary, authorName, authorEmail, authorTime, parentOids[] }] }` newest first |
@@ -163,6 +238,8 @@ absolute; relative cache/install paths anchor under `$HOME`.
 | `git.showFile` | `path`, `sha`, `file` | `{ content: string\|null }` (missing path in commit → null) |
 | `git.diff` | `path`, `from`, `to`, `file` | `{ diff: string\|null }` (`git diff` subprocess; immutable by key) |
 | `git.isAncestor` | `path`, `ancestor`, `descendant` | `{ isAncestor }` (`git merge-base --is-ancestor`) |
+
+`git.exec` (below) covers anything else, when the operator enables it.
 
 `FileDiff` = `{ status (libgit2 int), oldPath, newPath, patch,
 hunks: [{ oldStart, oldLines, newStart, newLines, header,
@@ -177,13 +254,103 @@ lines: [{ origin (1-char), content, oldLineNo, newLineNo }] }] }`.
 | `git.fetch` | `repoPath`, `authOpId` | `{ ok, lastFetched }` (`git fetch --all --prune`) |
 | `git.ensureRepository` | `fullName`, `cloneURL`, `installDir`, `authOpId` | `{ localPath, cloneURL, lastFetched }` — fetch if present else clone |
 
+### git.exec (allowlisted general git; opt-in)
+
+`git.exec` runs a git subcommand the agent has no typed method for, so
+a real git UI can drive the remote over the one multiplexed
+connection instead of a subprocess per invocation. It is the widest
+method in the protocol and is therefore **off unless the operator
+enables it**, and is advertised in `meta.hello` only when enabled.
+
+```
+scrutiny-agent --rpc-stdio \
+    [--git-exec <subcommand>]...      allow one subcommand
+    [--git-exec-preset read-only|magit]
+    [--git-exec-config <key>]...      extend the -c allowlist
+```
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `git.exec` | `repoPath`, `args[]`, `authOpId?` | `{ exitCode, stdout, stderr, truncated }` |
+
+A non-zero `exitCode` is **data, not an error**: git answers questions
+with exit codes (`diff --quiet`, `merge-base --is-ancestor`). Output
+is capped at 16 MiB per stream, with `truncated: true` when the cap
+bites. Subcommands that can reach the network (`fetch`, `pull`,
+`push`, `ls-remote`, `clone`, `submodule`) go through the credential
+broker when `authOpId` is given. Runs on the `normal` lane by default;
+override with the top-level `lane` field.
+
+Two checks, and the second is the one that matters:
+
+1. The subcommand must be on the allowlist.
+2. No argument may be one of git's "run this command for me" options.
+   **A subcommand allowlist alone is not security**: `-c
+   core.pager=…`, `-c credential.helper=…`, `-c alias.x=!…`,
+   `--upload-pack=`, `--receive-pack=`, `--exec-path=` and friends
+   turn *any* permitted subcommand into arbitrary code execution.
+   Also refused: `--git-dir`/`--work-tree`/`-C`/`--namespace` (which
+   would move the repository out from under `repoPath`),
+   `--gpg-sign=`, `--output=`, and `--textconv`. Before the
+   subcommand, only a fixed set of global options is accepted at all,
+   so an unanticipated spelling cannot slip through.
+
+`-c <key>=<value>` is permitted before the subcommand for an
+allowlisted set of *keys* — formatting and local-behavior settings
+only (`color.*`, `advice.*`, `core.preloadIndex`, `log.showSignature`,
+`diff.noPrefix`, …). Keys are allowlisted rather than deny-listed
+because the execution-capable ones are too many and too easily
+extended for a deny list to be trustworthy. This set exists because
+magit sends `-c core.preloadIndex=true -c log.showSignature=false -c
+color.ui=false -c color.diff=false -c diff.noPrefix=false` on every
+invocation; refusing `-c` outright would mean refusing magit.
+
+Failures of the policy answer `PERMISSION_DENIED` (1005) and start no
+process at all. Repository-local config and hooks are out of scope
+here: they are the user's own, already reachable through `git.fetch`,
+and equally in play for every other `git.*` method. What the policy
+prevents is the *client* injecting them.
+
 ### fs.*
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `fs.readFile` | `path` | `{ content }` (sandboxed; binary-safe emit) |
-| `fs.listDirectory` | `path` | `{ path (canonical absolute), entries: [{ name, isDir }] }` sorted by name; symlinks followed for `isDir` |
-| `fs.selftest` | — | `{ probe, succeeded, errorCode, firstBytesReadable, sampleSnippet }` — runtime sandbox probe of /etc/passwd |
+| `fs.readFile` | `path`, `base64?`, `stat?` | `{ content }`, or `{ contentBase64 }` with `base64: true`; `stat: true` adds `size`, `mtime`, `mode`. Base64 exists because a JSON string cannot carry arbitrary bytes — a client that must reproduce a file exactly asks for it. |
+| `fs.listDirectory` | `path`, `attributes?` | `{ path (canonical absolute), entries: [{ name, isDir }] }` sorted by name; symlinks followed for `isDir`. With `attributes: true` each entry also carries `size`, `mtime`, `mode`, `isRegular`, `isSymlink`, `symlinkTarget`, `uid`, `gid`, `readable`, `writable`, and `path` (the resolved name, so a client can answer `file-truename` from the listing) — one request answers everything a client is about to ask about that directory. |
+| `fs.stat` | `path` | `{ exists, isDir, isRegular, isSymlink, symlinkTarget, size, mtime, mode, uid, gid, readable, writable, path }`, or `{ exists: false }`. **Does not follow the final component**: the parent is canonicalized and authorized, then the leaf is `lstat`ed, so a symlink is described rather than resolved away (`path` still names the resolved target). A path inside the roots that is simply absent answers `exists: false`, not an error — that is the question being asked. |
+| `fs.statBatch` | `paths[]` | `{ stats: [...] }` in the order asked. One bad path yields a per-entry `{ exists: false }` (plus `denied: true` when outside the roots) rather than failing the batch. |
+| `fs.selftest` | — | `{ probe, succeeded, errorCode, reason?, firstBytesReadable, sampleSnippet }` — runtime sandbox probe of /etc/passwd. The probe takes the same route a client request takes (resolve, authorize, read the canonical path), so it reports **this agent's** posture; a denied probe returns `succeeded: false`, `errorCode: "PERMISSION_DENIED"`, and no content. |
+
+### fs.* (writes; opt-in)
+
+The agent is read-only unless started with `--allow-write`; the write
+methods are advertised in `meta.hello` only when it is, and
+`meta.capabilities.fileSystemAccess.writable` reports the posture.
+Writes are confined to the same `--allow-root` sandbox — `--allow-write`
+widens *what* may be done to a path, never *which* paths are reachable.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `fs.writeFile` | `path`, `content` \| `contentBase64`, `mode?`, `createDirs?` | `{ ok, size, mtime }` |
+| `fs.mkdir` | `path`, `parents?` | `{ ok }` |
+| `fs.delete` | `path`, `recursive?` | `{ ok, removed }` |
+| `fs.rename` | `from`, `to` | `{ ok }` |
+| `fs.copy` | `from`, `to`, `overwrite?` | `{ ok }` |
+| `fs.chmod` | `path`, `mode` | `{ ok }` |
+
+`fs.writeFile` is **atomic**: the bytes go to a temp file beside the
+target, are `fsync`ed, then `rename`d over it. A crash or a dropped
+transport leaves either the old file or the new one, never a truncated
+buffer. An existing file's mode is preserved unless `mode` is given,
+so saving an executable script does not silently drop its `+x` bit.
+The returned `mtime` lets a client track the file without a second
+round trip.
+
+Authorizing a path that does not exist yet resolves the deepest
+component that does and appends the rest, so every existing directory
+along the way is symlink-resolved and checked. A symlink inside the
+roots therefore cannot become a door out of them, and `fs.rename` /
+`fs.copy` authorize **both** ends.
 
 ### lsp.* (request-level queries)
 
