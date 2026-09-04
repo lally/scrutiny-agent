@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang cmake ninja-build python3 git libsqlite3-dev
+            clang cmake ninja-build python3 python3-venv git
           pipx install "conan>=2,<3"
           conan --version && cmake --version && clang --version | head -1
 
@@ -88,6 +88,14 @@ jobs:
           python3 tests/conformance/conformance.py \
             build/agent/scrutiny-agent --agent-version "$VER"
 
+      # The behavioral suite: framing, handshake, chunking,
+      # cancellation, lanes, the fs sandbox, the credential broker, and
+      # every git/lsp/index/watch/diffcache surface, against hermetic
+      # fixtures. run-tests.sh provisions its own venv (including pylsp,
+      # so the LSP paths assert rather than skip).
+      - name: Python test suite
+        run: tests/run-tests.sh -q
+
       # Emacs client: byte-compile as a lint, then the ERT suite. The
       # integration test does the REAL bootstrap over a local `sh`
       # transport against the binary built above (base64 streaming,
@@ -101,4 +109,68 @@ jobs:
           rm -f emacs/*.elc
           SCRUTINY_AGENT_BIN="$PWD/build/agent/scrutiny-agent" \
             emacs -Q --batch -L emacs -l emacs/scrutiny-agent-tests.el \
+            -f ert-run-tests-batch-and-exit
+
+      # The ops/UI/verify layers, driven against a real agent over a
+      # local `sh' transport. The verify harness asserts that every
+      # capability meta.hello advertises is exercised from the Emacs
+      # side too, so a protocol addition cannot land unverified.
+      # Five linters, because each catches something the others miss.
+      # package-lint is the one that matters most here: it compares what
+      # the code uses against the Emacs version the package claims, and
+      # caught `defvar-keymap' (29.1) in a file declaring 28.1 -- a
+      # package that installs and then fails to load.
+      #
+      # --elsa adds static type inference, compared against
+      # emacs/.elsa-baseline: a file whose count goes UP fails. The
+      # count is not zero because part of the residue is Elsa's own
+      # blind spots (cl-defstruct accessors, callbacks, defcustom
+      # defaults); the baseline is what makes the delta legible anyway.
+      # It costs a few minutes, which is why it is one step and not
+      # part of every developer's inner loop.
+      - name: Lint the Emacs Lisp
+        run: scripts/lint-elisp.sh --elsa
+
+      # magit routing: which invocations get sent over git.exec, how
+      # output is placed, and -- with magit installed -- that magit's
+      # own readers return the same answers over the agent as they do
+      # from a subprocess.
+      - name: Emacs magit routing suite
+        run: |
+          emacs -Q --batch --eval "(progn \
+            (require 'package) \
+            (add-to-list 'package-archives \
+                         '(\"melpa\" . \"https://melpa.org/packages/\")) \
+            (package-initialize) (package-refresh-contents) \
+            (package-install 'magit))" || \
+            echo "magit unavailable; the magit-API test will skip"
+          PATH="$PWD/tests/.venv/bin:$PATH" \
+          SCRUTINY_AGENT_BIN="$PWD/build/agent/scrutiny-agent" \
+            emacs -Q --batch -L emacs \
+            --eval "(progn (require 'package) (package-initialize))" \
+            -l emacs/scrutiny-agent-magit-tests.el \
+            -f ert-run-tests-batch-and-exit
+
+      # The file-name handler: fidelity of every read and write, plus
+      # the ordering property that decides whether it is reached at all
+      # (a handler registered behind TRAMP's is inert).
+      - name: Emacs file handler suite
+        run: |
+          PATH="$PWD/tests/.venv/bin:$PATH" \
+          SCRUTINY_AGENT_BIN="$PWD/build/agent/scrutiny-agent" \
+            emacs -Q --batch -L emacs \
+            -l emacs/scrutiny-agent-fs-tests.el \
+            -f ert-run-tests-batch-and-exit
+
+      - name: Emacs ops/UI suite
+        run: |
+          emacs -Q --batch -L emacs -f batch-byte-compile \
+            emacs/scrutiny-agent-ops.el emacs/scrutiny-agent-ui.el \
+            emacs/scrutiny-agent-verify.el emacs/scrutiny-agent-xref.el \
+            emacs/scrutiny-agent-fs.el emacs/scrutiny-agent-remote.el
+          bash -n scripts/build-agents.sh
+          rm -f emacs/*.elc
+          PATH="$PWD/tests/.venv/bin:$PATH" \
+          SCRUTINY_AGENT_BIN="$PWD/build/agent/scrutiny-agent" \
+            emacs -Q --batch -L emacs -l emacs/scrutiny-agent-ui-tests.el \
             -f ert-run-tests-batch-and-exit
