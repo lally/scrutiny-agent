@@ -7,3 +7,20 @@ __pycache__/
 .DS_Store
 *.profraw
 compile_commands.json
+.venv-test/
+.build-venv/
+tests/.venv/
+
+# Cargo build output from the rust indexer fixture: rust-analyzer
+# regenerates this whenever the indexer tests run.
+core/tests/fixtures/rust/target/
+
+# Agent log written when a test host is configured with --log.
+scrutiny-agent.log
+
+# Elsa analysis cache (scripts/lint-elisp.sh --elsa).
+emacs/.elsa/
+.lint-elpa/
+
+# Release artifacts from scripts/package-emacs.sh.
+dist/
