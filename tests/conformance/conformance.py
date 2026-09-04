@@ -17,6 +17,14 @@ only. Every wait is bounded so a hung agent fails fast.
 The normative protocol description lives in docs/protocol.md; the
 method-level assertions here mirror it.
 
+This suite answers one question: does the binary implement the wire
+API it advertises? For behavior *depth* -- framing edge cases,
+chunking, lane scheduling, sandbox escapes, the credential broker,
+per-method semantics against real fixtures -- see the pytest suite
+next to it (`tests/run-tests.sh`), which shares no code with this
+file on purpose: an agreement between two independent clients is
+worth more than one client agreeing with itself.
+
 Usage: conformance.py /path/to/scrutiny-agent [--agent-version X.Y.Z]
 
 Exit 0 = fully conformant; 1 = at least one failed check; 2 = usage.
@@ -633,6 +641,44 @@ def t_ensure_repository(ctx):
           "present repo -> fetched in place (same localPath)")
 
 
+@conformance("git.exec")
+def t_git_exec(ctx):
+    repo, head, _ = ctx.fx.repo()
+    r = ctx.a.call("git.exec",
+                   {"repoPath": repo, "args": ["rev-parse", "HEAD"]})
+    check(r.get("stdout", "").strip() == head,
+          "git.exec rev-parse HEAD matches the repository")
+    check(r.get("exitCode") == 0 and r.get("truncated") is False,
+          "git.exec result shape { exitCode, stdout, stderr, truncated }")
+    bad = ctx.a.call("git.exec",
+                     {"repoPath": repo, "args": ["rev-parse", "no-such-ref"]})
+    check(bad.get("exitCode") != 0 and bad.get("stderr"),
+          "non-zero exit is reported as data, with stderr")
+    # The allowlist, and the argument scan that makes it meaningful.
+    check(ctx.a.call_error(
+        "git.exec", {"repoPath": repo,
+                     "args": ["commit", "-m", "x"]}).code == PERMISSION_DENIED,
+        "subcommand outside the allowlist -> PERMISSION_DENIED 1005")
+    check(ctx.a.call_error(
+        "git.exec", {"repoPath": repo,
+                     "args": ["-c", "core.pager=id", "log"]}).code ==
+        PERMISSION_DENIED,
+        "-c core.pager (arbitrary execution) -> PERMISSION_DENIED 1005")
+    check(ctx.a.call_error(
+        "git.exec", {"repoPath": repo,
+                     "args": ["--git-dir=/etc", "status"]}).code ==
+        PERMISSION_DENIED,
+        "--git-dir relocation -> PERMISSION_DENIED 1005")
+    check(ctx.a.call("git.exec",
+                     {"repoPath": repo,
+                      "args": ["-c", "color.ui=false", "status",
+                               "--porcelain"]}).get("exitCode") == 0,
+          "-c with an allowlisted key is accepted")
+    check(ctx.a.call_error("git.exec", {"repoPath": repo}).code ==
+          INVALID_REQUEST,
+          "git.exec missing 'args' -> INVALID_REQUEST 1002")
+
+
 # ---- fs.* ------------------------------------------------------------
 @conformance("fs.readFile")
 def t_fs_read_file(ctx):
@@ -672,6 +718,87 @@ def t_fs_list_directory(ctx):
     check(ctx.a.call_error(
         "fs.listDirectory", {"path": "/no/such/conf/dir"}).code == NOT_FOUND,
         "missing dir -> NOT_FOUND 1001")
+
+
+@conformance("fs.stat", "fs.statBatch")
+def t_fs_stat(ctx):
+    tree = ctx.fx.tree()
+    st = ctx.a.call("fs.stat", {"path": os.path.join(tree, "gamma.txt")})
+    check(st.get("exists") is True and st.get("isRegular") is True,
+          "fs.stat reports an existing regular file")
+    check(st.get("size") == 1 and isinstance(st.get("mtime"), int),
+          "fs.stat carries size and mtime")
+    check(ctx.a.call("fs.stat",
+                     {"path": os.path.join(tree, "nope")}).get("exists")
+          is False,
+          "fs.stat on a missing path -> { exists: false }, not an error")
+    link = ctx.a.call("fs.stat", {"path": os.path.join(tree, "link-to-alpha")})
+    check(link.get("isSymlink") is True,
+          "fs.stat describes a symlink rather than following it")
+    batch = ctx.a.call("fs.statBatch",
+                       {"paths": [os.path.join(tree, "gamma.txt"),
+                                  os.path.join(tree, "nope"),
+                                  "/etc/passwd"]})["stats"]
+    check(len(batch) == 3, "fs.statBatch answers in the order asked")
+    check(batch[0].get("exists") is True and batch[1].get("exists") is False,
+          "fs.statBatch reports per-path results")
+    check(batch[2].get("exists") is False,
+          "fs.statBatch does not leak an out-of-roots path")
+    entries = ctx.a.call("fs.listDirectory",
+                         {"path": tree, "attributes": True})["entries"]
+    check(all("size" in e and "mode" in e for e in entries),
+          "fs.listDirectory attributes:true carries per-entry metadata")
+    check(ctx.a.call_error("fs.stat", {}).code == INVALID_REQUEST,
+          "fs.stat missing 'path' -> INVALID_REQUEST 1002")
+
+
+@conformance("fs.writeFile", "fs.mkdir", "fs.delete", "fs.rename",
+             "fs.copy", "fs.chmod")
+def t_fs_write(ctx):
+    base = ctx.fx.tempdir("conf-write-")
+    target = os.path.join(base, "written.txt")
+    r = ctx.a.call("fs.writeFile", {"path": target, "content": "hello\n"})
+    check(r.get("ok") is True and r.get("size") == 6,
+          "fs.writeFile reports ok and the byte count")
+    check(open(target).read() == "hello\n", "the bytes reached the file")
+    check([n for n in os.listdir(base) if "scrutiny-write" in n] == [],
+          "the atomic write leaves no temp file behind")
+    blob = bytes(range(256))
+    bpath = os.path.join(base, "blob.bin")
+    ctx.a.call("fs.writeFile",
+               {"path": bpath,
+                "contentBase64": base64.b64encode(blob).decode()})
+    check(open(bpath, "rb").read() == blob,
+          "contentBase64 round-trips arbitrary bytes")
+    back = ctx.a.call("fs.readFile", {"path": bpath, "base64": True})
+    check(base64.b64decode(back["contentBase64"]) == blob,
+          "fs.readFile base64:true returns the same bytes")
+    ctx.a.call("fs.mkdir", {"path": os.path.join(base, "a/b"),
+                            "parents": True})
+    check(os.path.isdir(os.path.join(base, "a/b")), "fs.mkdir parents:true")
+    ctx.a.call("fs.rename", {"from": target,
+                             "to": os.path.join(base, "moved.txt")})
+    check(os.path.exists(os.path.join(base, "moved.txt")) and
+          not os.path.exists(target), "fs.rename moves the file")
+    ctx.a.call("fs.copy", {"from": os.path.join(base, "moved.txt"),
+                           "to": os.path.join(base, "copy.txt")})
+    check(os.path.exists(os.path.join(base, "copy.txt")), "fs.copy")
+    ctx.a.call("fs.chmod", {"path": os.path.join(base, "copy.txt"),
+                            "mode": 0o640})
+    check((os.stat(os.path.join(base, "copy.txt")).st_mode & 0o777) == 0o640,
+          "fs.chmod sets the mode")
+    ctx.a.call("fs.delete", {"path": os.path.join(base, "a"),
+                             "recursive": True})
+    check(not os.path.exists(os.path.join(base, "a")),
+          "fs.delete recursive:true")
+    # The sandbox still governs every one of these.
+    check(ctx.a.call_error("fs.writeFile",
+                           {"path": "/etc/scrutiny-conformance",
+                            "content": "x"}).code == PERMISSION_DENIED,
+          "write outside the allowed roots -> PERMISSION_DENIED 1005")
+    check(ctx.a.call_error("fs.writeFile", {"path": target}).code ==
+          INVALID_REQUEST,
+          "fs.writeFile without content -> INVALID_REQUEST 1002")
 
 
 @conformance("fs.selftest")
@@ -1218,7 +1345,14 @@ def run(agent_path, agent_version):
     log_dir = fx.tempdir("conf-log-")
     log_path = os.path.join(log_dir, "agent.log")
     extra = ["--allow-root", tempfile.gettempdir(),
-             "--log", log_path, "--log-level", "info"]
+             "--log", log_path, "--log-level", "info",
+             # git.exec is off unless allowlisted, so enable the
+             # read-only preset here -- otherwise the capability is not
+             # advertised and its conformance check never runs.
+             "--git-exec-preset", "read-only",
+             # Likewise for the fs write surface: unadvertised unless
+             # enabled, so the coverage gate needs it on to check it.
+             "--allow-write"]
     home_root = os.environ.get("HOME") or os.path.expanduser("~")
     if home_root and home_root != "~":
         extra += ["--allow-root", home_root]
