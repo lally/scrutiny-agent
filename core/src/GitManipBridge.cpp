@@ -19,6 +19,7 @@ std::mutex g_error_mutex;
 struct GMRepository {
     std::unique_ptr<gitmanip::Repository> repo;
     std::string path_cache;
+    std::string workdir_cache;
     std::string head_oid_cache;
     std::string current_branch_cache;
 };
@@ -104,6 +105,22 @@ void gm_repository_free(GMRepository* repo) {
 const char* gm_repository_path(GMRepository* repo) {
     if (!repo) return nullptr;
     return repo->path_cache.c_str();
+}
+
+// The work tree, i.e. what a user calls "the repository". Distinct
+// from gm_repository_path(), which is libgit2's gitdir ("<repo>/.git/").
+// nullptr for a bare repository, which has no work tree.
+const char* gm_repository_workdir(GMRepository* repo) {
+    if (!repo) return nullptr;
+    try {
+        const auto workdir = repo->repo->workdir();
+        if (workdir.empty()) return nullptr;
+        repo->workdir_cache = workdir.string();
+        return repo->workdir_cache.c_str();
+    } catch (const std::exception& e) {
+        set_error(e.what());
+        return nullptr;
+    }
 }
 
 bool gm_repository_is_bare(GMRepository* repo) {

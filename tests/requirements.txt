@@ -1,0 +1,10 @@
+# Test-suite dependencies. The client library itself (tests/scrutiny/)
+# is stdlib-only; these are the runner and the language servers the
+# LSP tests exercise when present.
+pytest>=8
+pytest-timeout>=2.3
+pytest-xdist>=3.6
+
+# Optional: install a real language server so the lsp/index/tunnel
+# tests run their semantic assertions instead of skipping.
+python-lsp-server>=1.11
