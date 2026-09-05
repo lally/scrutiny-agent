@@ -3,9 +3,17 @@
 # runtime) natively on each architecture's runner, proves each binary
 # over the wire with the conformance suite (built on debian:11, run on
 # the newer-glibc runner -- which also proves portability), and
-# publishes a GitHub Release carrying the binaries + .sha256 sidecars
-# named exactly as the Scrutiny bootstrap expects
-# (scrutiny-agent-<version>-<arch>).
+# publishes a GitHub Release carrying:
+#
+#   * the binaries + .sha256 sidecars, named exactly as the Scrutiny
+#     bootstrap expects (scrutiny-agent-<version>-<arch>), and
+#   * scrutiny-agent-<version>.tar -- the Emacs package, with both
+#     binaries bundled inside it.
+#
+# Those are the two ways this gets used. Someone driving the Scrutiny
+# Mac app wants the raw binaries to bundle into the app; someone using
+# Emacs wants one file they can `package-install-file' and have work,
+# including on the first connect, without a second download.
 #
 # workflow_dispatch runs the same build for a chosen version and
 # uploads workflow artifacts, but does not publish a release.
@@ -92,11 +100,79 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The Emacs package carries both architectures, so it can only be
+      # assembled here, after both build jobs have landed their
+      # artifacts.
+      - name: Build the Emacs package
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          bash scripts/package-emacs.sh --binaries dist --version "$V" \
+            --out dist
+
+      # Prove the package actually installs and finds its binaries
+      # before publishing it. A release that installs but cannot
+      # connect is worse than no release.
+      - name: Verify the package installs
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          PKGDIR="$(mktemp -d)"
+          emacs -Q --batch --eval "
+            (progn
+              (require 'package)
+              (setq package-user-dir \"$PKGDIR\")
+              (package-initialize)
+              (package-install-file \"dist/scrutiny-agent-$V.tar\")
+              (require 'scrutiny-agent-remote)
+              (unless (equal scrutiny-agent-binary-version \"$V\")
+                (error \"package reports version %s, expected $V\"
+                       scrutiny-agent-binary-version))
+              (let ((found (mapcar #'car (scrutiny-agent-installed-binaries))))
+                (dolist (arch '(\"x86_64\" \"aarch64\"))
+                  (unless (member arch found)
+                    (error \"package ships no %s binary (found %S)\"
+                           arch found)))
+                (princ (format \"package %s installs; binaries: %S\n\"
+                               \"$V\" found))))"
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          V="${GITHUB_REF_NAME#v}"
           ls -l dist
+
+          # Quoted heredoc: the backticks below are markdown, and an
+          # unquoted one would run them as command substitution. The
+          # version is substituted afterwards.
+          cat > /tmp/notes.md <<'NOTES'
+          ## Two ways to use this
+
+          ### Emacs
+
+              M-x package-install-file RET scrutiny-agent-__V__.tar RET
+
+          Both Linux agent binaries (x86_64 and aarch64) are inside the
+          package, so the first connect to a server needs no further
+          download: the client probes the remote with `uname`, picks the
+          matching binary, streams it over your existing ssh/tsh
+          transport, verifies it runs there, and starts talking to it.
+
+          Four lines of configuration are in the package's `INSTALL.md`.
+
+          ### Scrutiny
+
+          `scrutiny-agent-__V__-x86_64` and `scrutiny-agent-__V__-aarch64`,
+          each with a `.sha256` sidecar, named exactly as the bootstrap
+          expects. Built on debian:11 (glibc 2.31 floor, static C++
+          runtime), so they run on any still-supported distro.
+
+          ---
+          NOTES
+          sed -i "s/__V__/$V/g" /tmp/notes.md
+
+          # --generate-notes appends the auto-generated changelog after
+          # the notes file, so both are kept.
           gh release create "$GITHUB_REF_NAME" dist/* \
             --title "scrutiny-agent $GITHUB_REF_NAME" \
+            --notes-file /tmp/notes.md \
             --generate-notes
