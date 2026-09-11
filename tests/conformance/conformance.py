@@ -33,6 +33,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1331,6 +1332,45 @@ def protocol_fs_sandbox(agent_path):
             "sibling-tree listDirectory -> PERMISSION_DENIED 1005")
     finally:
         scoped.close()
+
+    # --config <file>: the same root delivered the way clients install
+    # it (a `key = value` file under the install dir). The effective
+    # roots must come back from meta.capabilities so a client can
+    # verify a reconfigure took.
+    section("fs sandbox (--config file)")
+    cfg_dir = tempfile.mkdtemp(prefix="conf-sb-cfg-")
+    cfg_path = os.path.join(cfg_dir, "scrutiny-agent.conf")
+    with open(cfg_path, "w") as f:
+        f.write("# written by the conformance suite\n"
+                "allow-root = %s   # trailing comment\n" % sb_allowed)
+    from_file = Agent(agent_path, extra_args=["--config", cfg_path])
+    try:
+        check(from_file.call("fs.readFile",
+                             {"path": ok_file}).get("content") == "inside\n",
+              "root from the config file admits an inside read")
+        check(from_file.call_error(
+            "fs.readFile", {"path": secret_file}).code == PERMISSION_DENIED,
+            "config-file sandbox still denies a sibling tree")
+        roots = from_file.call("meta.capabilities").get(
+            "fileSystemAccess", {}).get("allowedRoots")
+        check(roots == [os.path.realpath(sb_allowed)],
+              "capabilities report the effective canonical roots "
+              "(got %r)" % roots)
+    finally:
+        from_file.close()
+
+    # A --config pointing at a missing file must not stop the agent:
+    # the floor falls back to $HOME.
+    missing = Agent(agent_path,
+                    extra_args=["--config", os.path.join(cfg_dir, "nope.conf")])
+    try:
+        roots = missing.call("meta.capabilities").get(
+            "fileSystemAccess", {}).get("allowedRoots")
+        check(bool(roots), "missing config file -> agent runs with the "
+                           "default $HOME floor")
+    finally:
+        missing.close()
+        shutil.rmtree(cfg_dir, ignore_errors=True)
         shutil.rmtree(sb_allowed, ignore_errors=True)
         shutil.rmtree(sb_secret, ignore_errors=True)
 
@@ -1405,14 +1445,35 @@ def run(agent_path, agent_version):
     return 0
 
 
+def project_version():
+    """`project(scrutiny-agent VERSION x.y.z)` from the repo's CMakeLists."""
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    try:
+        text = open(os.path.join(root, "CMakeLists.txt")).read()
+    except OSError:
+        return None
+    m = re.search(r"project\(\s*scrutiny-agent\s+VERSION\s+([0-9][0-9.]*)", text)
+    return m.group(1) if m else None
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
         return 2
     agent = argv[1]
-    version = "0.1.0"
+    # Expected version: --agent-version (CI passes the release tag),
+    # else the project version in the top-level CMakeLists.txt -- the
+    # same source the binary is built from, so the --version and
+    # meta.hello checks stay meaningful without a literal to forget.
     if "--agent-version" in argv:
         version = argv[argv.index("--agent-version") + 1]
+    else:
+        version = project_version()
+        if version is None:
+            print("error: could not read project(... VERSION) from "
+                  "CMakeLists.txt; pass --agent-version <v>")
+            return 2
     if not (os.path.isfile(agent) and os.access(agent, os.X_OK)):
         print("error: not an executable: %s" % agent)
         return 2
