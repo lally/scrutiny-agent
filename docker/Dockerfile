@@ -26,6 +26,22 @@ FROM debian:11-slim AS build
 ARG AGENT_VERSION=0.1.0
 ENV DEBIAN_FRONTEND=noninteractive
 
+# bullseye is past end of life. deb.debian.org has dropped the
+# bullseye-security pool (every package 404s) and the suites' Release
+# files carry an expired Valid-Until; archive.debian.org has no
+# bullseye-security at all, and the image ships libc6 etc. at
+# security-suite versions, so archive-only sources leave "held broken
+# packages". The image's own sources.list names the snapshot it was
+# built from (commented out); snapshot.debian.org serves all three
+# suites at that exact date, so switch to those lines, accept the
+# stale Release date, and retry (snapshot rate-limits). All of this
+# exists to keep the glibc 2.31 floor; when the base moves to a
+# supported release, delete this block.
+RUN sed -i -e 's|^# deb http://snapshot|deb http://snapshot|' \
+           -e 's|^deb http://deb.debian.org|# deb http://deb.debian.org|' /etc/apt/sources.list \
+    && grep -q '^deb http://snapshot' /etc/apt/sources.list \
+    && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-eol-suite
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git pkg-config perl python3 python3-pip \
         ca-certificates wget gnupg lsb-release software-properties-common \
