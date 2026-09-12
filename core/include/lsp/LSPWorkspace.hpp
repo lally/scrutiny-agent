@@ -53,6 +53,14 @@ std::optional<std::string> findCompileCommandsDir(const std::string& workspacePa
 /// cache already holds the toolchain and options) and produces one.
 std::vector<std::string> findConfiguredCMakeBuildDirs(const std::string& workspacePath);
 
+/// C/C++: the distinct compiler executables named by a compile database
+/// (first token of each entry's `command` / `arguments`). clangd only
+/// learns a compiler's built-in system include paths (libstdc++'s
+/// <algorithm> etc.) when it may query that driver; without
+/// `--query-driver` every standard header is "not found" and the AST
+/// is useless for references. Absolute paths only; sorted, unique.
+std::vector<std::string> queryDriversFromCompileDb(const std::string& compileCommandsDir);
+
 /// True when the workspace root has a CMakeLists.txt.
 bool hasCMakeProject(const std::string& workspacePath);
 

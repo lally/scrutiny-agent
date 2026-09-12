@@ -71,6 +71,26 @@ void testFindConfiguredCMakeBuildDirs() {
     CHECK(hasCMakeProject(t.path.string()), "CMakeLists at root detected");
 }
 
+void testQueryDriversFromCompileDb() {
+    TempDir t;
+    CHECK(queryDriversFromCompileDb(t.path.string()).empty(), "no database -> no drivers");
+    touch(t.path / "compile_commands.json",
+          "[{\"directory\":\"/w\",\"command\":\"/usr/bin/c++ -std=c++23 -c a.cpp\",\"file\":\"a.cpp\"},"
+          " {\"directory\":\"/w\",\"arguments\":[\"/usr/bin/clang-17\",\"-c\",\"b.c\"],\"file\":\"b.c\"},"
+          " {\"directory\":\"/w\",\"command\":\"/usr/bin/c++ -c c.cpp\",\"file\":\"c.cpp\"},"
+          " {\"directory\":\"/w\",\"command\":\"cc -c d.c\",\"file\":\"d.c\"}]");
+    auto d = queryDriversFromCompileDb(t.path.string());
+    CHECK(d.size() == 2 && d[0] == "/usr/bin/c++" && d[1] == "/usr/bin/clang-17",
+          "distinct absolute drivers from command and arguments forms; relative 'cc' skipped");
+    touch(t.path / "build" / "compile_commands.json", "not json");
+    CHECK(queryDriversFromCompileDb((t.path / "build").string()).empty(), "malformed database -> none");
+    // prepareWorkspace threads it through to clangd's argv.
+    auto info = prepareWorkspace(t.path.string(), Language::Cpp, 0);
+    bool hasQuery = false;
+    for (auto& a : info.serverArguments) if (a == "--query-driver=/usr/bin/c++,/usr/bin/clang-17") hasQuery = true;
+    CHECK(hasQuery, "clangd is allowed to query exactly the database's compilers");
+}
+
 void testGeneratedDirLivesInGitCache() {
     TempDir t;
     CHECK(generatedCompileDbDir(t.path.string()) == (t.path / ".scrutiny-lsp" / "compile-db").string(),
@@ -160,6 +180,7 @@ int main() {
     std::srand(static_cast<unsigned>(std::time(nullptr)));
     testFindCompileCommandsAtRootAndOneLevelDown();
     testFindConfiguredCMakeBuildDirs();
+    testQueryDriversFromCompileDb();
     testGeneratedDirLivesInGitCache();
     testXcodeContainerAndPlist();
     testFindXcodeIndexStore();
