@@ -185,6 +185,16 @@ public:
     LSPError workspaceSymbols(const std::string& query,
                               std::vector<LSPSymbolInformation>& outSymbols);
 
+    /// True while the server is plausibly still warming up: it reported
+    /// indexing activity (progress tokens, or "Indexing" log lines as
+    /// sourcekit-lsp emits while it prepares a package) within the last
+    /// few seconds, or it started moments ago and has said nothing yet.
+    /// A semantic query that comes back empty in that state is retried
+    /// briefly instead of being reported as "nothing" -- the difference
+    /// between a symbol panel that works on the first click and one
+    /// that stays empty.
+    bool isWarmingUp() const;
+
     // LSP operations (asynchronous)
     void gotoDefinitionAsync(const std::string& fileUri,
                              LSPPosition position,
@@ -290,6 +300,35 @@ private:
     // Indexing state tracking (for servers like rust-analyzer)
     std::atomic<bool> serverIndexing_{false};
     std::atomic<int> activeProgressTokens_{0};
+    /// Warm-up tracking (see isWarmingUp): when the server started and
+    /// when it last reported indexing activity, as steady-clock ms.
+    std::atomic<long long> startedAtMs_{0};
+    std::atomic<long long> lastIndexingActivityMs_{0};
+    void noteIndexingActivity();
+    /// Server -> client requests (they carry BOTH "id" and "method",
+    /// and the id may be a string). Unanswered, sourcekit-lsp never
+    /// starts its `$/progress` stream for indexing, which is what
+    /// tells us it is still warming up; clangd/rust-analyzer register
+    /// capabilities the same way.
+    void handleServerRequest(const nlohmann::json& id, const std::string& method,
+                             const nlohmann::json& params);
+    void sendRawMessage(const nlohmann::json& message);
+
+    // The single-shot bodies; the public names wrap them in the
+    // warm-up retry.
+    LSPError gotoDefinitionOnce(const std::string& fileUri, LSPPosition position,
+                                std::vector<LSPLocation>& outLocations);
+    LSPError findReferencesOnce(const std::string& fileUri, LSPPosition position,
+                                bool includeDeclaration, std::vector<LSPLocation>& outLocations);
+    LSPError hoverOnce(const std::string& fileUri, LSPPosition position,
+                       std::optional<LSPHover>& outHover);
+    LSPError documentSymbolsOnce(const std::string& fileUri,
+                                 std::vector<LSPDocumentSymbol>& outSymbols);
+    LSPError workspaceSymbolsOnce(const std::string& query,
+                                  std::vector<LSPSymbolInformation>& outSymbols);
+    /// Run `attempt` (which sets `gotResults`) again while it yields
+    /// nothing and the server is warming up; bounded.
+    LSPError withWarmupRetry(const std::function<LSPError(bool& gotResults)>& attempt);
     std::mutex indexingMutex_;
     std::condition_variable indexingCondition_;
 };

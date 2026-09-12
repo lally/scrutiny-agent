@@ -91,6 +91,7 @@ nlohmann::json WorkspaceInfo::toJson() const {
         {"language", static_cast<int>(language)},
         {"workspacePath", workspacePath},
         {"serverArguments", serverArguments},
+        {"initializationOptions", initializationOptions},
         {"source", source},
         {"crossFileCapable", crossFileCapable},
         {"notes", notes},
@@ -327,7 +328,11 @@ WorkspaceInfo prepareWorkspace(const std::string& workspacePath, Language langua
                 : (ws / ".scrutiny-lsp" / "sourcekit-index-db").string();
             std::error_code ec;
             fs::create_directories(db, ec);
-            info.serverArguments = {"-index-store-path", *store, "-index-db-path", db};
+            // sourcekit-lsp configuration (same schema as
+            // .sourcekit-lsp/config.json), passed per session so the
+            // user's checkout and home directory stay untouched.
+            info.initializationOptions = nlohmann::json{
+                {"index", {{"indexStorePath", *store}, {"indexDatabasePath", db}}}};
         } else {
             info.notes.push_back(
                 "Xcode project without an index: build it once in Xcode (Cmd+B) so DerivedData holds "

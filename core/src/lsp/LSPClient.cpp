@@ -274,6 +274,8 @@ LSPError LSPClient::start() {
     spdlog::debug("[LSPClient] Initialize succeeded, sending initialized notification...");
     sendInitialized();
     initialized_ = true;
+    startedAtMs_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
     spdlog::debug("[LSPClient] LSP client fully initialized");
     return LSPError::none();
@@ -417,7 +419,7 @@ LSPError LSPClient::didChange(
 // LSP Operations
 // ============================================================================
 
-LSPError LSPClient::gotoDefinition(
+LSPError LSPClient::gotoDefinitionOnce(
     const std::string& fileUri,
     LSPPosition position,
     std::vector<LSPLocation>& outLocations
@@ -475,7 +477,7 @@ LSPError LSPClient::gotoDefinition(
     }
 }
 
-LSPError LSPClient::findReferences(
+LSPError LSPClient::findReferencesOnce(
     const std::string& fileUri,
     LSPPosition position,
     bool includeDeclaration,
@@ -530,7 +532,7 @@ LSPError LSPClient::findReferences(
     }
 }
 
-LSPError LSPClient::hover(
+LSPError LSPClient::hoverOnce(
     const std::string& fileUri,
     LSPPosition position,
     std::optional<LSPHover>& outHover
@@ -583,7 +585,7 @@ LSPError LSPClient::hover(
     }
 }
 
-LSPError LSPClient::documentSymbols(
+LSPError LSPClient::documentSymbolsOnce(
     const std::string& fileUri,
     std::vector<LSPDocumentSymbol>& outSymbols
 ) {
@@ -655,7 +657,7 @@ LSPError LSPClient::documentSymbols(
     }
 }
 
-LSPError LSPClient::workspaceSymbols(
+LSPError LSPClient::workspaceSymbolsOnce(
     const std::string& query,
     std::vector<LSPSymbolInformation>& outSymbols
 ) {
@@ -980,6 +982,9 @@ LSPError LSPClient::sendInitialize() {
         {"rootPath", workspacePath_},  // Some servers prefer rootPath
         {"capabilities", capabilities}
     };
+    if (workspaceInfo_.initializationOptions.is_object()) {
+        params["initializationOptions"] = workspaceInfo_.initializationOptions;
+    }
 
     spdlog::debug("[LSPClient] Sending initialize request with rootUri: file:// {}", workspacePath_);
 
@@ -1165,6 +1170,13 @@ void LSPClient::parseMessages(const std::string& content) {
                 std::string method = j["method"].get<std::string>();
                 nlohmann::json params = j.contains("params") ? j["params"] : nlohmann::json::object();
                 handleNotification(method, params);
+            } else if (j.contains("method") && j.contains("id")) {
+                // A request FROM the server (progress-token creation,
+                // capability registration, configuration). Must be
+                // answered, and its id may be a string.
+                std::string method = j["method"].get<std::string>();
+                nlohmann::json params = j.contains("params") ? j["params"] : nlohmann::json::object();
+                handleServerRequest(j["id"], method, params);
             } else {
                 // This is a response to a request
                 LSPResponse response = j.get<LSPResponse>();
@@ -1206,6 +1218,7 @@ void LSPClient::handleNotification(const std::string& method, const nlohmann::js
     spdlog::debug("[LSPClient] Received notification: {}", method);
 
     if (method == "$/progress") {
+        noteIndexingActivity();
         // Handle progress notifications from rust-analyzer and other LSP servers
         // Progress tokens track indexing/analysis progress
         if (params.contains("token") && params.contains("value")) {
@@ -1250,11 +1263,55 @@ void LSPClient::handleNotification(const std::string& method, const nlohmann::js
             }
         }
     } else if (method == "window/logMessage" || method == "window/showMessage") {
-        // Log messages from server
+        // Log messages from server. sourcekit-lsp narrates its
+        // background preparation/indexing here (logName
+        // "SourceKit-LSP: Indexing"); treat that as warm-up activity.
         if (params.contains("message")) {
             spdlog::debug("[LSPClient] Server message: {}", params["message"].get<std::string>());
         }
+        const std::string logName = params.value("logName", "");
+        const std::string message = params.value("message", "");
+        if (logName.find("Indexing") != std::string::npos ||
+            message.find("ndexing") != std::string::npos ||
+            message.find("Preparing ") != std::string::npos) {
+            noteIndexingActivity();
+        }
     }
+}
+
+void LSPClient::sendRawMessage(const nlohmann::json& message) {
+    const std::string content = message.dump();
+    process_->write("Content-Length: " + std::to_string(content.size()) + "\r\n\r\n" + content);
+}
+
+void LSPClient::handleServerRequest(const nlohmann::json& id, const std::string& method,
+                                    const nlohmann::json& params) {
+    spdlog::debug("[LSPClient] Server request: {}", method);
+    nlohmann::json reply{{"jsonrpc", "2.0"}, {"id", id}};
+    if (method == "window/workDoneProgress/create") {
+        // The server is about to report progress (sourcekit-lsp:
+        // "indexing.<uuid>"); acknowledging it unlocks the $/progress
+        // stream that keeps isWarmingUp() honest.
+        noteIndexingActivity();
+        reply["result"] = nullptr;
+    } else if (method == "client/registerCapability" ||
+               method == "client/unregisterCapability" ||
+               method == "window/showMessageRequest") {
+        reply["result"] = nullptr;
+    } else if (method == "workspace/configuration") {
+        // One null per requested item: "no client-side configuration".
+        nlohmann::json items = nlohmann::json::array();
+        if (params.contains("items") && params["items"].is_array()) {
+            for (size_t i = 0; i < params["items"].size(); ++i) items.push_back(nullptr);
+        }
+        reply["result"] = items;
+    } else if (method == "workspace/workspaceFolders") {
+        reply["result"] = nlohmann::json::array({
+            {{"uri", "file://" + workspacePath_}, {"name", workspacePath_}}});
+    } else {
+        reply["error"] = {{"code", -32601}, {"message", "method not supported by client: " + method}};
+    }
+    sendRawMessage(reply);
 }
 
 bool LSPClient::isIndexing() const {
@@ -1388,6 +1445,105 @@ std::optional<LSPHover> LSPClient::parseHover(const nlohmann::json& result) {
     }
 
     return hover;
+}
+
+// ============================================================================
+// Warm-up aware retry
+// ============================================================================
+
+namespace {
+long long nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+constexpr long long kIndexingActivityWindowMs = 3000;   // activity counts for this long
+constexpr long long kStartupGraceMs = 5000;             // silent servers: retry only this long after start
+constexpr int kWarmupRetryBudgetMs = 20000;             // never wait longer than this for one query
+constexpr int kWarmupRetrySleepMs = 750;
+}  // namespace
+
+void LSPClient::noteIndexingActivity() {
+    lastIndexingActivityMs_ = nowMs();
+}
+
+bool LSPClient::isWarmingUp() const {
+    const long long now = nowMs();
+    if (activeProgressTokens_.load() > 0) return true;
+    const long long last = lastIndexingActivityMs_.load();
+    if (last != 0 && now - last < kIndexingActivityWindowMs) return true;
+    const long long started = startedAtMs_.load();
+    return started != 0 && last == 0 && now - started < kStartupGraceMs;
+}
+
+LSPError LSPClient::withWarmupRetry(const std::function<LSPError(bool&)>& attempt) {
+    const long long deadline = nowMs() + kWarmupRetryBudgetMs;
+    int tries = 0;
+    while (true) {
+        bool gotResults = false;
+        LSPError err = attempt(gotResults);
+        ++tries;
+        if (err || gotResults) {
+            if (tries > 1) spdlog::info("[LSPClient] warm-up retry succeeded after {} tries", tries);
+            return err;
+        }
+        if (!isWarmingUp() || nowMs() >= deadline) {
+            if (tries > 1) spdlog::info("[LSPClient] still empty after {} warm-up tries", tries);
+            return err;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kWarmupRetrySleepMs));
+    }
+}
+
+LSPError LSPClient::gotoDefinition(const std::string& fileUri, LSPPosition position,
+                                   std::vector<LSPLocation>& outLocations) {
+    return withWarmupRetry([&](bool& got) {
+        outLocations.clear();
+        LSPError e = gotoDefinitionOnce(fileUri, position, outLocations);
+        got = !outLocations.empty();
+        return e;
+    });
+}
+
+LSPError LSPClient::findReferences(const std::string& fileUri, LSPPosition position,
+                                   bool includeDeclaration, std::vector<LSPLocation>& outLocations) {
+    return withWarmupRetry([&](bool& got) {
+        outLocations.clear();
+        LSPError e = findReferencesOnce(fileUri, position, includeDeclaration, outLocations);
+        // The declaration alone is what a cold server answers; keep
+        // asking while it warms up if that is all we have.
+        got = includeDeclaration ? outLocations.size() > 1 : !outLocations.empty();
+        return e;
+    });
+}
+
+LSPError LSPClient::hover(const std::string& fileUri, LSPPosition position,
+                          std::optional<LSPHover>& outHover) {
+    return withWarmupRetry([&](bool& got) {
+        outHover.reset();
+        LSPError e = hoverOnce(fileUri, position, outHover);
+        got = outHover.has_value() && !outHover->contents.empty();
+        return e;
+    });
+}
+
+LSPError LSPClient::documentSymbols(const std::string& fileUri,
+                                    std::vector<LSPDocumentSymbol>& outSymbols) {
+    return withWarmupRetry([&](bool& got) {
+        outSymbols.clear();
+        LSPError e = documentSymbolsOnce(fileUri, outSymbols);
+        got = !outSymbols.empty();
+        return e;
+    });
+}
+
+LSPError LSPClient::workspaceSymbols(const std::string& query,
+                                     std::vector<LSPSymbolInformation>& outSymbols) {
+    return withWarmupRetry([&](bool& got) {
+        outSymbols.clear();
+        LSPError e = workspaceSymbolsOnce(query, outSymbols);
+        got = !outSymbols.empty();
+        return e;
+    });
 }
 
 std::vector<LSPDocumentSymbol> LSPClient::parseDocumentSymbols(const nlohmann::json& result) {

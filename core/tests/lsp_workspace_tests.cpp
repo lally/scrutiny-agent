@@ -185,6 +185,11 @@ void testPrepareWorkspaceReportsWhatIsMissing() {
     ::setenv("HOME", savedHome.c_str(), 1);
     CHECK(bothInfo.source == "found" && bothInfo.indexStorePath.has_value(),
           "an existing Xcode index beats the package beside it");
+    CHECK(bothInfo.serverArguments.empty(), "sourcekit-lsp takes no index flags on its command line");
+    CHECK(bothInfo.initializationOptions.is_object()
+              && bothInfo.initializationOptions["index"]["indexStorePath"] == *bothInfo.indexStorePath,
+          "the index store rides in initializationOptions");
+    CHECK(bothInfo.toJson()["initializationOptions"]["index"].is_object(), "JSON carries it");
     auto pkgOnly = prepareWorkspace(both.path.string(), Language::Swift, 0);  // real HOME: no matching index
     CHECK(pkgOnly.source == "package" || pkgOnly.source == "found", "without a matching index the package is used");
 

@@ -24,6 +24,11 @@ struct WorkspaceInfo {
     std::string workspacePath;
     /// Extra arguments passed to the server because of what was found.
     std::vector<std::string> serverArguments;
+    /// `initializationOptions` for the LSP initialize request (an
+    /// object, or null). sourcekit-lsp takes its index store this way
+    /// (its CLI rejects -index-store-path since Xcode 16); servers that
+    /// don't understand the keys ignore them.
+    nlohmann::json initializationOptions = nullptr;
     /// C/C++: directory holding compile_commands.json, if any.
     std::optional<std::string> compileCommandsDir;
     /// Swift (Xcode project): the DerivedData index store handed to
