@@ -410,6 +410,17 @@ void grc_lsp_client_stop(GRCLSPClient* client) {
     }
 }
 
+char* grc_lsp_client_workspace_info_json(GRCLSPClient* client) {
+    std::string out = "{}";
+    if (auto* impl = getClient(client)) {
+        out = impl->workspaceInfo().toJson().dump();
+    }
+    // grc_free_string uses delete[]; allocate to match.
+    char* result = new char[out.size() + 1];
+    std::memcpy(result, out.c_str(), out.size() + 1);
+    return result;
+}
+
 bool grc_lsp_client_is_ready(GRCLSPClient* client) {
     if (auto* impl = getClient(client)) {
         bool ready = impl->isReady();

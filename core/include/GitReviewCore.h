@@ -249,6 +249,11 @@ void grc_lsp_client_stop(GRCLSPClient* client);
 // Check if the client is initialized and ready
 bool grc_lsp_client_is_ready(GRCLSPClient* client);
 
+// What start() discovered for the workspace (compile database / index
+// store / notes explaining thin results), as a JSON object string.
+// Caller frees with grc_free_string. Empty object before start().
+char* grc_lsp_client_workspace_info_json(GRCLSPClient* client);
+
 // ============================================================================
 // Document Management
 // ============================================================================

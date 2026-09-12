@@ -371,6 +371,7 @@ tunnel: `1` rust (rust-analyzer), `2` python (pylsp), `3` javascript /
 | `lsp.findReferences` | position, `includeDeclaration?` | `{ locations: [...] }` |
 | `lsp.hover` | position | `{ hover: { contents, hasRange, range }\|null }` |
 | `lsp.documentSymbols` | — | `{ symbols: [...] }` |
+| `lsp.workspaceInfo` | `workspacePath`, `language` (no file) | `{ language, workspacePath, serverArguments[], compileCommandsDir\|null, indexStorePath\|null, source: "found"\|"generated"\|"package"\|"server"\|"none", crossFileCapable, notes[] }` — what the agent found or generated so the server can answer cross-file questions (clangd: a `compile_commands.json`, generated via cmake when a configured build dir or CMakeLists.txt exists; sourcekit-lsp: an Xcode DerivedData index store). `notes` say what is missing and how to fix it; a client shows them when results are empty. Starts the server for the workspace if needed. |
 | `lsp.workspaceSymbols` | `query` (no filePath/fileContent) | `{ symbols: [...] }` |
 | `lsp.foldingRange` | — | `{ ranges: [{ startLine, endLine, hasKind, kind }] }` |
 

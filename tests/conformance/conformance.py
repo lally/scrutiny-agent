@@ -858,6 +858,29 @@ def t_lsp_hover(ctx):
     _lsp_method(ctx, "lsp.hover", "hover")
 
 
+@conformance("lsp.workspaceInfo")
+def t_lsp_workspace_info(ctx):
+    params = _lsp_params(ctx, with_pos=False)
+    try:
+        info = ctx.a.call("lsp.workspaceInfo",
+                          {"workspacePath": params["workspacePath"],
+                           "language": params["language"]}, timeout=45)
+    except AgentError as e:
+        check(e.code == LSP_FAILED,
+              "lsp.workspaceInfo without a language server -> clean LSP_FAILED 1004 "
+              "(got %s)" % e.code)
+        return
+    check(info.get("workspacePath") == params["workspacePath"],
+          "workspaceInfo echoes the workspace")
+    check(info.get("source") in ("found", "generated", "package", "server", "none"),
+          "workspaceInfo.source is one of the documented values (got %r)" % info.get("source"))
+    check(isinstance(info.get("notes"), list), "workspaceInfo.notes is a list")
+    check(isinstance(info.get("crossFileCapable"), bool),
+          "workspaceInfo.crossFileCapable is a bool")
+    check(isinstance(info.get("serverArguments"), list),
+          "workspaceInfo.serverArguments is a list")
+
+
 @conformance("lsp.documentSymbols")
 def t_lsp_document_symbols(ctx):
     _lsp_method(ctx, "lsp.documentSymbols", "symbols", with_pos=False)

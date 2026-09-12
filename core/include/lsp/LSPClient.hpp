@@ -45,6 +45,12 @@ struct LanguageServerConfig {
     std::vector<std::string> arguments;
 };
 
+}  // namespace lsp
+}  // namespace gitreview
+#include "lsp/LSPWorkspace.hpp"
+namespace gitreview {
+namespace lsp {
+
 // Hover result
 struct LSPHover {
     std::string contents;  // Markdown content
@@ -209,6 +215,10 @@ public:
 
     // Accessors
     Language language() const { return language_; }
+
+    /// What `start()` discovered/generated for this workspace (compile
+    /// database, index store, notes). Valid after `start()`.
+    const WorkspaceInfo& workspaceInfo() const { return workspaceInfo_; }
     const std::string& workspacePath() const { return workspacePath_; }
 
     // Wait for server-side indexing to complete (for servers like rust-analyzer)
@@ -253,6 +263,7 @@ private:
     // State
     std::string workspacePath_;
     Language language_;
+    WorkspaceInfo workspaceInfo_;
     std::atomic<bool> initialized_{false};
     std::atomic<bool> running_{false};
     std::string currentGitSha_;

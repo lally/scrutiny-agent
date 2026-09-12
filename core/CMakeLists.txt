@@ -6,6 +6,7 @@
 add_library(GitReviewCore STATIC
     src/GitReviewCore.cpp
     src/lsp/LSPClient.cpp
+    src/lsp/LSPWorkspace.cpp
     src/lsp/Process.cpp
     src/db/Database.cpp
     src/db/LSPCache.cpp
