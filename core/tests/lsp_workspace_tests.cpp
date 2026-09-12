@@ -167,6 +167,27 @@ void testPrepareWorkspaceReportsWhatIsMissing() {
     CHECK(!xc.crossFileCapable && !xc.notes.empty() && xc.notes[0].find("Cmd+B") != std::string::npos,
           "Xcode project without an index says to build once");
 
+    // Package.swift AND an Xcode project: the Xcode index wins when it
+    // exists (HOME is pointed at a fake DerivedData for the lookup).
+    TempDir both;
+    touch(both.path / "Package.swift", "// swift-tools-version:5.9");
+    fs::create_directories(both.path / "App.xcodeproj");
+    TempDir home;
+    const fs::path dd = home.path / "Library" / "Developer" / "Xcode" / "DerivedData";
+    touch(dd / "App-cafe" / "info.plist",
+          "<plist><dict><key>WorkspacePath</key><string>" + (both.path / "App.xcodeproj").string() +
+          "</string></dict></plist>");
+    fs::create_directories(dd / "App-cafe" / "Index.noindex" / "DataStore");
+    const char* oldHome = std::getenv("HOME");
+    const std::string savedHome = oldHome ? oldHome : "";
+    ::setenv("HOME", home.path.c_str(), 1);
+    auto bothInfo = prepareWorkspace(both.path.string(), Language::Swift, 0);
+    ::setenv("HOME", savedHome.c_str(), 1);
+    CHECK(bothInfo.source == "found" && bothInfo.indexStorePath.has_value(),
+          "an existing Xcode index beats the package beside it");
+    auto pkgOnly = prepareWorkspace(both.path.string(), Language::Swift, 0);  // real HOME: no matching index
+    CHECK(pkgOnly.source == "package" || pkgOnly.source == "found", "without a matching index the package is used");
+
     auto rs = prepareWorkspace(t.path.string(), Language::Rust, 0);
     CHECK(rs.source == "server" && rs.crossFileCapable, "rust-analyzer self-configures");
 
