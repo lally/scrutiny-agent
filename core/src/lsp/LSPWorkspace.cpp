@@ -300,18 +300,24 @@ WorkspaceInfo prepareWorkspace(const std::string& workspacePath, Language langua
     }
     case Language::Swift: {
         const fs::path ws(workspacePath);
-        if (isFile(ws / "Package.swift")) {
+        const bool hasPackage = isFile(ws / "Package.swift");
+        const auto container = findXcodeContainer(workspacePath);
+        // An Xcode project that Xcode has built has an index covering
+        // the app's own sources; prefer it even when a Package.swift
+        // sits beside it (a repo can carry both, and sourcekit-lsp
+        // would otherwise index only the package and know nothing
+        // about the app -- "running but returning nothing").
+        const auto store = container ? findXcodeIndexStore(*container) : std::nullopt;
+        if (!store && hasPackage) {
             info.source = "package";
             info.crossFileCapable = true;
             break;
         }
-        const auto container = findXcodeContainer(workspacePath);
         if (!container) {
             info.notes.push_back(
                 "No Package.swift or Xcode project at the workspace root: sourcekit-lsp has nothing to index.");
             break;
         }
-        const auto store = findXcodeIndexStore(*container);
         if (store) {
             info.indexStorePath = store;
             info.source = "found";
