@@ -138,6 +138,28 @@ std::vector<std::string> findConfiguredCMakeBuildDirs(const std::string& workspa
     return dirs;
 }
 
+std::vector<std::string> queryDriversFromCompileDb(const std::string& compileCommandsDir) {
+    std::vector<std::string> drivers;
+    std::ifstream in(fs::path(compileCommandsDir) / "compile_commands.json");
+    if (!in) return drivers;
+    nlohmann::json db = nlohmann::json::parse(in, nullptr, false);
+    if (db.is_discarded() || !db.is_array()) return drivers;
+    for (const auto& e : db) {
+        std::string exe;
+        if (auto a = e.find("arguments"); a != e.end() && a->is_array() && !a->empty() && (*a)[0].is_string()) {
+            exe = (*a)[0].get<std::string>();
+        } else if (auto c = e.find("command"); c != e.end() && c->is_string()) {
+            const std::string cmd = c->get<std::string>();
+            const auto sp = cmd.find(' ');
+            exe = sp == std::string::npos ? cmd : cmd.substr(0, sp);
+        }
+        if (exe.empty() || exe[0] != '/') continue;   // relative names: clangd can't query them safely
+        if (std::find(drivers.begin(), drivers.end(), exe) == drivers.end()) drivers.push_back(exe);
+    }
+    std::sort(drivers.begin(), drivers.end());
+    return drivers;
+}
+
 bool hasCMakeProject(const std::string& workspacePath) {
     return isFile(fs::path(workspacePath) / "CMakeLists.txt");
 }
@@ -258,6 +280,15 @@ WorkspaceInfo prepareWorkspace(const std::string& workspacePath, Language langua
             info.compileCommandsDir = dir;
             info.crossFileCapable = true;
             info.serverArguments.push_back("--compile-commands-dir=" + *dir);
+            // Let clangd ask the project's own compilers for their
+            // system include paths (GCC's libstdc++ lives where only
+            // GCC knows). Restricted to the drivers the database names.
+            const auto drivers = queryDriversFromCompileDb(*dir);
+            if (!drivers.empty()) {
+                std::string joined;
+                for (const auto& d : drivers) joined += (joined.empty() ? "" : ",") + d;
+                info.serverArguments.push_back("--query-driver=" + joined);
+            }
         } else {
             info.notes.push_back(
                 "No compile_commands.json: clangd can only see the current file, so references, "
