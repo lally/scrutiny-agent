@@ -186,8 +186,19 @@ std::optional<LanguageServerConfig> LSPClient::getServerConfig(Language lang) {
         case Language::Cpp:
         case Language::C:
             return LanguageServerConfig{findExecutable("clangd"), {}};
-        case Language::Swift:
-            return LanguageServerConfig{findExecutable("sourcekit-lsp"), {}};
+        case Language::Swift: {
+            // sourcekit-lsp ships inside the Xcode toolchain, which is
+            // not on a GUI app's PATH; fall back to the toolchain path.
+            std::string exe = findExecutable("sourcekit-lsp");
+            if (exe == "sourcekit-lsp") {
+                for (const char* cand : {
+                        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/sourcekit-lsp",
+                        "/Library/Developer/CommandLineTools/usr/bin/sourcekit-lsp"}) {
+                    if (access(cand, X_OK) == 0) { exe = cand; break; }
+                }
+            }
+            return LanguageServerConfig{exe, {}};
+        }
         default:
             return std::nullopt;
     }
@@ -221,6 +232,13 @@ LSPError LSPClient::start() {
     }
 
     spdlog::debug("[LSPClient] Using server:  {}", config->executable);
+
+    // "Try harder": find or generate the project configuration the
+    // server needs to answer cross-file questions, and record what was
+    // (not) found so the UI can explain thin results.
+    workspaceInfo_ = prepareWorkspace(workspacePath_, language_);
+    for (const auto& a : workspaceInfo_.serverArguments) config->arguments.push_back(a);
+    for (const auto& n : workspaceInfo_.notes) spdlog::info("[LSPClient] workspace note: {}", n);
 
     process_ = std::make_unique<Process>(
         config->executable,

@@ -686,6 +686,7 @@ void handleHello(const Responder& rsp, const json& params) {
                                                   "lsp.documentSymbols",
                                                   "lsp.workspaceSymbols",
                                                   "lsp.foldingRange",
+                                                  "lsp.workspaceInfo",
                                                   "lsp.tunnelOpen",
                                                   "lsp.tunnelSend",
                                                   "lsp.tunnelClose",
@@ -2330,6 +2331,33 @@ bool lspPos(const Responder& rsp, const json& p, const char* method,
     return true;
 }
 
+// lsp.workspaceInfo { workspacePath, language } -> the core's
+// WorkspaceInfo JSON: compileCommandsDir / indexStorePath / source /
+// crossFileCapable / notes. Starts the server for the workspace if it
+// is not running yet (that is where discovery happens), so a client
+// can ask "why is this thin?" and show the notes.
+void handleLspWorkspaceInfo(const Responder& rsp, const json& p) {
+    std::string ws;
+    if (!reqStr(rsp, p, "workspacePath", "lsp.workspaceInfo", ws)) return;
+    auto lit = p.find("language");
+    if (lit == p.end() || !lit->is_number_integer()) {
+        rsp.error(kInvalidRequest, "lsp.workspaceInfo requires int param 'language'");
+        return;
+    }
+    std::string err;
+    LspSession* s = lspSessionFor(ws, lit->get<int32_t>(), err);
+    if (s == nullptr) { rsp.error(kLspFailed, err); return; }
+    std::lock_guard<std::mutex> g(s->mu);
+    char* raw = grc_lsp_client_workspace_info_json(s->client);
+    json info = json::object();
+    if (raw != nullptr) {
+        info = json::parse(raw, nullptr, false);
+        if (info.is_discarded()) info = json::object();
+        grc_free_string(raw);
+    }
+    rsp.result(info);
+}
+
 // lsp.gotoDefinition / lsp.findReferences -> { locations: [...] }
 void handleLspLocations(const Responder& rsp, const json& p,
                         const char* method, bool references) {
@@ -3792,6 +3820,8 @@ void dispatch(const std::string& method, const Responder& rsp, const json& param
         handleLspDocumentSymbols(rsp, params);
     } else if (method == "lsp.workspaceSymbols") {
         handleLspWorkspaceSymbols(rsp, params);
+    } else if (method == "lsp.workspaceInfo") {
+        handleLspWorkspaceInfo(rsp, params);
     } else if (method == "lsp.foldingRange") {
         handleLspFoldingRange(rsp, params);
     } else if (method == "lsp.tunnelOpen") {
