@@ -2208,6 +2208,33 @@ const char* grcErrName(GRCError e) {
     }
 }
 
+// What to install on this host when no server binary can be found for
+// `lang`. Rides in the RPC error and the text-fallback note so the
+// client can show it verbatim.
+std::string lspInstallHint(int32_t lang) {
+    switch (static_cast<GRCLanguage>(lang)) {
+    case GRC_LANG_SWIFT:
+        return "install a Swift toolchain on this host (https://www.swift.org/install/ or swiftly) "
+               "so that `sourcekit-lsp` is on the PATH of the shell that starts the agent (the "
+               "login shell over ssh), then Reconnect";
+    case GRC_LANG_CPP:
+    case GRC_LANG_C:
+        return "install clangd (e.g. `apt install clangd`) and make sure the project has a "
+               "compile_commands.json (CMake: -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)";
+    case GRC_LANG_RUST:
+        return "install rust-analyzer (`rustup component add rust-analyzer`)";
+    case GRC_LANG_PYTHON:
+        return "install python-lsp-server (`pip install python-lsp-server`)";
+    case GRC_LANG_GO:
+        return "install gopls (`go install golang.org/x/tools/gopls@latest`)";
+    case GRC_LANG_JAVASCRIPT:
+    case GRC_LANG_TYPESCRIPT:
+        return "install typescript-language-server (`npm install -g typescript typescript-language-server`)";
+    default:
+        return "no language server is configured for this language";
+    }
+}
+
 LspSession* lspSessionFor(const std::string& workspace, int32_t lang,
                           std::string& errMsg) {
     const std::string key = workspace + "\x1f" + std::to_string(lang);
@@ -2229,7 +2256,8 @@ LspSession* lspSessionFor(const std::string& workspace, int32_t lang,
         if (client != nullptr) grc_lsp_client_destroy(client);
         errMsg = "could not create language server (lang=" +
                  std::to_string(lang) + " server='" + serverPath +
-                 "' ws='" + workspace + "'): " + grcErrName(err);
+                 "' ws='" + workspace + "'): " + grcErrName(err) +
+                 " -- to fix: " + lspInstallHint(lang);
         if (logOn(LogLevel::Error))
             logWrite(LogLevel::Error, "lsp session create FAILED " + errMsg);
         return nullptr;
@@ -2239,7 +2267,8 @@ LspSession* lspSessionFor(const std::string& workspace, int32_t lang,
         grc_lsp_client_destroy(client);
         errMsg = "language server failed to start (lang=" +
                  std::to_string(lang) + " server='" + serverPath +
-                 "' ws='" + workspace + "'): " + grcErrName(serr);
+                 "' ws='" + workspace + "'): " + grcErrName(serr) +
+                 " -- to fix: " + lspInstallHint(lang);
         if (logOn(LogLevel::Error))
             logWrite(LogLevel::Error, "lsp session start FAILED " + errMsg);
         return nullptr;
@@ -2310,6 +2339,14 @@ bool lspCommon(const Responder& rsp, const json& p, const char* method,
     lang = lit->get<int32_t>();
     if (!reqStr(rsp, p, "filePath", method, filePath)) return false;
     if (!reqStr(rsp, p, "fileContent", method, content)) return false;
+    // A clone-relative path is joined onto the workspace: "file://Sources/x"
+    // is a URI outside every workspace and sourcekit-lsp answers it with
+    // single-file fallback settings (nothing cross-file), silently.
+    if (!filePath.empty() && filePath[0] != '/') {
+        std::string base = ws;
+        while (base.size() > 1 && base.back() == '/') base.pop_back();
+        filePath = base + "/" + filePath;
+    }
     uri = "file://" + filePath;
     const char* lid = grc_language_id(static_cast<GRCLanguage>(lang));
     langId = lid != nullptr ? lid : "plaintext";
