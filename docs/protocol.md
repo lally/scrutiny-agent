@@ -355,7 +355,8 @@ roots therefore cannot become a door out of them, and `fs.rename` /
 ### lsp.* (request-level queries)
 
 Common params: `workspacePath`, `language` (int, see the language
-table below), `filePath`, `fileContent`; positional methods add
+table below), `filePath` (absolute on the host; a relative path is
+joined onto `workspacePath`), `fileContent`; positional methods add
 `line`, `character`. One language-server session per (workspace,
 language), spawned lazily; if no server binary is installed the call
 fails `LSP_FAILED`.

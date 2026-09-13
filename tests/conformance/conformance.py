@@ -848,6 +848,23 @@ def _lsp_method(ctx, method, result_key, with_pos=True, text_fallback=False):
                   "%s text fallback explains why" % method)
             check(len(r.get(result_key, [])) >= 1,
                   "%s text fallback finds `let x`" % method)
+            if "no language server" in r["note"]:
+                check("install" in r["note"],
+                      "%s note says what to install" % method)
+        # A clone-relative filePath is joined onto workspacePath: the
+        # answer's URIs are absolute (a relative file:// URI is outside
+        # every workspace and gets fallback settings from the server).
+        rel = dict(p)
+        rel["filePath"] = os.path.relpath(p["filePath"], p["workspacePath"])
+        r2 = ctx.a.call(method, rel, timeout=200)
+        locs = r2.get(result_key, [])
+        # A server may answer with the realpath (macOS: /var -> /private/var).
+        roots = {"file://" + p["workspacePath"] + "/",
+                 "file://" + os.path.realpath(p["workspacePath"]) + "/"}
+        check(len(locs) >= 1 and all(
+            any(l["uri"].startswith(r) for r in roots) for l in locs),
+              "%s with a relative filePath answers with absolute URIs under the workspace (got %r)"
+              % (method, [l.get("uri") for l in locs[:2]]))
         return
     try:
         r = ctx.a.call(method, p, timeout=45)
