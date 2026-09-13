@@ -194,6 +194,10 @@ public:
     /// between a symbol panel that works on the first click and one
     /// that stays empty.
     bool isWarmingUp() const;
+    /// True when the most recent query gave up empty while the server
+    /// was still reporting build/index activity (the answer is "still
+    /// preparing", not "nothing to find").
+    bool gaveUpWarming() const { return gaveUpWarming_.load(); }
 
     // LSP operations (asynchronous)
     void gotoDefinitionAsync(const std::string& fileUri,
@@ -304,6 +308,7 @@ private:
     /// when it last reported indexing activity, as steady-clock ms.
     std::atomic<long long> startedAtMs_{0};
     std::atomic<long long> lastIndexingActivityMs_{0};
+    std::atomic<bool> gaveUpWarming_{false};
     void noteIndexingActivity();
     /// Server -> client requests (they carry BOTH "id" and "method",
     /// and the id may be a string). Unanswered, sourcekit-lsp never

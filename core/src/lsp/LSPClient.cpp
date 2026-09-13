@@ -1269,13 +1269,29 @@ void LSPClient::handleNotification(const std::string& method, const nlohmann::js
         if (params.contains("message")) {
             spdlog::debug("[LSPClient] Server message: {}", params["message"].get<std::string>());
         }
+        // sourcekit-lsp also forwards its build output ("[7/19]
+        // Compiling MarkdownKit ...", "Fetching ...", "Resolving ...")
+        // while it prepares a package -- during which every semantic
+        // query answers empty. All of that is warm-up activity.
         const std::string logName = params.value("logName", "");
         const std::string message = params.value("message", "");
-        if (logName.find("Indexing") != std::string::npos ||
-            message.find("ndexing") != std::string::npos ||
-            message.find("Preparing ") != std::string::npos) {
-            noteIndexingActivity();
+        static const char* const kActivity[] = {
+            "ndexing", "Preparing ", "Compiling ", "Building ", "Linking ", "Fetching ",
+            "Resolving ", "Updating ", "Computing ", "Planning ", "Emitting ", "Write "};
+        bool activity = logName.find("Indexing") != std::string::npos;
+        for (const char* k : kActivity) {
+            if (!activity && message.find(k) != std::string::npos) activity = true;
         }
+        // "[3/19] Compiling ..." style build steps.
+        if (!activity && message.size() > 3 && message.find('[') != std::string::npos) {
+            const auto b = message.find('[');
+            const auto slash = message.find('/', b);
+            const auto e = message.find(']', b);
+            if (slash != std::string::npos && e != std::string::npos && slash < e &&
+                e - b < 16 && std::isdigit(static_cast<unsigned char>(message[b + 1])))
+                activity = true;
+        }
+        if (activity) noteIndexingActivity();
     }
 }
 
@@ -1456,9 +1472,16 @@ long long nowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-constexpr long long kIndexingActivityWindowMs = 3000;   // activity counts for this long
+constexpr long long kIndexingActivityWindowMs = 10000;  // activity counts for this long (a single compile step can be slow)
 constexpr long long kStartupGraceMs = 5000;             // silent servers: retry only this long after start
-constexpr int kWarmupRetryBudgetMs = 20000;             // never wait longer than this for one query
+constexpr int kWarmupRetryBudgetMs = 20000;             // quiet server: never wait longer than this for one query
+// A server that keeps reporting build/index activity (sourcekit-lsp
+// preparing a package on a slow box takes well over a minute the first
+// time) gets this much longer before a query is declared empty. The
+// caller shows a loading state meanwhile; giving up early is what
+// produced "running but returned nothing" for symbols that resolve
+// fine a minute later.
+constexpr int kBusyWarmupRetryBudgetMs = 180000;
 constexpr int kWarmupRetrySleepMs = 750;
 }  // namespace
 
@@ -1476,18 +1499,33 @@ bool LSPClient::isWarmingUp() const {
 }
 
 LSPError LSPClient::withWarmupRetry(const std::function<LSPError(bool&)>& attempt) {
-    const long long deadline = nowMs() + kWarmupRetryBudgetMs;
+    const long long start = nowMs();
+    const long long quietDeadline = start + kWarmupRetryBudgetMs;
+    const long long busyDeadline = start + kBusyWarmupRetryBudgetMs;
     int tries = 0;
+    gaveUpWarming_ = false;
     while (true) {
         bool gotResults = false;
         LSPError err = attempt(gotResults);
         ++tries;
         if (err || gotResults) {
-            if (tries > 1) spdlog::info("[LSPClient] warm-up retry succeeded after {} tries", tries);
+            if (tries > 1)
+                spdlog::info("[LSPClient] warm-up retry succeeded after {} tries ({} ms)", tries, nowMs() - start);
             return err;
         }
-        if (!isWarmingUp() || nowMs() >= deadline) {
-            if (tries > 1) spdlog::info("[LSPClient] still empty after {} warm-up tries", tries);
+        const bool warming = isWarmingUp();
+        const long long now = nowMs();
+        // Busy servers (progress token / build output within the activity
+        // window) get the long budget; a quiet one only the short.
+        const bool busy = activeProgressTokens_.load() > 0 ||
+                          (lastIndexingActivityMs_.load() != 0 &&
+                           now - lastIndexingActivityMs_.load() < kIndexingActivityWindowMs);
+        const long long deadline = busy ? busyDeadline : quietDeadline;
+        if (!warming || now >= deadline) {
+            if (tries > 1)
+                spdlog::info("[LSPClient] still empty after {} warm-up tries ({} ms, server {})", tries,
+                             now - start, warming ? "still busy" : "quiet");
+            gaveUpWarming_ = warming;
             return err;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(kWarmupRetrySleepMs));

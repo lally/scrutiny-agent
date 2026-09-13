@@ -828,12 +828,27 @@ def _lsp_params(ctx, with_pos=True):
     return p
 
 
-def _lsp_method(ctx, method, result_key, with_pos=True):
+def _lsp_method(ctx, method, result_key, with_pos=True, text_fallback=False):
     p = _lsp_params(ctx, with_pos)
     bad = dict(p)
     bad.pop("workspacePath")
     check(ctx.a.call_error(method, bad).code == INVALID_REQUEST,
           "%s missing workspacePath -> INVALID_REQUEST 1002" % method)
+    if text_fallback:
+        # gotoDefinition / findReferences never fail for want of a
+        # server: the agent answers from a text search of the workspace
+        # and says so. `let x = 1` with the cursor on `x` has exactly one
+        # declaration-shaped line.
+        r = ctx.a.call(method, p, timeout=200)
+        check(result_key in r, "%s result carries '%s'" % (method, result_key))
+        check(r.get("source") in ("server", "text"),
+              "%s result says where it came from (got %r)" % (method, r.get("source")))
+        if r.get("source") == "text":
+            check(isinstance(r.get("note"), str) and r["note"],
+                  "%s text fallback explains why" % method)
+            check(len(r.get(result_key, [])) >= 1,
+                  "%s text fallback finds `let x`" % method)
+        return
     try:
         r = ctx.a.call(method, p, timeout=45)
         check(result_key in r, "%s result carries '%s'" % (method, result_key))
@@ -845,12 +860,12 @@ def _lsp_method(ctx, method, result_key, with_pos=True):
 
 @conformance("lsp.gotoDefinition")
 def t_lsp_goto_definition(ctx):
-    _lsp_method(ctx, "lsp.gotoDefinition", "locations")
+    _lsp_method(ctx, "lsp.gotoDefinition", "locations", text_fallback=True)
 
 
 @conformance("lsp.findReferences")
 def t_lsp_find_references(ctx):
-    _lsp_method(ctx, "lsp.findReferences", "locations")
+    _lsp_method(ctx, "lsp.findReferences", "locations", text_fallback=True)
 
 
 @conformance("lsp.hover")

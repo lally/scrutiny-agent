@@ -4,6 +4,7 @@
 
 #include "GitReviewCore.h"
 #include "lsp/LSPClient.hpp"
+#include "lsp/DeclarationSearch.hpp"
 #include "db/LSPCache.hpp"
 #include "indexer/Indexer.hpp"
 
@@ -512,6 +513,51 @@ GRCError grc_lsp_client_goto_definition(
     spdlog::info("[GRC] gotoDefinition returned {} locations", locations.size());
     convertLocations(locations, out_locations);
     return GRC_SUCCESS;
+}
+
+GRCError grc_lsp_text_definitions(
+    const char* workspace_path,
+    GRCLanguage language,
+    const char* file_uri,
+    const char* file_content,
+    GRCPosition position,
+    GRCLocationArray* out_locations
+) {
+    if (!workspace_path || !file_uri || !file_content || !out_locations) return GRC_ERROR_INVALID_ARGUMENT;
+    out_locations->locations = nullptr;
+    out_locations->count = 0;
+    const std::string name = impl_lsp::identifierAt(file_content, position.line, position.character);
+    if (name.empty()) return GRC_SUCCESS;
+    auto locations = impl_lsp::findDeclarations(workspace_path, toLanguage(language), file_uri, name);
+    spdlog::info("[GRC] text definitions for '{}': {} candidates", name, locations.size());
+    convertLocations(locations, out_locations);
+    return GRC_SUCCESS;
+}
+
+GRCError grc_lsp_text_references(
+    const char* workspace_path,
+    GRCLanguage language,
+    const char* file_uri,
+    const char* file_content,
+    GRCPosition position,
+    bool include_declaration,
+    GRCLocationArray* out_locations
+) {
+    if (!workspace_path || !file_uri || !file_content || !out_locations) return GRC_ERROR_INVALID_ARGUMENT;
+    out_locations->locations = nullptr;
+    out_locations->count = 0;
+    const std::string name = impl_lsp::identifierAt(file_content, position.line, position.character);
+    if (name.empty()) return GRC_SUCCESS;
+    auto locations = impl_lsp::findOccurrences(workspace_path, toLanguage(language), file_uri, name,
+                                               include_declaration);
+    spdlog::info("[GRC] text references for '{}': {} occurrences", name, locations.size());
+    convertLocations(locations, out_locations);
+    return GRC_SUCCESS;
+}
+
+bool grc_lsp_client_gave_up_warming(GRCLSPClient* client) {
+    auto* impl = getClient(client);
+    return impl != nullptr && impl->gaveUpWarming();
 }
 
 GRCError grc_lsp_client_find_references(

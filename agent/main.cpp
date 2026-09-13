@@ -2366,33 +2366,74 @@ void handleLspLocations(const Responder& rsp, const json& p,
     if (!lspCommon(rsp, p, method, ws, lang, uri, langId, content)) return;
     GRCPosition pos{};
     if (!lspPos(rsp, p, method, pos)) return;
+    bool incl = true;
+    if (auto i = p.find("includeDeclaration"); i != p.end() && i->is_boolean())
+        incl = i->get<bool>();
+    // Text-search fallback: when no server can be started, or the server
+    // answers empty, scan the workspace for declaration-shaped lines
+    // (definitions) / whole-word occurrences (references) of the symbol
+    // under the cursor. The result says so (`source: "text"` + `note`),
+    // so the client labels it; the reason is never hidden.
+    std::string source = "server";
+    std::string note;
+    GRCLocationArray out{};
+    auto textFallback = [&](const std::string& why) -> bool {
+        GRCError te = references
+            ? grc_lsp_text_references(ws.c_str(), static_cast<GRCLanguage>(lang), uri.c_str(),
+                                      content.c_str(), pos, incl, &out)
+            : grc_lsp_text_definitions(ws.c_str(), static_cast<GRCLanguage>(lang), uri.c_str(),
+                                       content.c_str(), pos, &out);
+        if (te != GRC_SUCCESS) {
+            rsp.error(kLspFailed, std::string(method) + " text fallback failed (grc error " +
+                                      std::to_string(static_cast<int>(te)) + "); " + why);
+            return false;
+        }
+        source = "text";
+        note = why;
+        if (logOn(LogLevel::Info))
+            logWrite(LogLevel::Info, std::string(method) + " -> text search (" +
+                     std::to_string(out.count) + " hits): " + why);
+        return true;
+    };
     std::string err;
     LspSession* s = lspSessionFor(ws, lang, err);
-    if (s == nullptr) { rsp.error(kLspFailed, err); return; }
-    std::lock_guard<std::mutex> g(s->mu);
-    lspSyncDoc(s, uri, langId, content);
-    GRCLocationArray out{};
-    GRCError e;
-    if (references) {
-        bool incl = true;
-        if (auto i = p.find("includeDeclaration");
-            i != p.end() && i->is_boolean())
-            incl = i->get<bool>();
-        e = grc_lsp_client_find_references(s->client, uri.c_str(), pos, incl,
-                                           &out);
+    if (s == nullptr) {
+        if (!textFallback("no language server: " + err)) return;
     } else {
-        e = grc_lsp_client_goto_definition(s->client, uri.c_str(), pos, &out);
-    }
-    if (e != GRC_SUCCESS) {
-        rsp.error(kLspFailed, std::string(method) + " failed (grc error " +
-                                  std::to_string(static_cast<int>(e)) + ")");
-        return;
+        std::lock_guard<std::mutex> g(s->mu);
+        lspSyncDoc(s, uri, langId, content);
+        GRCError e;
+        if (references) {
+            e = grc_lsp_client_find_references(s->client, uri.c_str(), pos, incl, &out);
+        } else {
+            e = grc_lsp_client_goto_definition(s->client, uri.c_str(), pos, &out);
+        }
+        if (e != GRC_SUCCESS) {
+            rsp.error(kLspFailed, std::string(method) + " failed (grc error " +
+                                      std::to_string(static_cast<int>(e)) + ")");
+            return;
+        }
+        // find-references answering only the declaration is "nothing"
+        // for the user's purposes, the same rule the warm-up retry uses.
+        const bool empty = references && incl ? out.count <= 1 : out.count == 0;
+        if (empty) {
+            const bool stillBusy = grc_lsp_client_gave_up_warming(s->client);
+            grc_free_locations(&out);
+            out = GRCLocationArray{};
+            const std::string why = stillBusy
+                ? "the language server was still preparing its index (build/indexing activity "
+                  "continued past the wait limit); results are a text search meanwhile"
+                : "the language server answered nothing for this symbol; results are a text search";
+            if (!textFallback(why)) return;
+        }
     }
     json arr = json::array();
     for (int32_t i = 0; out.locations != nullptr && i < out.count; ++i)
         arr.push_back(jLoc(out.locations[i]));
     grc_free_locations(&out);
-    rsp.result(json{{"locations", arr}});
+    json result{{"locations", arr}, {"source", source}};
+    if (!note.empty()) result["note"] = note;
+    rsp.result(result);
 }
 
 void handleLspHover(const Responder& rsp, const json& p) {
