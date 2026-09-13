@@ -24,3 +24,6 @@ emacs/.elsa/
 
 # Release artifacts from scripts/package-emacs.sh.
 dist/
+
+# mypy writes here when the python fixture is type-checked by a test run
+core/tests/fixtures/python/.mypy_cache/
