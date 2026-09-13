@@ -399,6 +399,38 @@ void grc_free_string(char* str);
 // Free a locations array (frees contained URIs and the array itself)
 void grc_free_locations(GRCLocationArray* locations);
 
+// ----------------------------------------------------------------------------
+// Text-search fallback (no language server needed)
+// ----------------------------------------------------------------------------
+// When no server can be started, or the server answers empty, these scan
+// the workspace's source files for declaration-shaped lines (definitions)
+// or whole-word occurrences (references) of the identifier under the
+// cursor in `file_content`. Results are ranked text matches, not
+// semantic answers; clients label them as such. `file_uri` may be a
+// plain path. Bounded (20k files, 1 MB per file, 500 results).
+GRCError grc_lsp_text_definitions(
+    const char* workspace_path,
+    GRCLanguage language,
+    const char* file_uri,
+    const char* file_content,
+    GRCPosition position,
+    GRCLocationArray* out_locations
+);
+GRCError grc_lsp_text_references(
+    const char* workspace_path,
+    GRCLanguage language,
+    const char* file_uri,
+    const char* file_content,
+    GRCPosition position,
+    bool include_declaration,
+    GRCLocationArray* out_locations
+);
+
+// True when the client's most recent query came back empty because the
+// warm-up wait ran out while the server was still reporting build /
+// index activity -- i.e. "still preparing", not "nothing to find".
+bool grc_lsp_client_gave_up_warming(GRCLSPClient* client);
+
 // Free a hover result
 void grc_free_hover(GRCHover* hover);
 

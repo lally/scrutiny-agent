@@ -37,3 +37,17 @@ target_include_directories(lsp_workspace_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 add_test(NAME LSPWorkspaceTests COMMAND lsp_workspace_tests)
+
+add_executable(declaration_search_tests declaration_search_tests.cpp)
+target_link_libraries(declaration_search_tests
+    PRIVATE
+        GitReviewCore
+        nlohmann_json::nlohmann_json
+        fmt::fmt
+        spdlog::spdlog
+)
+target_include_directories(declaration_search_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+add_test(NAME DeclarationSearchTests COMMAND declaration_search_tests)

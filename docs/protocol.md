@@ -367,8 +367,8 @@ tunnel: `1` rust (rust-analyzer), `2` python (pylsp), `3` javascript /
 
 | Method | Extra params | Result |
 | --- | --- | --- |
-| `lsp.gotoDefinition` | position | `{ locations: [...] }` |
-| `lsp.findReferences` | position, `includeDeclaration?` | `{ locations: [...] }` |
+| `lsp.gotoDefinition` | position | `{ locations: [...], source: "server"\|"text", note? }` — `source: "text"` means no server could be started (or it answered nothing, or was still preparing its index past the wait limit) and the locations are ranked declaration-shaped text matches for the identifier under the cursor; `note` says why. Never an error just because a server is missing. |
+| `lsp.findReferences` | position, `includeDeclaration?` | `{ locations: [...], source, note? }` — same fallback: whole-word occurrences across the workspace's files of that language. |
 | `lsp.hover` | position | `{ hover: { contents, hasRange, range }\|null }` |
 | `lsp.documentSymbols` | — | `{ symbols: [...] }` |
 | `lsp.workspaceInfo` | `workspacePath`, `language` (no file) | `{ language, workspacePath, serverArguments[], compileCommandsDir\|null, indexStorePath\|null, source: "found"\|"generated"\|"package"\|"server"\|"none", crossFileCapable, notes[] }` — what the agent found or generated so the server can answer cross-file questions (clangd: a `compile_commands.json`, generated via cmake when a configured build dir or CMakeLists.txt exists; sourcekit-lsp: an Xcode DerivedData index store). `notes` say what is missing and how to fix it; a client shows them when results are empty. Starts the server for the workspace if needed. |
