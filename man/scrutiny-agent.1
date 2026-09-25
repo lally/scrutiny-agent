@@ -1,0 +1,1132 @@
+.\" Manual page for scrutiny-agent(1).
+.\" Format with:  man ./scrutiny-agent.1  (macOS)   or   man -l scrutiny-agent.1  (Linux)
+.TH SCRUTINY-AGENT 1 "2026-09-21" "scrutiny-agent 0.2.0" "User Commands"
+.SH NAME
+scrutiny-agent \- remote git, filesystem and LSP backend for Scrutiny
+.SH SYNOPSIS
+.B scrutiny-agent
+.RB [ \-\-rpc\-stdio ]
+.RI [ options ]
+.br
+.B scrutiny-agent
+.B \-\-version
+.br
+.B scrutiny-agent
+.BR \-\-help " | " \-h
+.SH DESCRIPTION
+.B scrutiny-agent
+is the process a client spawns on a remote machine, next to the source
+trees it wants to work with, and drives over the client's own stdio
+transport
+.RB ( ssh ,
+.BR "ssh \-J" ,
+.BR tsh ,
+.BR "kubectl exec" ,
+a local shell, and so on).
+It speaks JSON-RPC 2.0 with LSP-style
+.B Content-Length
+framing on standard input and standard output, and answers git,
+filesystem, language-server, indexing and cache requests against the
+working trees on the host.
+There is no network listener: stdio is the only channel.
+.PP
+Its primary client is Scrutiny, a macOS GitHub pull-request review
+application, whose remote clones run entirely through this agent.
+An Emacs client ships in the same repository and uses the agent to
+carry
+.BR find-file ,
+saving, dired, magit and eglot over a single connection.
+.PP
+The agent is not interactive.
+Run by hand it waits on standard input until EOF and then exits.
+Standard output carries protocol frames only; every diagnostic goes to
+standard error or to the log file named by
+.BR \-\-log .
+.PP
+Policy (which directories may be read, whether writes are allowed,
+which git subcommands
+.B git.exec
+may run) is set at startup from the command line and/or a
+configuration file, and cannot be changed by a client over the wire.
+The effective policy is reported by
+.B meta.capabilities
+and printed to standard error at startup.
+.SH OPTIONS
+Options are read left to right; a configuration file named by
+.B \-\-config
+is applied at the point it appears, and later options add to or
+override it.
+Every option except
+.BR \-\-rpc\-stdio ,
+.B \-\-version
+and
+.B \-\-help
+has a configuration-file key of the same name without the leading
+dashes; see
+.BR scrutiny-agent.conf (5).
+Repeatable options and file keys accumulate.
+.TP
+.B \-\-rpc\-stdio
+Serve the JSON-RPC protocol on stdin/stdout.
+This is what a bare invocation does too; the flag is accepted so that
+a client's exec line is stable and says what it does.
+It has one real effect: it is never mistaken for an askpass prompt
+(see
+.BR "ASKPASS MODE" ).
+.TP
+.BI \-\-config " path"
+Read options from the file
+.IR path ;
+see
+.B CONFIGURATION FILE
+below and
+.BR scrutiny-agent.conf (5)
+for the format and the keys.
+A relative
+.I path
+is anchored under
+.BR $HOME .
+An unreadable file is a warning on standard error, not an error, so an
+exec line that carries every setting itself still starts.
+May be repeated.
+.TP
+.BI \-\-allow\-root " path"
+Add
+.I path
+to the filesystem sandbox.
+Every path given to an
+.B fs.*
+method is anchored under
+.B $HOME
+if relative, resolved through symlinks with
+.BR realpath (3),
+and must then lie inside one of the allowed roots; anything else
+answers
+.B PERMISSION_DENIED
+(1005) before the kernel is touched.
+Relative roots anchor under
+.BR $HOME .
+Repeatable.
+A root that does not resolve is dropped with a warning rather than
+denying everything under it.
+If no root survives, the sandbox is
+.B $HOME
+itself; if
+.B $HOME
+is unset or does not resolve either, every filesystem call is denied.
+Roots are printed to standard error at startup.
+.TP
+.B \-\-allow\-write
+Serve the filesystem write methods
+.RB ( fs.writeFile ,
+.BR fs.mkdir ,
+.BR fs.delete ,
+.BR fs.rename ,
+.BR fs.copy ,
+.BR fs.chmod ).
+Off by default: the agent is read-only, the write methods are not
+advertised in
+.BR meta.hello ,
+and
+.B meta.capabilities
+reports
+.BR "writable: false" .
+Writes are confined to the same allowed roots;
+.B \-\-allow\-write
+widens what may be done to a path, never which paths are reachable.
+.TP
+.BI \-\-git\-exec " subcommand"
+Allow one git
+.I subcommand
+(for example
+.BR log ,
+.BR status ,
+.BR push )
+through the
+.B git.exec
+method.
+Repeatable.
+.B git.exec
+is off, and not advertised, until at least one subcommand is allowed
+by this option or by
+.BR \-\-git\-exec\-preset .
+.TP
+.BI \-\-git\-exec\-preset " name"
+Allow a named set of subcommands through
+.BR git.exec :
+.B read\-only
+(inspection only) or
+.B magit
+(inspection plus the working operations magit needs, a grant close to
+.B git
+itself).
+The sets are listed in
+.BR scrutiny-agent.conf (5).
+An unknown
+.I name
+is a warning and grants nothing.
+.TP
+.BI \-\-git\-exec\-config " key"
+Permit
+.B git.exec
+requests to pass
+.BI "\-c " key = value
+before the subcommand, in addition to the built-in set of formatting
+and local-behaviour keys.
+.I key
+is a full
+.B section.name
+or a bare section name, which permits every key in that section.
+Never add a key that makes git run a program; the built-in set and the
+reasoning are in
+.BR scrutiny-agent.conf (5).
+Repeatable.
+.TP
+.BI \-\-log " path"
+Append a log to
+.IR path .
+Without this option nothing is logged.
+When the file reaches 8 MiB it is renamed to
+.IB path .1
+(a single backup) and a fresh file is started.
+A relative
+.I path
+is used as given, relative to the agent's working directory; a client
+that writes a configuration file normally names an absolute path or
+one inside its install directory.
+Credential values are redacted from the log at every level, because
+.B logs.tail
+streams the log back to the client.
+.TP
+.BI \-\-log\-level " level"
+One of
+.BR off ,
+.BR error ,
+.BR warn ,
+.BR info ,
+.BR debug ,
+.BR trace .
+The default once
+.B \-\-log
+is given is
+.BR info .
+An unrecognised
+.I level
+is treated as
+.BR off ,
+which disables logging entirely.
+At
+.B trace
+request parameters are logged in full (except credentials); below it
+content-bearing parameters are redacted and only paths, queries, ids,
+lanes, sizes, timings and errors are kept.
+.TP
+.B \-\-version
+Print
+.RI ` "version" " proto " N '
+(the agent version and the wire protocol version it serves) on
+standard output and exit 0.
+Clients run this right after installing a binary: it proves at once
+that the file executes on this architecture, that dynamic linking
+resolved, and that the intended version was installed, before a single
+frame is exchanged.
+.TP
+.BR \-\-help ", " \-h
+Print a usage summary and exit 0.
+.PP
+An unknown option is reported on standard error and ignored; the
+agent still starts and never writes a diagnostic to standard output.
+.SH CONFIGURATION FILE
+Every option above except
+.BR \-\-rpc\-stdio ,
+.B \-\-version
+and
+.B \-\-help
+can also be set in the file named by
+.BR \-\-config ,
+as
+.B key = value
+lines whose keys are the option names without the leading dashes.
+A file and the command line feed the same table inside the agent and
+apply in the order they are read.
+The format, every key, the git subcommand presets and the permitted
+.B \-c
+keys are documented in
+.BR scrutiny-agent.conf (5).
+A small file:
+.PP
+.nf
+.RS
+# policy for this host
+allow-root = src             # relative: ~/src
+allow-root = /srv/repos
+git-exec-preset = read-only
+log = /home/me/.scrutiny-agent/agent.log
+.RE
+.fi
+.PP
+Clients such as Scrutiny and the Emacs client write this file beside
+the agent binary as
+.IB installDir /scrutiny-agent.conf
+at bootstrap and start the agent with
+.B \-\-config
+pointing at it, so the policy lives on the host and every client using
+that install directory agrees on it.
+.SH OPERATIONS
+Requests are JSON-RPC 2.0 objects whose
+.B method
+is
+.IB namespace . operation\c
+\&.
+Parameters are an object.
+The sections below list every method the agent serves, grouped by
+namespace.
+Unless stated otherwise, a
+.B path
+parameter is absolute on the host; relative cache and install paths
+are anchored under
+.BR $HOME .
+The wire format, error codes and streaming rules are summarised under
+.BR PROTOCOL .
+The normative reference is
+.I docs/protocol.md
+in the source tree.
+.SS Session and diagnostics
+.TP
+.B meta.hello
+.RI { clientVersion ", " supportedProtocolVersions [], " frameCap? }"
+\(->
+.RI { agentVersion ", " protocolVersion ", " frameCap ", " capabilities [] }.
+Must be the first request.
+.I capabilities
+is the exhaustive list of methods this process serves; opt-in
+surfaces
+.RB ( fs.write* ,
+.BR git.exec )
+appear only when enabled.
+A client that cannot speak the agent's protocol version gets
+.B VERSION_MISMATCH
+(1006).
+.TP
+.B meta.capabilities
+\(->
+.RI { agentVersion ", " protocolVersion ", " outboundIO [], " fileSystemAccess" {}, " languageServers" {}, " network" ", " selftestMethod }.
+The security posture of the running process.
+.I fileSystemAccess
+carries
+.I allowedRoots
+(the canonical roots this process is running with),
+.I writable
+and
+.I home
+(the host's
+.BR $HOME ,
+which a client needs to expand
+.BR ~ ).
+.TP
+.B meta.stat
+\(->
+.RI { lanes ", " lspSessions ", " lspTunnels ", " uptimeMs ", " gitParallel ", " logLevel ", " agentVersion }.
+Live counters for the operations viewer.
+.TP
+.B meta.debug
+.RI { sleepMs? ", " padBytes? }
+\(->
+.RI { echoId ", " pad }.
+Sleeps (cancellably) and pads its result, to exercise cancellation and
+chunking.
+.TP
+.B logs.tail
+.RI { maxBytes? }
+\(->
+.RI { enabled ", " path? ", " level? ", " bytes? ", " text? }.
+The tail (at most 1 MiB) of the
+.B \-\-log
+file, or
+.B enabled: false
+when logging is off.
+.SS Git, read-only
+Each takes
+.I path
+(the work tree) unless noted.
+.TP
+.B git.headSha
+\(->
+.RI { headSha }.
+.TP
+.B git.repoMetadata
+\(->
+.RI { path ", " gitDir ", " isBare ", " headSha ", " currentBranch ", " hasUncommittedChanges }.
+.TP
+.B git.remotes
+\(->
+.RI { remotes ": [{ " name ", " url ", " pushUrl " }] }."
+.TP
+.B git.branches
+.RI { path ", " local? ", " remote? }
+\(->
+.RI { branches ": [{ " name ", " refname ", " targetOid ", " isRemote ", " isHead ", " upstream ", " remoteName " }] }."
+.TP
+.B git.commits
+.RI { path ", " branch? ", " limit? }
+\(->
+.RI { commits ": [...] }"
+newest first;
+.I limit
+defaults to 100.
+.TP
+.B git.aheadBehind
+.RI { path ", " branch }
+\(->
+.RI { ahead ", " behind }
+against the branch's upstream.
+.TP
+.B git.diffForCommit
+.RI { path ", " sha }
+\(->
+.RI { diffs ": [FileDiff] }."
+An unknown
+.I sha
+yields an empty list.
+.TP
+.B git.workingTreeDiff
+\(->
+.RI { diffs }
+for index to work tree, including untracked files.
+.TP
+.B git.stagedDiff
+\(->
+.RI { diffs }
+for HEAD to index.
+.TP
+.B git.showFile
+.RI { path ", " sha ", " file }
+\(->
+.RI { content }
+(null when the file is absent in that commit).
+.TP
+.B git.diff
+.RI { path ", " from ", " to ", " file }
+\(->
+.RI { diff }
+via a
+.B git diff
+subprocess.
+.TP
+.B git.isAncestor
+.RI { path ", " ancestor ", " descendant }
+\(->
+.RI { isAncestor }
+via
+.BR "git merge-base \-\-is\-ancestor" .
+.PP
+A
+.I FileDiff
+is
+.RI { status ", " oldPath ", " newPath ", " patch ", " hunks ": [{ " oldStart ", " oldLines ", " newStart ", " newLines ", " header ", " lines ": [{ " origin ", " content ", " oldLineNo ", " newLineNo " }] }] }."
+.SS Git, mutating and network
+These run on the
+.B bulk
+lane and, where git may prompt for a password, through the credential
+broker (see
+.BR SECURITY ).
+.TP
+.B git.checkoutBranch
+.RI { path ", " branch }
+\(-> {}.
+A safe checkout; a refusal answers
+.B INTERNAL
+with libgit2's reason.
+.TP
+.B git.clone
+.RI { fullName ", " cloneURL ", " installDir ", " authOpId }
+\(->
+.RI { localPath ", " cloneURL ", " lastFetched }.
+Clones into
+.IR installDir / fullName
+with
+.B /
+replaced by
+.BR _ .
+.TP
+.B git.fetch
+.RI { repoPath ", " authOpId }
+\(->
+.RI { ok ", " lastFetched }
+.RB ( "git fetch \-\-all \-\-prune" ).
+.TP
+.B git.ensureRepository
+Same parameters and result as
+.BR git.clone ;
+fetches when the clone already exists.
+.SS General git (git.exec, opt-in)
+.TP
+.B git.exec
+.RI { repoPath ", " args [], " authOpId? }"
+\(->
+.RI { exitCode ", " stdout ", " stderr ", " truncated }.
+Runs one allowlisted git subcommand in
+.IR repoPath ,
+with
+.B \-\-no\-pager
+prepended,
+.B GIT_PAGER=cat
+and
+.B GIT_TERMINAL_PROMPT=0
+in the environment.
+A non-zero
+.I exitCode
+is data, not an error (git answers questions with exit codes).
+Each output stream is capped at 16 MiB;
+.I truncated
+says when the cap bit.
+The subcommands
+.BR fetch ,
+.BR pull ,
+.BR push ,
+.BR ls-remote ,
+.B clone
+and
+.B submodule
+go through the credential broker when
+.I authOpId
+is given.
+Runs on the
+.B normal
+lane by default.
+.IP
+Before any process starts, the request is checked against the policy
+in
+.B SECURITY
+below; a refusal is
+.B PERMISSION_DENIED
+(1005) whose message names the offending argument.
+Served only when
+.B \-\-git\-exec
+or
+.B \-\-git\-exec\-preset
+enabled it.
+.SS Filesystem
+All paths pass through the sandbox described under
+.BR \-\-allow\-root .
+.TP
+.B fs.readFile
+.RI { path ", " base64? ", " stat? }
+\(->
+.RI { content }
+or
+.RI { contentBase64 },
+plus
+.IR size ", " mtime ", " mode
+with
+.BR "stat: true" .
+.TP
+.B fs.listDirectory
+.RI { path ", " attributes? }
+\(->
+.RI { path ", " entries ": [{ " name ", " isDir " }] }"
+sorted by name, symlinks followed for
+.IR isDir .
+With
+.B attributes: true
+each entry also carries
+.IR size ", " mtime ", " mode ", " isRegular ", " isSymlink ", " symlinkTarget ", " uid ", " gid ", " readable ", " writable
+and the resolved
+.IR path .
+.TP
+.B fs.stat
+.RI { path }
+\(->
+.RI { exists ", " isDir ", " isRegular ", " isSymlink ", " symlinkTarget ", " size ", " mtime ", " mode ", " uid ", " gid ", " readable ", " writable ", " path }
+or
+.RI { "exists: false" }.
+The parent is canonicalised and authorised, then the leaf is
+.BR lstat (2)ed,
+so a symlink is described rather than resolved away.
+.TP
+.B fs.statBatch
+.RI { paths [] }
+\(->
+.RI { stats ": [...] }"
+in the order asked; a bad entry yields
+.B exists: false
+(plus
+.B denied: true
+outside the roots) instead of failing the batch.
+.TP
+.B fs.selftest
+\(->
+.RI { probe ", " succeeded ", " errorCode ", " reason? ", " firstBytesReadable ", " sampleSnippet }.
+Reads
+.I /etc/passwd
+through the same resolve-authorise-read path a client request takes,
+so it reports this process's real posture.
+.SS Filesystem writes (opt-in, \-\-allow\-write)
+.TP
+.B fs.writeFile
+.RI { path ", " content " | " contentBase64 ", " mode? ", " createDirs? }
+\(->
+.RI { ok ", " size ", " mtime }.
+Atomic: temp file beside the target,
+.BR fsync (2),
+then
+.BR rename (2)
+over it.
+An existing file's mode is kept unless
+.I mode
+is given.
+.TP
+.B fs.mkdir
+.RI { path ", " parents? }
+\(->
+.RI { ok }.
+.TP
+.B fs.delete
+.RI { path ", " recursive? }
+\(->
+.RI { ok ", " removed }.
+.TP
+.B fs.rename
+.RI { from ", " to }
+\(->
+.RI { ok }.
+Both ends are authorised.
+.TP
+.B fs.copy
+.RI { from ", " to ", " overwrite? }
+\(->
+.RI { ok }.
+Both ends are authorised.
+.TP
+.B fs.chmod
+.RI { path ", " mode }
+\(->
+.RI { ok }.
+.PP
+Authorising a path that does not exist yet resolves the deepest
+existing component and appends the rest, so a symlink inside the roots
+cannot become a door out of them.
+.SS Language servers, request level
+Common parameters:
+.I workspacePath
+(the project root),
+.I language
+(an integer: 1 rust, 2 python, 3 javascript, 4 typescript, 5 go,
+6 cpp, 7 c, 8 swift),
+.I filePath
+(absolute on the host, or relative to
+.IR workspacePath )
+and
+.IR fileContent ;
+positional methods add
+.I line
+and
+.IR character .
+One server session per (workspace, language) is spawned on first use
+(rust-analyzer, pylsp, typescript-language-server, gopls, clangd,
+sourcekit-lsp, looked up on
+.BR PATH ).
+Before a server starts the agent prepares the workspace: for C and C++
+it finds or generates a
+.B compile_commands.json
+and passes clangd the compilers it names; for Swift it locates an
+Xcode index store when there is one.
+A server that is still indexing is given time to warm up before an
+empty answer is accepted.
+.TP
+.B lsp.gotoDefinition
+.RI { "position" }
+\(->
+.RI { locations ", " source ", " note? }.
+.I source
+is
+.B server
+or
+.BR text :
+when no server can run, or it answers nothing, the locations are
+ranked declaration-shaped text matches and
+.I note
+says why.
+A missing server is never an error here.
+.TP
+.B lsp.findReferences
+.RI { "position, " includeDeclaration? }
+\(->
+.RI { locations ", " source ", " note? }.
+Same fallback, using whole-word occurrences across the workspace's
+files of that language.
+.TP
+.B lsp.hover
+\(->
+.RI { hover ": { " contents ", " hasRange ", " range " } | null }."
+.TP
+.B lsp.documentSymbols
+\(->
+.RI { symbols }.
+.TP
+.B lsp.workspaceSymbols
+.RI { workspacePath ", " language ", " query }
+\(->
+.RI { symbols }.
+.TP
+.B lsp.foldingRange
+\(->
+.RI { ranges ": [{ " startLine ", " endLine ", " hasKind ", " kind " }] }."
+.TP
+.B lsp.workspaceInfo
+.RI { workspacePath ", " language }
+\(->
+.RI { language ", " workspacePath ", " serverArguments [], " compileCommandsDir" ", " indexStorePath ", " source ", " crossFileCapable ", " notes [] }.
+What the agent found or generated for cross-file answers;
+.I source
+is one of
+.BR found ,
+.BR generated ,
+.BR package ,
+.BR server ,
+.BR none ,
+and
+.I notes
+say what is missing and how to fix it.
+Starts the server if needed.
+.PP
+Language-server failures answer
+.B LSP_FAILED
+(1004); the message carries what to install when the server binary is
+absent.
+.SS Language servers, raw tunnel
+The tunnel pipes bytes verbatim between the client and a server the
+agent spawns with its working directory set to the workspace.
+The agent neither parses nor reframes LSP traffic; a real LSP client
+(eglot, an IDE) speaks its native protocol through it.
+.TP
+.B lsp.tunnelOpen
+.RI { workspacePath ", " language }
+\(->
+.RI { tunnelId ", " serverPath }.
+.B LSP_FAILED
+when no server binary is installed.
+.TP
+.B lsp.tunnelSend
+(notification)
+.RI { tunnelId ", " data }
+with
+.I data
+base64: client-to-server bytes, written in arrival order.
+.TP
+.B lsp.tunnelClose
+.RI { tunnelId }
+\(->
+.RI { ok },
+idempotent; closes the server's stdin and sends
+.BR SIGTERM .
+.PP
+The agent emits
+.B lsp.tunnelRecv
+.RI { tunnelId ", " data }
+(at most 32 KiB of raw bytes per notification, in stream order) and
+.B lsp.tunnelClosed
+.RI { tunnelId ", " exitCode ", " reason }.
+Back-pressure is bounded in both directions; the client-to-server
+queue is capped at 8 MiB.
+.SS Indexer
+.TP
+.B index.create
+.RI { workspacePath ", " language ", " cacheDBPath }
+\(->
+.RI { indexerId }.
+A relative
+.I cacheDBPath
+lands under
+.BR $HOME .
+.TP
+.B index.run
+.RI { indexerId }
+\(->
+.RI { filesIndexed ", " definitionsFound ", ... }."
+Streams
+.B index.progress
+.RI { indexerId ", " filePath ", " current ", " total }
+notifications, coalesced to roughly one per percent.
+Bulk lane.
+.TP
+.B index.cancel
+(notification)
+.RI { indexerId }.
+.TP
+.B index.destroy
+.RI { indexerId }
+\(->
+.RI { ok };
+idempotent, refused while running.
+.SS HEAD watching
+.TP
+.B watch.head
+.RI { path }
+\(->
+.RI { watchId }.
+Observes the clone's resolved
+.I .git/HEAD
+file (worktree
+.B gitdir:
+pointers followed) and emits a debounced
+.B watch.headChanged
+.RI { watchId }
+on checkout, branch switch, rebase or any other rewrite of HEAD.
+A plain commit moves the branch ref, not HEAD, and does not fire.
+.TP
+.B watch.stop
+(notification)
+.RI { watchId }.
+.SS Credentials
+.TP
+.B cred.provide
+.RI { credId ", " value }
+\(->
+.RI { ok }.
+The client's answer to a
+.B cred.request
+notification;
+.B ok
+is false for an unknown or expired
+.IR credId .
+.TP
+.B cred.selftest
+.RI { authOpId ", " prompt }
+\(->
+.RI { got ", " askpassExit }.
+A full broker, unix-socket and self-exec round trip.
+Diagnostic; not advertised.
+.SS Diff cache
+An SQLite cache on the host keyed by
+.RI ( fromSha ", " toSha ", " file ).
+Entries are immutable, so there is no invalidation, only pruning.
+.TP
+.B diffcache.get
+.RI { cacheDir ", " fromSha ", " toSha ", " file }
+\(->
+.RI { hit ", " value? }.
+.TP
+.B diffcache.put
+.RI { cacheDir ", " fromSha ", " toSha ", " file ", " value }
+\(->
+.RI { ok }.
+.TP
+.B diffcache.prune
+.RI { cacheDir ", " days }
+\(->
+.RI { removed }.
+.SS Notifications sent by the agent
+.TP
+.B rpc.chunk
+.RI { id ", " seq ", " last ", " data }
+when a response body exceeds the frame cap.
+.TP
+.B index.progress
+during
+.BR index.run .
+.TP
+.B watch.headChanged
+when a watched HEAD changes.
+.TP
+.B cred.request
+.RI { authOpId ", " credId ", " prompt }
+when git prompts during a brokered operation.
+.TP
+.BR lsp.tunnelRecv ", " lsp.tunnelClosed
+for an open tunnel.
+.SH PROTOCOL
+.SS Framing
+Each message is
+.B Content-Length:
+.IR N ,
+CRLF, CRLF, then
+.I N
+bytes of UTF-8 JSON.
+The header name is matched case-insensitively.
+A header block without
+.B Content-Length
+(a late login banner, a
+.B motd
+line) is answered with a null-id
+.B INVALID_REQUEST
+and skipped; so is a body that is not valid JSON.
+Only EOF on standard input ends the session, after which the agent
+drains in-flight work, stops watches and tunnels, and exits 0.
+Frames are capped at a size negotiated in
+.B meta.hello
+(default 128 KiB, clamped to 64 to 256 KiB).
+A response larger than the cap is streamed as
+.B rpc.chunk
+notifications followed by a small
+.RI { "streamed: true" ", " bytes }
+result.
+.SS Cancellation
+The notification
+.B $/cancelRequest
+.RI { id }
+drops queued work before it starts and asks running work to stop at
+its next safe point; a cancelled request answers
+.B CANCELLED
+(1007).
+.SS Priority lanes
+Work runs on a pool of 16 threads in three lanes,
+.BR interactive ,
+.B normal
+and
+.BR bulk ,
+with per-lane caps (normal 8, bulk 2) so a clone or an index run cannot
+starve a hover.
+The writer also serves higher lanes first at frame boundaries.
+Defaults per method:
+.BR index.run ,
+.BR git.clone ,
+.B git.fetch
+and
+.B git.ensureRepository
+are bulk;
+.BR meta.debug ,
+.BR cred.selftest ,
+.B git.exec
+and
+.B lsp.tunnelOpen
+are normal; everything else is interactive.
+A request may carry a top-level
+.B lane
+field to override.
+.SS Error codes
+.TS
+l l l.
+1000	INTERNAL	agent-side failure; the message carries the reason
+1001	NOT_FOUND	repository, file, path or id missing; unknown method
+1002	INVALID_REQUEST	malformed JSON, or missing or mistyped parameters
+1003	GIT_FAILED	git subprocess failed; the message carries its stderr
+1004	LSP_FAILED	language server unavailable or crashed
+1005	PERMISSION_DENIED	path outside the sandbox, or a refused git.exec request
+1006	VERSION_MISMATCH	protocol version negotiation failed
+1007	CANCELLED	request cancelled by the client
+.TE
+.PP
+The distinction between
+.B NOT_FOUND
+and
+.B PERMISSION_DENIED
+is deliberate and load-bearing for clients: the latter is what a
+client uses to offer "allow this directory".
+.SH SECURITY
+.SS Filesystem sandbox
+Described under
+.BR \-\-allow\-root .
+The kernel only ever sees the canonical, symlink-resolved path, which
+closes the symlink-swap race between check and use.
+.SS Credential broker
+Git running under the agent never receives a token in a URL, a config
+setting or the environment.
+For a brokered operation the agent creates a private unix socket in
+.B $TMPDIR
+and re-executes itself as
+.B GIT_ASKPASS
+(see
+.BR "ASKPASS MODE" ).
+When git prompts, the agent sends a
+.B cred.request
+notification to the client, which answers with
+.BR cred.provide ;
+the secret is written to the askpass child and exists on the host only
+while git is reading it.
+Values are redacted from the log at every level.
+.SS git.exec policy
+Two checks, and the second is the one that matters:
+.IP 1. 3
+The subcommand must be on the allowlist built from
+.B \-\-git\-exec
+and
+.BR \-\-git\-exec\-preset .
+.IP 2. 3
+No argument may be one of git's "run this program for me" options.
+A subcommand allowlist alone is not security:
+.BR "\-c core.pager=..." ,
+.BR "\-c credential.helper=..." ,
+.BR "\-c alias.x=!..." ,
+.BR \-\-upload\-pack= ,
+.BR \-\-receive\-pack= ,
+.B \-\-exec\-path=
+and friends turn any permitted subcommand into arbitrary code
+execution.
+Also refused anywhere in the argument list:
+.BR \-\-git\-dir ,
+.BR \-\-work\-tree ,
+.BR \-C ,
+.B \-\-namespace
+(which would move the repository out from under
+.IR repoPath ),
+.BR \-\-config\-env ,
+.BR \-\-ext\-diff ,
+.BR \-\-gpg\-sign= ,
+.B \-\-output=
+and
+.BR \-\-textconv .
+.PP
+Before the subcommand only
+.BR \-\-no\-pager ,
+.BR \-\-paginate ,
+.BR \-\-no\-replace\-objects ,
+.BR \-\-literal\-pathspecs ,
+.B \-\-no\-optional\-locks
+and
+.B \-\-bare
+are accepted at all, plus
+.BI "\-c " key = value
+for allowlisted keys (see
+.B \-\-git\-exec\-config
+and
+.BR scrutiny-agent.conf (5)).
+Repository-local configuration and hooks are the user's own and are
+out of scope; the policy prevents the client from injecting them.
+.SH ASKPASS MODE
+The same binary is also git's askpass helper for the agent's
+credential broker.
+For a brokered git operation the serving agent creates a private unix
+socket, sets
+.B SCRUTINY_CRED_SOCK
+to its path and
+.B GIT_ASKPASS
+to its own executable, and runs git.
+When git needs a password it runs
+.BI "scrutiny-agent '" prompt "'"
+and that child connects to the socket, sends the prompt, prints the
+secret it receives on standard output for git, and exits.
+Any failure exits 1, so git (run with
+.BR GIT_TERMINAL_PROMPT=0 )
+fails authentication cleanly rather than hanging.
+.PP
+The mode is selected before any option is parsed, by this rule alone:
+.B SCRUTINY_CRED_SOCK
+is set in the environment and there is exactly one command-line
+argument, and that argument is neither
+.B \-\-version
+nor
+.BR \-\-rpc\-stdio .
+Nothing else is examined, because git passes the prompt text as an
+ordinary argument and it may look like anything.
+Two consequences follow.
+.IP \(bu 3
+In an environment where
+.B SCRUTINY_CRED_SOCK
+is already set, a bare
+.B scrutiny-agent
+.I something
+would be taken for an askpass prompt.
+Passing
+.B \-\-rpc\-stdio
+(or a second argument) prevents that, which is why clients always
+include it.
+A normal login shell never has the variable set; only the agent's own
+git children do.
+.IP \(bu 3
+The variable is not a setting.
+Setting it by hand does not enable anything in the serving agent, and
+an askpass invocation whose socket is missing or refuses the
+connection simply exits 1.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Anchors relative sandbox roots, config paths, cache and install
+directories, and is the default sandbox root.
+When unset, relative paths anchor under
+.I /tmp
+and no default sandbox root exists.
+.TP
+.B TMPDIR
+Where the credential broker's unix socket is created.
+Kept out of the repository because
+.B sun_path
+is 108 bytes.
+.TP
+.B PATH
+Where language servers and
+.B git
+are found.
+.TP
+.B SCRUTINY_CRED_SOCK
+Path of the credential broker's unix socket.
+Set by the serving agent on the git processes it spawns, never read by
+the serving agent itself; together with a single argument it selects
+.BR "ASKPASS MODE" .
+.TP
+.BR GIT_ASKPASS ", " GIT_TERMINAL_PROMPT ", " GIT_PAGER
+Set by the agent on the git processes it spawns.
+.SH FILES
+.TP
+.IB installDir /scrutiny-agent.conf
+The configuration file clients write beside the binary at every
+bootstrap and pass with
+.BR \-\-config ;
+format in
+.BR scrutiny-agent.conf (5).
+.TP
+.IR path ", " path .1
+The log file named by
+.B \-\-log
+and its single rotated backup.
+.SH EXIT STATUS
+0 on a clean shutdown (EOF on standard input), after
+.B \-\-version
+or
+.BR \-\-help .
+Startup problems (an unknown option, an unreadable config file, a root
+that does not resolve) are warnings and do not change the exit status.
+In askpass mode, 1 when the secret could not be obtained.
+.SH EXAMPLES
+Check a freshly installed binary:
+.PP
+.nf
+.RS
+$ scrutiny-agent \-\-version
+0.2.0 proto 1
+.RE
+.fi
+.PP
+Serve one handshake by hand, read-only, sandboxed to two directories,
+with magit-level git access and an info log:
+.PP
+.nf
+.RS
+$ scrutiny-agent \-\-rpc\-stdio \e
+      \-\-allow\-root src \-\-allow\-root /srv/repos \e
+      \-\-git\-exec\-preset magit \e
+      \-\-log ~/.scrutiny-agent/agent.log \-\-log\-level info
+.RE
+.fi
+.PP
+Smoke-test the protocol without a client:
+.PP
+.nf
+.RS
+$ body='{"jsonrpc":"2.0","id":1,"method":"meta.hello",
+         "params":{"supportedProtocolVersions":[1]}}'
+$ printf 'Content-Length: %d\er\en\er\en%s' ${#body} "$body" \e
+      | scrutiny-agent \-\-rpc\-stdio
+.RE
+.fi
+.PP
+Run it from a configuration file on the host (the
+.B \-\-rpc\-stdio
+flag is optional; a bare invocation serves too):
+.PP
+.nf
+.RS
+$ scrutiny-agent \-\-config ~/.scrutiny-agent/scrutiny-agent.conf
+.RE
+.fi
+.SH SEE ALSO
+.BR scrutiny-agent.conf (5),
+.BR git (1),
+.BR ssh (1)
+.PP
+.I docs/protocol.md
+in the source tree is the normative wire specification, verified
+against a built binary by
+.IR tests/conformance/conformance.py .
+.PP
+Source: https://github.com/lally/scrutiny-agent

@@ -68,6 +68,8 @@ core/       GitReviewCore: shared C++ core (git bridge, LSP client,
             linked in-process by the Scrutiny Mac app
 gitmanip/   modern C++23 wrapper over libgit2
 docs/       protocol.md — the normative wire API
+man/        scrutiny-agent(1) and scrutiny-agent.conf(5); read with
+            `man ./man/scrutiny-agent.1` (`man -l` on Linux)
 tests/      conformance/ — wire-protocol conformance suite
             scrutiny/ + test_*.py — pytest behavioral suite (framing,
             handshake, chunking, cancellation, lanes, sandbox, cred
