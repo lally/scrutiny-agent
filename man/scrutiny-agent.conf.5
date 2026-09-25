@@ -1,0 +1,421 @@
+.\" Manual page for scrutiny-agent.conf(5).
+.\" Format with:  man ./scrutiny-agent.conf.5  (macOS)   or   man -l scrutiny-agent.conf.5  (Linux)
+.TH SCRUTINY-AGENT.CONF 5 "2026-09-21" "scrutiny-agent 0.2.0" "File Formats"
+.SH NAME
+scrutiny-agent.conf \- configuration file for scrutiny-agent
+.SH SYNOPSIS
+.IB installDir /scrutiny-agent.conf
+.PP
+.B scrutiny-agent \-\-rpc\-stdio \-\-config
+.I path
+.SH DESCRIPTION
+.B scrutiny-agent.conf
+holds the startup policy of
+.BR scrutiny-agent (1):
+which directories the agent may read, whether it may write, which git
+subcommands
+.B git.exec
+may run, and where it logs.
+It is read when the agent is started with
+.BI \-\-config " path"
+and has no fixed location; the name above is the convention every
+client follows, writing the file beside the agent binary in its
+install directory so that every client bootstrapping into the same
+directory agrees about what the agent may touch.
+.PP
+The point of a file rather than an exec line is that policy lives on
+the host: it is readable and editable where the agent runs, and it
+survives reconnects.
+The format is deliberately not JSON.
+It is written by hand, or generated to be read by a person deciding
+what a machine may touch.
+.SH FORMAT
+The file is line-oriented.
+.IP \(bu 3
+Each line is
+.BI key " = " value\c
+\&.
+Whitespace around the key and around the value is trimmed.
+The value runs to the end of the line; a value may itself contain
+.BR = .
+.IP \(bu 3
+.B #
+starts a comment that runs to the end of the line, wherever it
+appears.
+A value therefore cannot contain
+.BR # .
+.IP \(bu 3
+Blank lines are ignored.
+.IP \(bu 3
+A line holding a bare
+.I key
+with no
+.B =
+means
+.BR "key = true" .
+This is meant for the boolean key
+.BR allow\-write ;
+for any other key the literal value
+.B true
+is what gets applied.
+.IP \(bu 3
+Keys are case-insensitive (they are lowercased before use).
+Values are used as written, except
+.B git\-exec\-config
+keys, which are lowercased.
+.IP \(bu 3
+Repeatable keys
+.RB ( allow\-root ,
+.BR git\-exec ,
+.BR git\-exec\-config ,
+.BR git\-exec\-preset ,
+.BR config )
+accumulate.
+Single-valued keys
+.RB ( log ,
+.BR log\-level ,
+.BR allow\-write )
+take the last value seen.
+.IP \(bu 3
+Lines apply in order, and the file applies at the point on the
+command line where its
+.B \-\-config
+appears.
+Later command-line options add to or override what the file set, and
+earlier ones are added to or overridden by it.
+.IP \(bu 3
+An unknown key, or a bad value for a known key, is reported on the
+agent's standard error with the file name and line number and
+otherwise ignored.
+An unreadable file is likewise a warning.
+One stale line in a shared file must not stop an agent from starting.
+.PP
+Every key corresponds to the command-line option of the same name
+with the leading dashes removed, and the two feed one table inside the
+agent, so neither can gain a setting the other lacks.
+.SH KEYS
+.TP
+.BI allow\-root " = path"
+Add
+.I path
+to the filesystem sandbox.
+Every path an
+.B fs.*
+request names must, after symlink resolution, lie inside one of the
+allowed roots; anything else is refused with
+.B PERMISSION_DENIED
+before the kernel is touched.
+A relative
+.I path
+is anchored under the agent's
+.BR $HOME .
+Repeatable.
+A root that does not resolve is dropped with a warning.
+If no root survives, the sandbox is
+.B $HOME
+itself.
+.TP
+.BR allow\-write " [= true | false]"
+Serve the filesystem write methods
+.RB ( fs.writeFile ,
+.BR fs.mkdir ,
+.BR fs.delete ,
+.BR fs.rename ,
+.BR fs.copy ,
+.BR fs.chmod ).
+Off by default.
+The values
+.BR false ,
+.B no
+and
+.B 0
+turn it off; anything else, including a bare
+.BR allow\-write ,
+turns it on.
+Writes are confined to the same roots as reads.
+.TP
+.BI git\-exec " = subcommand"
+Allow one git
+.I subcommand
+through the
+.B git.exec
+method.
+Repeatable.
+.B git.exec
+is disabled, and not advertised to clients, until at least one
+subcommand has been allowed by this key or by
+.BR git\-exec\-preset .
+Subcommand names are matched exactly.
+.TP
+.BI git\-exec\-preset " = " read\-only " | " magit
+Allow a named set of subcommands.
+The two presets are listed under
+.B PRESETS
+below.
+An unknown name is a warning and grants nothing.
+Combining a preset with individual
+.B git\-exec
+lines is fine; the result is the union.
+.TP
+.BI git\-exec\-config " = key"
+Permit
+.B git.exec
+requests to pass
+.BI "\-c " key = value
+before the subcommand.
+.I key
+is either a full
+.B section.name
+.RB ( diff.context )
+or a bare section
+.RB ( color ),
+which permits every key in that section.
+The built-in set is listed under
+.B PERMITTED \-c KEYS
+below.
+Repeatable.
+Never add a key that makes git run a program or reach the network on
+its own terms:
+.BR core.pager ,
+.BR core.editor ,
+.BR core.sshCommand ,
+.BR credential.helper ,
+.BR alias.* ,
+.BR diff.external ,
+.BR *.textconv ,
+.BR http.* ,
+and the like.
+The set is allowlisted, not denylisted, precisely because that family
+is too large and too easily extended to enumerate.
+.TP
+.BI log " = path"
+Append the agent's log to
+.IR path .
+Without this key nothing is logged.
+At 8 MiB the file is renamed to
+.IB path .1
+and a new one started; one backup is kept.
+.I path
+is used as given (a relative path is relative to the agent's working
+directory, which a transport does not guarantee), so name an absolute
+path or one the client resolves.
+Credential values never appear in the log, at any level, because the
+.B logs.tail
+method streams the log back to the client.
+.TP
+.BI log\-level " = " off " | " error " | " warn " | " info " | " debug " | " trace
+The threshold for
+.BR log .
+Defaults to
+.B info
+when
+.B log
+is set.
+An unrecognised value is treated as
+.BR off ,
+which disables logging entirely; check the agent's startup line on
+standard error if a log stays empty.
+At
+.B trace
+request parameters are logged in full except credentials; below it
+content-bearing parameters are redacted.
+.TP
+.BI config " = path"
+Read another file in this format at this point.
+A relative
+.I path
+is anchored under
+.BR $HOME .
+There is no cycle detection; do not include a file from itself.
+.SH PRESETS
+.TP
+.B read\-only
+Subcommands that only inspect a repository:
+.PP
+.RS
+blame, branch, cat-file, check-ignore, check-ref-format, count-objects,
+describe, diff, diff-files, diff-index, diff-tree, for-each-ref, grep,
+log, ls-files, ls-remote, ls-tree, merge-base, name-rev, rev-list,
+rev-parse, shortlog, show, show-ref, status, symbolic-ref, tag, var,
+version, whatchanged.
+.RE
+.IP
+Note that
+.B branch
+and
+.B tag
+are included: they list by default, but with arguments they create
+and delete refs.
+An operator who needs strictly read-only behaviour should list
+subcommands individually.
+.TP
+.B magit
+Everything in
+.B read\-only
+plus the working operations magit needs:
+.PP
+.RS
+add, am, apply, bisect, checkout, cherry, cherry-pick, clean, commit,
+fetch, format-patch, merge, mv, notes, pull, push, range-diff, rebase,
+reflog, remote, reset, restore, revert, rm, stash, submodule, switch,
+update-index, worktree.
+.RE
+.IP
+This is a broad grant, close to
+.B git
+itself, and is documented as such.
+.PP
+Whatever the allowlist, every
+.B git.exec
+request is also checked for the git options that would let it run an
+arbitrary program or move the repository; see
+.BR scrutiny-agent (1),
+section
+.BR SECURITY .
+The subcommands
+.BR fetch ,
+.BR pull ,
+.BR push ,
+.BR ls-remote ,
+.B clone
+and
+.B submodule
+authenticate through the client-side credential broker; no token is
+stored on the host.
+.SH PERMITTED \-c KEYS
+Always permitted, before any
+.B git\-exec\-config
+additions.
+A bare section name permits every key under it.
+.PP
+.RS
+.nf
+advice            (whole section)
+color             (whole section)
+core.abbrev
+core.commitgraph
+core.preloadindex
+core.quotepath
+core.untrackedcache
+diff.algorithm
+diff.context
+diff.mnemonicprefix
+diff.noprefix
+diff.renames
+diff.submodule
+gc.auto
+i18n.logoutputencoding
+log.date
+log.showsignature
+status.relativepaths
+status.showuntrackedfiles
+.fi
+.RE
+.PP
+These only affect formatting or local behaviour.
+The set exists because magit passes
+.B \-c core.preloadIndex=true \-c log.showSignature=false \-c color.ui=false
+.B \-c color.diff=false \-c diff.noPrefix=false
+on every invocation, so refusing
+.B \-c
+outright would mean refusing magit.
+.SH CLIENTS THAT WRITE THIS FILE
+The file is normally generated, and its comments say by whom.
+.TP
+.B Scrutiny
+(Settings > Remote Hosts) renders the host's saved settings into
+.IB installDir /scrutiny-agent.conf
+on every connection, hash-gated like the binary, and starts the agent
+with
+.BR "\-\-config " "that file."
+It writes
+.B allow\-root
+lines (the host's Allowed directories), a
+.B git\-exec\-preset
+line when git commands via the agent are enabled, and
+.B log
+/
+.B log\-level
+when logging is on.
+The Mac is the source of truth: hand edits to a Scrutiny-managed file
+are overwritten at the next connection.
+Change the host in Scrutiny instead.
+.TP
+.B Emacs
+.RB ( scrutiny-agent-remote-setup )
+writes the same file once and rewrites it only when its own generated
+default changes, so hand edits survive.
+It may also write
+.B allow\-write
+(saving through the agent rather than TRAMP) and
+.BR "git\-exec\-preset = magit" .
+.PP
+Scrutiny's reader ignores keys it does not write, matching the agent's
+warn-and-continue posture.
+A host used from both clients should be configured in Scrutiny, since
+its rewrite drops anything the Emacs client added.
+.SH EXAMPLES
+A host used for code review only, read-only, two source trees, git
+inspection allowed:
+.PP
+.nf
+.RS
+# scrutiny-agent policy for this host.
+allow-root = src            # ~/src
+allow-root = /srv/repos
+git-exec-preset = read-only
+log = /home/me/.scrutiny-agent/agent.log
+log-level = warn
+.RE
+.fi
+.PP
+A development host driven from Emacs, with saves and magit over the
+agent and an extra
+.B \-c
+key:
+.PP
+.nf
+.RS
+allow-root = work
+allow-write
+git-exec-preset = magit
+git-exec-config = merge.conflictstyle
+.RE
+.fi
+.PP
+A minimal allowlist instead of a preset:
+.PP
+.nf
+.RS
+allow-root = /srv/repos
+git-exec = log
+git-exec = status
+git-exec = diff
+git-exec = fetch
+.RE
+.fi
+.PP
+Splitting site policy from per-user additions:
+.PP
+.nf
+.RS
+config = /etc/scrutiny-agent/site.conf
+allow-root = scratch
+.RE
+.fi
+.SH FILES
+.TP
+.IB installDir /scrutiny-agent.conf
+The conventional location, beside the agent binary.
+.SH SEE ALSO
+.BR scrutiny-agent (1),
+.BR git-config (1)
+.PP
+.I docs/protocol.md
+in the source tree describes the
+.B git.exec
+policy and the
+.B fs.*
+sandbox normatively.
+.PP
+Source: https://github.com/lally/scrutiny-agent
