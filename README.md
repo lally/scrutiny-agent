@@ -1,6 +1,6 @@
 # scrutiny-agent
 
-The remote backend process for [Scrutiny](https://github.com/lally/git-review),
+The remote backend process for [Scrutiny](https://scrutiny.review),
 a native macOS GitHub-PR review app. Scrutiny spawns this agent on a
 remote box over a user-supplied stdio transport (ssh / `ssh -J` / tsh /
 `kubectl exec` / a local shell / ...) and speaks JSON-RPC 2.0 with

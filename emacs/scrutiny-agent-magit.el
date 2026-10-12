@@ -1,7 +1,7 @@
 ;;; scrutiny-agent-magit.el --- Magit over a scrutiny-agent channel  -*- lexical-binding: t; -*-
 
 ;; Author: Lally Singh
-;; URL: https://github.com/lally/scrutiny-agent
+;; URL: https://github.com/five-rivers/scrutiny-agent
 ;; Version: 0.2.0
 ;; (The package's requirements are declared in scrutiny-agent.el;
 ;; a Package-Requires header outside the main file has no effect.)

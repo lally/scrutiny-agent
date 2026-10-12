@@ -1,7 +1,7 @@
 ;;; scrutiny-agent.el --- Client for the scrutiny-agent remote backend  -*- lexical-binding: t; -*-
 
 ;; Author: Lally Singh
-;; URL: https://github.com/lally/scrutiny-agent
+;; URL: https://github.com/five-rivers/scrutiny-agent
 ;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1"))
 ;;
@@ -83,7 +83,7 @@ integration).  PLIST keys:
 Each function is called with one argument: the host name (string).")
 
 (defcustom scrutiny-agent-release-url-format
-  "https://github.com/lally/scrutiny-agent/releases/download/v%s/scrutiny-agent-%s-%s"
+  "https://github.com/five-rivers/scrutiny-agent/releases/download/v%s/scrutiny-agent-%s-%s"
   "Format for release-asset URLs: version, version, arch."
   :type 'string)
 
