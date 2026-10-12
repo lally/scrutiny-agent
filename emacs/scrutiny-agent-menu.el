@@ -29,6 +29,8 @@
 
 (declare-function scrutiny-agent-verify "scrutiny-agent-verify")
 (declare-function scrutiny-agent-code-mode "scrutiny-agent-xref")
+(declare-function scrutiny-agent-fs-status "scrutiny-agent-fs")
+(declare-function scrutiny-agent-fs-warm-cache "scrutiny-agent-fs")
 
 ;;;###autoload (autoload 'scrutiny-agent-transient "scrutiny-agent-menu" nil t)
 (transient-define-prefix scrutiny-agent-transient ()
@@ -38,7 +40,8 @@
     ("q" "Disconnect"       scrutiny-agent-disconnect)
     ("i" "Info / posture"   scrutiny-agent-info)
     ("p" "Ping"             scrutiny-agent-ping)
-    ("L" "Remote log tail"  scrutiny-agent-remote-logs)]
+    ("L" "Remote log tail"  scrutiny-agent-remote-logs)
+    ("P" "Prime FS cache"   scrutiny-agent-fs-warm-cache)]
    ["Files"
     ("b" "Browse directory" scrutiny-agent-browse)
     ("f" "View file"        scrutiny-agent-view-file)]
@@ -62,7 +65,8 @@
     ("W" "Stop watch"       scrutiny-agent-unwatch)]
    ["Diagnostics"
     ("v" "Verify all operations" scrutiny-agent-verify)
-    ("k" "Credential selftest"   scrutiny-agent-credential-selftest)]])
+    ("k" "Credential selftest"   scrutiny-agent-credential-selftest)
+    ("S" "FS-mode status"        scrutiny-agent-fs-status)]])
 
 (provide 'scrutiny-agent-menu)
 ;;; scrutiny-agent-menu.el ends here

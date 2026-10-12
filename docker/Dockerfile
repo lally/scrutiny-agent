@@ -20,8 +20,12 @@
 # debian:11's apt cmake is 3.18 (predates solid C++23 dialect
 # support), so a modern CMake + Ninja come from PyPI manylinux wheels
 # (glibc-compatible; the 2.31 floor is kept).
+#
+# LAYER CACHING: Each RUN is a separate layer so partial downloads
+# survive network failures. buildpack-deps:bullseye provides
+# build-essential, git, curl, ca-certificates, wget, and more.
 
-FROM debian:11-slim AS build
+FROM buildpack-deps:bullseye AS build
 
 ARG AGENT_VERSION=0.1.0
 ENV DEBIAN_FRONTEND=noninteractive
@@ -42,19 +46,32 @@ RUN sed -i -e 's|^# deb http://snapshot|deb http://snapshot|' \
     && grep -q '^deb http://snapshot' /etc/apt/sources.list \
     && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-eol-suite
 
+# Layer 1: Additional base packages (small, fast)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git pkg-config perl python3 python3-pip \
-        ca-certificates wget gnupg lsb-release software-properties-common \
-        libsqlite3-dev \
-    && wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
-    && chmod +x /tmp/llvm.sh && /tmp/llvm.sh 17 \
-    && apt-get install -y --no-install-recommends \
-        clang-17 lld-17 libc++-17-dev libc++abi-17-dev \
-    && ln -sf /usr/bin/clang-17 /usr/bin/clang \
+    pkg-config lsb-release software-properties-common gpg gpg-agent dirmngr \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Layer 2: SQLite dev headers
+RUN apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Layer 3: Add LLVM apt repo (downloads GPG key and updates sources)
+RUN wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+    && chmod +x /tmp/llvm.sh && /tmp/llvm.sh 17 all
+
+# Layer 4: LLVM toolchain (the big download, ~160MB)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang-17 lld-17 libc++-17-dev libc++abi-17-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Layer 5: Symlinks for toolchain
+RUN ln -sf /usr/bin/clang-17 /usr/bin/clang \
     && ln -sf /usr/bin/clang++-17 /usr/bin/clang++ \
-    && ln -sf /usr/bin/ld.lld-17 /usr/bin/ld.lld \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir "conan>=2.0,<3" "cmake>=3.27" ninja \
+    && ln -sf /usr/bin/ld.lld-17 /usr/bin/ld.lld
+
+# Layer 6: Python build tools (Conan, CMake, Ninja)
+RUN pip3 install --no-cache-dir "conan>=2.0,<3" "cmake>=3.27" ninja \
     && cmake --version && ninja --version
 
 ENV CC=clang-17 CXX=clang++-17

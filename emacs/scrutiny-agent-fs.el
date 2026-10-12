@@ -102,8 +102,44 @@ holding the whole thing in a base64 payload."
 (defvar scrutiny-agent-fs--dir-cache (make-hash-table :test #'equal)
   "HOST+DIR -> (TIMESTAMP . ((NAME . ATTRS-PLIST) ...)).")
 
+(defvar scrutiny-agent-fs--pending-fetches (make-hash-table :test #'equal)
+  "Directories currently being fetched in the background.")
+
 (defvar scrutiny-agent-fs--roots-cache (make-hash-table :test #'equal)
   "HOST -> (ROOTS . HOME), the connection facts. Fixed per connection.")
+
+(defcustom scrutiny-agent-fs-verbose nil
+  "When non-nil, log diagnostic messages for fs-mode operations.
+Set to t to see warnings in *Messages*, or to a buffer name for
+a dedicated log.  Useful for debugging why operations fall back
+to TRAMP or fail entirely."
+  :type '(choice (const :tag "Off" nil)
+                 (const :tag "To *Messages*" t)
+                 (string :tag "To named buffer")))
+
+(defvar scrutiny-agent-fs--last-error nil
+  "The last error encountered by fs-mode, for diagnostics.
+A plist with :host, :operation, :error, and :time.")
+
+(defun scrutiny-agent-fs--warn (host format-string &rest args)
+  "Log a diagnostic message for HOST using FORMAT-STRING and ARGS.
+Output goes to *Messages* or a dedicated buffer per `scrutiny-agent-fs-verbose'."
+  (when scrutiny-agent-fs-verbose
+    (let ((msg (format "scrutiny-agent-fs[%s]: %s"
+                       (or host "?")
+                       (apply #'format format-string args))))
+      (if (stringp scrutiny-agent-fs-verbose)
+          (with-current-buffer (get-buffer-create scrutiny-agent-fs-verbose)
+            (goto-char (point-max))
+            (insert (format-time-string "[%H:%M:%S] ") msg "\n"))
+        (message "%s" msg)))))
+
+(defun scrutiny-agent-fs--record-error (host operation error)
+  "Record ERROR for diagnostics; retrievable via `scrutiny-agent-fs-last-error'."
+  (setq scrutiny-agent-fs--last-error
+        (list :host host :operation operation
+              :error error :time (current-time)))
+  (scrutiny-agent-fs--warn host "%s failed: %S" operation error))
 
 (defcustom scrutiny-agent-fs-roots-are-the-world t
   "Whether the agent's roots define everything visible on a host.
@@ -146,31 +182,83 @@ over the string."
   (when (and (stringp filename)
              (fboundp 'tramp-tramp-file-p)
              (tramp-tramp-file-p filename))
-    (let ((vec (ignore-errors (tramp-dissect-file-name filename))))
-      (let ((tramp-host (and vec (tramp-file-name-host vec)))
-            (localname (and vec (tramp-file-name-localname vec))))
-        (let ((host (and tramp-host
-                         (or (cdr (assoc tramp-host
-                                         scrutiny-agent-fs-host-alist))
-                             tramp-host))))
-          (when (and localname host (assoc host scrutiny-agent-hosts))
-            (list host
-                  (substring filename
-                             0 (- (length filename) (length localname)))
-                  localname)))))))
+    (condition-case err
+        (let ((vec (tramp-dissect-file-name filename)))
+          (unless vec
+            (scrutiny-agent-fs--warn nil "TRAMP dissect returned nil for %s" filename)
+            (cl-return-from scrutiny-agent-fs--parse nil))
+          (let ((tramp-host (tramp-file-name-host vec))
+                (localname (tramp-file-name-localname vec)))
+            (unless (stringp tramp-host)
+              (scrutiny-agent-fs--warn nil "no host in TRAMP vector for %s" filename)
+              (cl-return-from scrutiny-agent-fs--parse nil))
+            (let ((host (or (cdr (assoc tramp-host scrutiny-agent-fs-host-alist))
+                            tramp-host)))
+              (if (not (assoc host scrutiny-agent-hosts))
+                  nil  ; Not our host, silently delegate
+                (list host
+                      (substring filename
+                                 0 (- (length filename) (length (or localname ""))))
+                      (or localname ""))))))
+      (error
+       (scrutiny-agent-fs--record-error nil 'parse err)
+       nil))))
+
+(defcustom scrutiny-agent-fs-auto-connect nil
+  "Whether to connect automatically when a file operation needs it.
+When nil (the default), fs-mode only accelerates hosts you have
+already connected to with `scrutiny-agent-connect'.  This avoids
+blocking file operations while bootstrapping the agent.
+
+When non-nil, the first file operation on an unconnected host will
+block while the connection is established -- which can take tens of
+seconds if the binary needs to be streamed over a slow link."
+  :type 'boolean)
+
+(defvar scrutiny-agent-fs--connect-hints (make-hash-table :test #'equal)
+  "Hosts we've already shown the connect hint for, to avoid spam.")
 
 (defun scrutiny-agent-fs--conn (host)
   "A live connection to HOST, or nil if one cannot be had.
 Never signals: a handler that errors on a dead transport would break
-every file operation instead of falling back to TRAMP."
+every file operation instead of falling back to TRAMP.
+
+With `scrutiny-agent-fs-auto-connect' nil, only returns an existing
+connection -- so unconnected hosts fall through to TRAMP immediately
+rather than blocking on bootstrap."
   (or (scrutiny-agent-connection host)
-      (ignore-errors (scrutiny-agent-connect host))))
+      (if scrutiny-agent-fs-auto-connect
+          (condition-case err
+              (scrutiny-agent-connect host)
+            (error
+             (scrutiny-agent-fs--record-error host 'connect err)
+             nil))
+        ;; Not connected and auto-connect is off: show a one-time hint
+        (unless (gethash host scrutiny-agent-fs--connect-hints)
+          (puthash host t scrutiny-agent-fs--connect-hints)
+          (message "scrutiny-agent-fs: %s not connected, using TRAMP (connect with C-c s c)"
+                   host))
+        nil)))
 
 (defun scrutiny-agent-fs--writable-p (host)
   "Whether HOST's agent serves the fs write surface."
   (let ((conn (scrutiny-agent-fs--conn host)))
     (when conn
       (and (member "fs.writeFile" (scrutiny-agent--conn-capabilities conn)) t))))
+
+(defun scrutiny-agent-fs--interactive-p ()
+  "Non-nil if we're in a context where blocking is unacceptable.
+During minibuffer completion, any RPC would freeze the UI."
+  (let* ((mb (minibufferp))
+         (wmb (window-minibuffer-p))
+         (mwa (minibuffer-window-active-p (minibuffer-window)))
+         (cc (bound-and-true-p company-candidates))
+         (result (or mb wmb mwa cc)))
+    ;; Debug output - remove after fixing
+    (when scrutiny-agent-fs-verbose
+      (message "interactive-p: mb=%S wmb=%S mwa=%S cc=%S => %S"
+               mb wmb mwa cc result))
+    result))
 
 (defun scrutiny-agent-fs--facts (host)
   "The agent's roots and remote home for HOST, as (ROOTS . HOME).
@@ -180,23 +268,38 @@ of a connection -- so this is asked once and the failure is cached
 too. Retrying a lookup that cannot succeed puts a round trip in front
 of every single file operation."
   (let ((cached (gethash host scrutiny-agent-fs--roots-cache 'miss)))
-    (if (not (eq cached 'miss))
-        cached
+    (cond
+     ;; Cache hit - return immediately (facts don't expire)
+     ((not (eq cached 'miss)) cached)
+     ;; Interactive context with no cache - don't block
+     ((scrutiny-agent-fs--interactive-p)
+      (scrutiny-agent-fs--warn host "no cached facts during completion, using TRAMP")
+      nil)
+     ;; Non-interactive - OK to block for the RPC
+     (t
       (puthash host
                (let ((conn (scrutiny-agent-fs--conn host)))
-		 (when conn
-		   (condition-case nil
-                       (let ((fsa (plist-get
-                                   (scrutiny-agent-ops-capabilities conn)
-                                   :fileSystemAccess)))
-			 (cons (scrutiny-agent-ops--list
-				(plist-get fsa :allowedRoots))
-                               (let ((home (plist-get fsa :home)))
-				 (and (stringp home)
-                                      (not (string-empty-p home))
-                                      (directory-file-name home)))))
-                     (error nil))))
-               scrutiny-agent-fs--roots-cache))))
+                 (if (null conn)
+                     (progn
+                       (scrutiny-agent-fs--warn host "no connection, cannot fetch capabilities")
+                       nil)
+                   (condition-case err
+                       (let* ((caps (scrutiny-agent-ops-capabilities conn))
+                              (fsa (plist-get caps :fileSystemAccess))
+                              (roots (scrutiny-agent-ops--list
+                                      (plist-get fsa :allowedRoots)))
+                              (home (plist-get fsa :home)))
+                         (when (null roots)
+                           (scrutiny-agent-fs--warn
+                            host "no allowedRoots in capabilities (agent may not serve fs)"))
+                         (cons roots
+                               (and (stringp home)
+                                    (not (string-empty-p home))
+                                    (directory-file-name home))))
+                     (error
+                      (scrutiny-agent-fs--record-error host 'capabilities err)
+                      nil))))
+               scrutiny-agent-fs--roots-cache)))))
 
 (defun scrutiny-agent-fs--roots (host)
   "The filesystem roots HOST's agent will serve, or nil if unknown."
@@ -258,6 +361,12 @@ which is the behavior from before this check existed."
   "Run OPERATION with ARGS as if this handler were not installed.
 The standard idiom: inhibit ourselves for exactly this call, so the
 next handler in `file-name-handler-alist' -- TRAMP -- takes it."
+  ;; Only log delegations for remote files (to reduce noise from local files)
+  (when (and scrutiny-agent-fs-verbose
+             (car args)
+             (stringp (car args))
+             (file-remote-p (car args)))
+    (message "DELEGATE TO TRAMP: %s %S" operation (car args)))
   (let ((inhibit-file-name-handlers
          (cons 'scrutiny-agent-fs-handler
                (and (eq inhibit-file-name-operation operation)
@@ -310,7 +419,13 @@ next handler in `file-name-handler-alist' -- TRAMP -- takes it."
             0 0))))                             ; inode, device
 
 (defun scrutiny-agent-fs--cache-key (host directory)
-  (concat host "\0" (directory-file-name directory)))
+  "Cache key for DIRECTORY on HOST.
+Normalizes the path so `/foo/bar/.` and `/foo/bar` use the same key.
+Also collapses double slashes: `//foo//bar` becomes `/foo/bar`."
+  (let* ((expanded (expand-file-name directory "/"))
+         ;; Collapse multiple slashes to single slash
+         (collapsed (replace-regexp-in-string "/+" "/" expanded)))
+    (concat host "\0" (directory-file-name collapsed))))
 
 (defun scrutiny-agent-fs-flush-cache (&optional host directory)
   "Forget cached attributes, for DIRECTORY on HOST or for everything."
@@ -336,6 +451,40 @@ them costs a round trip. They change only when the connection does."
     (remhash (concat "\0stat\0" host "\0" clean)
              scrutiny-agent-fs--dir-cache)))
 
+(defun scrutiny-agent-fs--fetch-async (host directory)
+  "Fetch DIRECTORY listing for HOST in the background.
+Populates the cache so the next access is fast."
+  (let ((key (scrutiny-agent-fs--cache-key host directory)))
+    (unless (gethash key scrutiny-agent-fs--pending-fetches)
+      (puthash key t scrutiny-agent-fs--pending-fetches)
+      ;; Use run-at-time with 0 delay - fires on next event loop iteration
+      (run-at-time
+       0 nil
+       (lambda ()
+         (unwind-protect
+             (let ((conn (scrutiny-agent-connection host)))
+               (when conn
+                 (condition-case nil
+                     (let* ((result (scrutiny-agent-request
+                                     conn "fs.listDirectory"
+                                     (list :path (directory-file-name directory)
+                                           :attributes t)
+                                     60))
+                            (entries
+                             (mapcar (lambda (entry)
+                                       (cons (plist-get entry :name)
+                                             (plist-put (copy-sequence entry)
+                                                        :exists t)))
+                                     (scrutiny-agent-ops--list
+                                      (plist-get result :entries)))))
+                       (puthash key (cons (current-time) entries)
+                                scrutiny-agent-fs--dir-cache)
+                       (when scrutiny-agent-fs-verbose
+                         (message "scrutiny-agent-fs[%s]: fetched %s (%d entries)"
+                                  host directory (length entries))))
+                   (error nil))))
+           (remhash key scrutiny-agent-fs--pending-fetches)))))))
+
 (defun scrutiny-agent-fs--listing (host directory)
   "Cached (NAME . STAT-PLIST) alist for DIRECTORY on HOST.
 
@@ -348,14 +497,26 @@ One `fs.listDirectory' with attributes answers every question Emacs is
 about to ask about the files in it."
   (let* ((key (scrutiny-agent-fs--cache-key host directory))
          (hit (gethash key scrutiny-agent-fs--dir-cache)))
-    (if (and hit (> scrutiny-agent-fs-cache-ttl 0)
-             (< (float-time (time-since (car hit)))
-                scrutiny-agent-fs-cache-ttl))
-        (cdr hit)
+    (cond
+     ;; Cache hit (fresh)
+     ((and hit (> scrutiny-agent-fs-cache-ttl 0)
+           (< (float-time (time-since (car hit)))
+              scrutiny-agent-fs-cache-ttl))
+      (cdr hit))
+     ;; Interactive context - use stale cache or trigger background fetch
+     ((scrutiny-agent-fs--interactive-p)
+      (if hit
+          (cdr hit)  ; Use stale data rather than blocking
+        ;; No cache - trigger background fetch for next time
+        (scrutiny-agent-fs--fetch-async host directory)
+        (scrutiny-agent-fs--warn host "fetching %s in background" directory)
+        'unavailable))
+     ;; Fetch from agent
+     (t
       (let ((conn (scrutiny-agent-fs--conn host)))
         (if (null conn)
             'unavailable
-          (condition-case nil
+          (condition-case err
               (let* ((result (scrutiny-agent-request
                               conn "fs.listDirectory"
                               (list :path (directory-file-name directory)
@@ -377,10 +538,13 @@ about to ask about the files in it."
             ;; wanted. The TTL applies equally, so a root that becomes
             ;; readable is picked up shortly.
             (scrutiny-agent-rpc-error
+             (scrutiny-agent-fs--record-error host 'listing err)
              (puthash key (cons (current-time) 'unavailable)
                       scrutiny-agent-fs--dir-cache)
              'unavailable)
-            (error 'unavailable)))))))
+            (error
+             (scrutiny-agent-fs--record-error host 'listing err)
+             'unavailable))))))))
 
 (defun scrutiny-agent-fs--listing-ok (entries)
   "ENTRIES if the listing succeeded (possibly empty), else nil."
@@ -409,22 +573,35 @@ Emacs asks about the same file several times inside a single command
 and without this each one is its own round trip."
   (let* ((key (concat "\0stat\0" host "\0" path))
          (hit (gethash key scrutiny-agent-fs--dir-cache)))
-    (if (and hit (> scrutiny-agent-fs-cache-ttl 0)
-             (< (float-time (time-since (car hit)))
-                scrutiny-agent-fs-cache-ttl))
-        (cdr hit)
+    (cond
+     ;; Cache hit (fresh)
+     ((and hit (> scrutiny-agent-fs-cache-ttl 0)
+           (< (float-time (time-since (car hit)))
+              scrutiny-agent-fs-cache-ttl))
+      (cdr hit))
+     ;; Interactive context - use stale cache if available
+     ((scrutiny-agent-fs--interactive-p)
+      (if hit
+          (cdr hit)  ; Use stale data rather than blocking
+        (scrutiny-agent-fs--warn host "no cached stat for %s during completion" path)
+        nil))
+     ;; Fetch from agent
+     (t
       (let ((result
              (let ((conn (scrutiny-agent-fs--conn host)))
-	       (when conn
-		 (condition-case nil
-                     (scrutiny-agent-request conn "fs.stat" (list :path path)
-                                             30)
-                   (scrutiny-agent-rpc-error nil)
-                   (error nil))))))
+               (when conn
+                 (condition-case err
+                     (scrutiny-agent-request conn "fs.stat" (list :path path) 30)
+                   (scrutiny-agent-rpc-error
+                    (scrutiny-agent-fs--record-error host 'stat err)
+                    nil)
+                   (error
+                    (scrutiny-agent-fs--record-error host 'stat err)
+                    nil))))))
         (when (> scrutiny-agent-fs-cache-ttl 0)
           (puthash key (cons (current-time) result)
                    scrutiny-agent-fs--dir-cache))
-        result))))
+        result)))))
 
 ;; ---------------------------------------------------------------------
 ;; Handler helpers
@@ -445,16 +622,23 @@ each of the call sites below, but nothing outside Emacs could see
 through it."
   (let ((parsed (scrutiny-agent-fs--parse filename)))
     (if (not parsed)
-        (scrutiny-agent-fs--delegate operation args)
+        (progn
+          (when scrutiny-agent-fs-verbose
+            (message "dispatch[%s]: not parsed, delegating" operation))
+          (scrutiny-agent-fs--delegate operation args))
       (let ((host (nth 0 parsed))
             (prefix (nth 1 parsed))
             (localname (nth 2 parsed)))
         (cond
          ((not (scrutiny-agent-fs--conn host))
+          (when scrutiny-agent-fs-verbose
+            (message "dispatch[%s]: no conn for %s, delegating" operation host))
           (scrutiny-agent-fs--delegate operation args))
          ((not (scrutiny-agent-fs--in-roots-p host localname))
           ;; Outside the roots. Either answer from structure (no
           ;; request, no connection) or hand it to TRAMP.
+          (when scrutiny-agent-fs-verbose
+            (message "dispatch[%s]: %s outside roots" operation localname))
           (if scrutiny-agent-fs-roots-are-the-world
               (scrutiny-agent-fs--outside-roots host localname operation)
             (scrutiny-agent-fs--delegate operation args)))
@@ -633,14 +817,16 @@ See `scrutiny-agent-fs-roots-are-the-world'."
    directory 'directory-files (append (list directory full match nosort) rest)
    (lambda (host prefix localname)
      (let ((entries (scrutiny-agent-fs--listing host localname)))
-       (if (not (scrutiny-agent-fs--listing-ok entries))
-           (scrutiny-agent-fs--delegate
-            'directory-files
-            (append (list directory full match nosort) rest))
+       (cond
+        ((scrutiny-agent-fs--listing-ok entries)
          (mapcar (lambda (name) (if (and full (not (file-remote-p name)))
                                     (concat prefix name)
                                   name))
-                 (scrutiny-agent-fs--names host localname full match nosort)))))))
+                 (scrutiny-agent-fs--names host localname full match nosort)))
+        ;; Listing unavailable - return empty rather than falling back to TRAMP
+        (t
+         (scrutiny-agent-fs--warn host "directory-files failed for %s" localname)
+         nil))))))
 
 (defun scrutiny-agent-fs--handle-directory-files-and-attributes
     (directory &optional full match nosort id-format &rest rest)
@@ -648,10 +834,8 @@ See `scrutiny-agent-fs-roots-are-the-world'."
    directory 'directory-files-and-attributes (append (list directory full match nosort id-format) rest)
    (lambda (host prefix localname)
      (let ((entries (scrutiny-agent-fs--listing host localname)))
-       (if (not (scrutiny-agent-fs--listing-ok entries))
-           (scrutiny-agent-fs--delegate
-            'directory-files-and-attributes
-            (append (list directory full match nosort id-format) rest))
+       (cond
+        ((scrutiny-agent-fs--listing-ok entries)
          (mapcar
           (lambda (name)
             (let* ((base (file-name-nondirectory
@@ -662,28 +846,43 @@ See `scrutiny-agent-fs-roots-are-the-world'."
                                     base (file-name-as-directory localname)))
                            (cdr (assoc base entries)))))
               (cons (if (and full (not (file-remote-p name)))
-			(concat prefix name)
+                        (concat prefix name)
                       name)
                     (scrutiny-agent-fs--attributes stat id-format))))
-          (scrutiny-agent-fs--names host localname full match nosort)))))))
+          (scrutiny-agent-fs--names host localname full match nosort)))
+        ;; Listing unavailable - return empty rather than falling back to TRAMP
+        (t
+         (scrutiny-agent-fs--warn host "directory-files-and-attributes failed for %s" localname)
+         nil))))))
 
 (defun scrutiny-agent-fs--handle-file-name-all-completions (file directory)
   (scrutiny-agent-fs--dispatch
    directory 'file-name-all-completions (list file directory)
    (lambda (host _prefix localname)
      (let ((entries (scrutiny-agent-fs--listing host localname)))
-       (if (not (scrutiny-agent-fs--listing-ok entries))
-           (scrutiny-agent-fs--delegate 'file-name-all-completions
-					(list file directory))
-         (delq nil
-               (mapcar (lambda (entry)
-                         (let ((name (car entry)))
-                           (when (string-prefix-p file name)
-                             (if (scrutiny-agent-ops-bool
-                                  (plist-get (cdr entry) :isDir))
-                                 (file-name-as-directory name)
-                               name))))
-                       entries)))))))
+       (cond
+        ;; Listing succeeded (possibly empty)
+        ((scrutiny-agent-fs--listing-ok entries)
+         (let ((completions
+                (delq nil
+                      (mapcar (lambda (entry)
+                                (let ((name (car entry)))
+                                  (when (string-prefix-p file name)
+                                    (if (scrutiny-agent-ops-bool
+                                         (plist-get (cdr entry) :isDir))
+                                        (file-name-as-directory name)
+                                      name))))
+                              entries))))
+           ;; Add . and .. entries (directories always include these)
+           (when (string-prefix-p file ".")
+             (push "./" completions)
+             (when (string-prefix-p file "..")
+               (push "../" completions)))
+           completions))
+        ;; Listing unavailable - return empty rather than falling back to TRAMP
+        (t
+         (scrutiny-agent-fs--warn host "completions unavailable for %s" localname)
+         nil))))))
 
 (defun scrutiny-agent-fs--handle-file-name-completion
     (file directory &optional predicate)
@@ -714,19 +913,28 @@ See `scrutiny-agent-fs-roots-are-the-world'."
    filename 'file-local-copy (list filename)
    (lambda (host _prefix localname)
      (let ((stat (scrutiny-agent-fs--stat host localname)))
-       (if (or (not (scrutiny-agent-ops-bool (plist-get stat :exists)))
-               (> (or (plist-get stat :size) 0)
-                  scrutiny-agent-fs-max-inline-bytes))
-           (scrutiny-agent-fs--delegate 'file-local-copy (list filename))
+       (cond
+        ;; File doesn't exist
+        ((not (scrutiny-agent-ops-bool (plist-get stat :exists)))
+         (scrutiny-agent-fs--warn host "file-local-copy: %s does not exist" localname)
+         nil)
+        ;; File too large for inline transfer - must delegate
+        ((> (or (plist-get stat :size) 0) scrutiny-agent-fs-max-inline-bytes)
+         (scrutiny-agent-fs--warn host "file-local-copy: %s too large, delegating" localname)
+         (scrutiny-agent-fs--delegate 'file-local-copy (list filename)))
+        ;; Normal case - fetch via agent
+        (t
          (let ((bytes (scrutiny-agent-fs--fetch host localname)))
            (if (null bytes)
-               (scrutiny-agent-fs--delegate 'file-local-copy (list filename))
+               (progn
+                 (scrutiny-agent-fs--warn host "file-local-copy: failed to fetch %s" localname)
+                 nil)
              (let ((tmp (make-temp-file "scrutiny-agent-fs")))
                (let ((coding-system-for-write 'binary))
                  (with-temp-file tmp
                    (set-buffer-multibyte nil)
                    (insert bytes)))
-               tmp))))))))
+               tmp)))))))))
 
 (defun scrutiny-agent-fs--handle-insert-file-contents
     (filename &optional visit beg end replace)
@@ -738,11 +946,13 @@ gets coding-system detection, REPLACE and BEG/END right -- reproducing
 those here would be a large and subtle way to corrupt buffers."
   (scrutiny-agent-fs--dispatch
    filename 'insert-file-contents (list filename visit beg end replace)
-   (lambda (_host _prefix _localname)
+   (lambda (host _prefix localname)
      (let ((local (scrutiny-agent-fs--handle-file-local-copy filename)))
        (if (null local)
-           (scrutiny-agent-fs--delegate 'insert-file-contents
-					(list filename visit beg end replace))
+           ;; Failed to get file - signal error instead of delegating to TRAMP
+           (progn
+             (scrutiny-agent-fs--warn host "insert-file-contents: failed for %s" localname)
+             (error "Cannot read file %s via scrutiny-agent" filename))
          (unwind-protect
              (let ((result (insert-file-contents local nil beg end replace)))
                (when visit
@@ -1073,32 +1283,30 @@ made, instead of TRAMP shelling out to `ls' on the far end."
     (scrutiny-agent-fs--dispatch
      file 'insert-directory args
      (lambda (host _prefix localname)
-       (if (or wildcard
-               (not (scrutiny-agent-fs--listing-ok
-                     (scrutiny-agent-fs--listing
-                      host (directory-file-name localname)))))
-           ;; A wildcard needs shell globbing, and an unreadable
-           ;; directory is TRAMP's problem to report.
-           (scrutiny-agent-fs--delegate 'insert-directory args)
-         (condition-case nil
-             (progn
-               ;; Call `ls-lisp-insert-directory' directly, NOT the
-               ;; `ls-lisp--insert-directory' advice: that one looks up
-               ;; the handler for the file and calls it, which is this
-               ;; function -- straight into infinite recursion.
-               ;;
-               ;; Doing so means reproducing the two preparation steps
-               ;; the advice performs: drop long options it cannot
-               ;; honor, and convert the switch string into the list of
-               ;; characters `ls-lisp-insert-directory' actually reads.
-               (let* ((ls-lisp-use-insert-directory-program nil)
-                      (text (if (fboundp 'ls-lisp--sanitize-switches)
-				(ls-lisp--sanitize-switches (or switches ""))
-                              (or switches "")))
-                      (chars (delete ?\s (delete ?- (append text nil)))))
-                 (ls-lisp-insert-directory
-                  file chars (ls-lisp-time-index chars) nil full-directory-p)))
-           (error (scrutiny-agent-fs--delegate 'insert-directory args))))))))
+       (cond
+        ;; Wildcards need shell globbing - must delegate
+        (wildcard
+         (scrutiny-agent-fs--delegate 'insert-directory args))
+        ;; Listing unavailable - show empty rather than falling back to TRAMP
+        ((not (scrutiny-agent-fs--listing-ok
+               (scrutiny-agent-fs--listing
+                host (directory-file-name localname))))
+         (scrutiny-agent-fs--warn host "insert-directory: listing unavailable for %s" localname)
+         ;; Insert a minimal "empty" listing so dired doesn't error
+         (insert "  total 0\n"))
+        ;; Normal case - render via ls-lisp
+        (t
+         (condition-case err
+             (let* ((ls-lisp-use-insert-directory-program nil)
+                    (text (if (fboundp 'ls-lisp--sanitize-switches)
+                              (ls-lisp--sanitize-switches (or switches ""))
+                            (or switches "")))
+                    (chars (delete ?\s (delete ?- (append text nil)))))
+               (ls-lisp-insert-directory
+                file chars (ls-lisp-time-index chars) nil full-directory-p))
+           (error
+            (scrutiny-agent-fs--warn host "insert-directory error: %S" err)
+            (insert "  total 0\n")))))))))
 
 ;; ---------------------------------------------------------------------
 ;; Dispatch
@@ -1178,6 +1386,13 @@ in here."
                                 (mapcar #'car scrutiny-agent-fs-host-alist)))
             ":")))
 
+(defvar scrutiny-agent-fs-mode)  ; defined by define-minor-mode below
+
+(defun scrutiny-agent-fs--on-connect (host)
+  "Hook function to warm the cache after connecting to HOST."
+  (when scrutiny-agent-fs-mode
+    (scrutiny-agent-fs-warm-cache host)))
+
 ;;;###autoload
 (define-minor-mode scrutiny-agent-fs-mode
   "Serve remote file operations over scrutiny-agent instead of TRAMP.
@@ -1194,19 +1409,26 @@ off restores stock behavior completely."
                       file-name-handler-alist))
   (scrutiny-agent-fs-flush-cache)
   (scrutiny-agent-fs-forget-connections)
-  (when scrutiny-agent-fs-mode
-    ;; Load TRAMP FIRST. It registers its handler with `add-to-list',
-    ;; which prepends -- so if it loads after us (and it would, lazily,
-    ;; the first time anything parses a remote name) it lands ahead of
-    ;; our entry and serves every operation itself. The accelerator
-    ;; would then be installed, matching, and completely inert.
-    (require 'tramp)
-    (push (cons (scrutiny-agent-fs--file-name-regexp)
-                'scrutiny-agent-fs-handler)
-          file-name-handler-alist)
-    (unless (scrutiny-agent-fs-active-p)
-      (message "scrutiny-agent-fs: another handler precedes ours; \
-run M-x scrutiny-agent-fs-refresh after loading it"))))
+  (clrhash scrutiny-agent-fs--connect-hints)
+  ;; Remove our hook first (idempotent)
+  (remove-hook 'scrutiny-agent-after-connect-hook #'scrutiny-agent-fs--on-connect)
+  (if scrutiny-agent-fs-mode
+      (progn
+        ;; Load TRAMP FIRST. It registers its handler with `add-to-list',
+        ;; which prepends -- so if it loads after us (and it would, lazily,
+        ;; the first time anything parses a remote name) it lands ahead of
+        ;; our entry and serves every operation itself. The accelerator
+        ;; would then be installed, matching, and completely inert.
+        (require 'tramp)
+        (push (cons (scrutiny-agent-fs--file-name-regexp)
+                    'scrutiny-agent-fs-handler)
+              file-name-handler-alist)
+        ;; Auto-warm cache on connect
+        (add-hook 'scrutiny-agent-after-connect-hook #'scrutiny-agent-fs--on-connect)
+        (unless (scrutiny-agent-fs-active-p)
+          (message "scrutiny-agent-fs: another handler precedes ours; \
+run M-x scrutiny-agent-fs-refresh after loading it")))
+    (message "scrutiny-agent-fs-mode disabled")))
 
 (defun scrutiny-agent-fs-active-p ()
   "Non-nil when our handler would actually be reached for our hosts.
@@ -1310,6 +1532,127 @@ the ratio.  Read-only: it lists, stats and reads, and never writes."
       (special-mode)
       (goto-char (point-min))
       (display-buffer (current-buffer)))))
+
+;; ---------------------------------------------------------------------
+;; Cache warm-up
+;; ---------------------------------------------------------------------
+
+;;;###autoload
+(defun scrutiny-agent-fs-warm-cache (host)
+  "Pre-populate the cache for HOST by fetching roots and listing them.
+Run this after connecting to make subsequent completions fast.
+Subdirectories are cached incrementally on demand via background fetches."
+  (interactive (list (completing-read "Host: "
+                                       (mapcar #'car scrutiny-agent-hosts))))
+  (let ((conn (scrutiny-agent-connection host)))
+    (unless conn
+      (user-error "Not connected to %s (use C-c s c first)" host))
+    (message "Warming cache for %s..." host)
+    (condition-case err
+        (let* ((caps (scrutiny-agent-ops-capabilities conn))
+               (fsa (plist-get caps :fileSystemAccess))
+               (roots (scrutiny-agent-ops--list (plist-get fsa :allowedRoots)))
+               (home (plist-get fsa :home)))
+          ;; Store facts in cache
+          (puthash host
+                   (cons roots (and (stringp home)
+                                    (not (string-empty-p home))
+                                    (directory-file-name home)))
+                   scrutiny-agent-fs--roots-cache)
+          ;; List the root directories
+          (let ((count 0))
+            (dolist (root roots)
+              (message "Listing %s..." root)
+              (condition-case nil
+                  (let* ((result (scrutiny-agent-request
+                                  conn "fs.listDirectory"
+                                  (list :path (directory-file-name root) :attributes t)
+                                  60))
+                         (entries (mapcar (lambda (entry)
+                                            (cons (plist-get entry :name)
+                                                  (plist-put (copy-sequence entry) :exists t)))
+                                          (scrutiny-agent-ops--list
+                                           (plist-get result :entries)))))
+                    (puthash (scrutiny-agent-fs--cache-key host root)
+                             (cons (current-time) entries)
+                             scrutiny-agent-fs--dir-cache)
+                    (cl-incf count))
+                (error nil)))
+            (message "Cache warmed for %s: %d directories, roots=%S" host count roots)))
+      (error
+       (message "Failed to warm cache for %s: %S" host err)))))
+
+;; ---------------------------------------------------------------------
+;; Diagnostics
+;; ---------------------------------------------------------------------
+
+;;;###autoload
+(defun scrutiny-agent-fs-status ()
+  "Show the status of scrutiny-agent-fs-mode for all configured hosts.
+Displays connection state, roots, home directory, and any recent errors."
+  (interactive)
+  (with-current-buffer (get-buffer-create "*scrutiny-agent-fs-status*")
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (insert "scrutiny-agent-fs-mode status\n")
+      (insert (make-string 60 ?=) "\n\n")
+      (insert (format "Mode enabled: %s\n" (if scrutiny-agent-fs-mode "yes" "NO")))
+      (insert (format "Handler active: %s\n"
+                      (if (scrutiny-agent-fs-active-p) "yes"
+                        "NO (another handler precedes ours)")))
+      (insert (format "Verbose logging: %s\n\n"
+                      (if scrutiny-agent-fs-verbose
+                          (if (stringp scrutiny-agent-fs-verbose)
+                              (format "to buffer %s" scrutiny-agent-fs-verbose)
+                            "to *Messages*")
+                        "off")))
+      (if (null scrutiny-agent-hosts)
+          (insert "No hosts configured in `scrutiny-agent-hosts'.\n")
+        (insert (format "Configured hosts: %d\n\n"
+                        (length scrutiny-agent-hosts)))
+        (dolist (entry scrutiny-agent-hosts)
+          (let* ((name (car entry))
+                 (conn (scrutiny-agent-connection name))
+                 (facts (gethash name scrutiny-agent-fs--roots-cache 'miss)))
+            (insert (format "Host: %s\n" name))
+            (insert (format "  Connection: %s\n"
+                            (if conn "live" "not connected")))
+            (if (eq facts 'miss)
+                (insert "  Roots: (not yet queried)\n")
+              (if (null facts)
+                  (insert "  Roots: FAILED to fetch capabilities\n")
+                (insert (format "  Roots: %S\n" (car facts)))
+                (insert (format "  Home: %s\n" (or (cdr facts) "(none)")))))
+            (insert "\n"))))
+      (when scrutiny-agent-fs--last-error
+        (insert (make-string 60 ?-) "\n")
+        (insert "Last error:\n")
+        (insert (format "  Host: %s\n" (plist-get scrutiny-agent-fs--last-error :host)))
+        (insert (format "  Operation: %s\n" (plist-get scrutiny-agent-fs--last-error :operation)))
+        (insert (format "  Error: %S\n" (plist-get scrutiny-agent-fs--last-error :error)))
+        (insert (format "  Time: %s\n"
+                        (format-time-string "%Y-%m-%d %H:%M:%S"
+                                            (plist-get scrutiny-agent-fs--last-error :time)))))
+      (insert "\n")
+      (insert "Commands:\n")
+      (insert "  M-x scrutiny-agent-fs-mode      Toggle the mode\n")
+      (insert "  M-x scrutiny-agent-fs-refresh   Re-read host config\n")
+      (insert "  M-x scrutiny-agent-fs-flush-cache  Clear directory cache\n")
+      (insert "  (setq scrutiny-agent-fs-verbose t)  Enable logging\n"))
+    (special-mode)
+    (goto-char (point-min))
+    (display-buffer (current-buffer))))
+
+;;;###autoload
+(defun scrutiny-agent-fs-last-error ()
+  "Display the last error encountered by scrutiny-agent-fs-mode."
+  (interactive)
+  (if (null scrutiny-agent-fs--last-error)
+      (message "No errors recorded by scrutiny-agent-fs-mode.")
+    (message "scrutiny-agent-fs[%s] %s: %S"
+             (or (plist-get scrutiny-agent-fs--last-error :host) "?")
+             (plist-get scrutiny-agent-fs--last-error :operation)
+             (plist-get scrutiny-agent-fs--last-error :error))))
 
 (provide 'scrutiny-agent-fs)
 ;;; scrutiny-agent-fs.el ends here

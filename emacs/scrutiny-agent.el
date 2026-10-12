@@ -78,6 +78,10 @@ integration).  PLIST keys:
   "Release version of the agent binary to bootstrap onto remotes."
   :type 'string)
 
+(defvar scrutiny-agent-after-connect-hook nil
+  "Hook run after a connection is established.
+Each function is called with one argument: the host name (string).")
+
 (defcustom scrutiny-agent-release-url-format
   "https://github.com/lally/scrutiny-agent/releases/download/v%s/scrutiny-agent-%s-%s"
   "Format for release-asset URLs: version, version, arch."
@@ -138,7 +142,7 @@ instead of polling.")
 
 (cl-defstruct (scrutiny-agent--conn (:constructor scrutiny-agent--conn-make))
   name process
-  (buffer "")                ; unibyte read accumulator
+  (buffer (string-to-unibyte ""))  ; unibyte read accumulator
   (next-id 0)
   (pending (make-hash-table :test #'eql))   ; id -> callback (RESULT ERR)
   (chunks (make-hash-table :test #'equal))  ; id-key -> reversed data list
@@ -883,6 +887,7 @@ at it if this platform is expected to work"
     (message "scrutiny-agent[%s]: connected (agent %s, %d capabilities)"
              name (scrutiny-agent--conn-agent-version conn)
              (length (scrutiny-agent--conn-capabilities conn)))
+    (run-hook-with-args 'scrutiny-agent-after-connect-hook name)
     conn))
 
 (defun scrutiny-agent--on-disconnect (conn)

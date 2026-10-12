@@ -118,6 +118,9 @@ it.  Closing either side tears down the other and the tunnel."
                        (process-contact server :service)
                        :type 'plain :coding 'binary)))
           (set-process-query-on-exit-flag client nil)
+          ;; Ensure binary coding is actually in effect (open-network-stream
+          ;; :coding isn't always reliable across Emacs versions).
+          (set-process-coding-system client 'binary 'binary)
           ;; Wait for the accept so tunnel output has somewhere to go
           ;; before eglot's first write can possibly round-trip.
           (let ((deadline (+ (float-time) 5)))

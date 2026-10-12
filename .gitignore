@@ -10,6 +10,7 @@ compile_commands.json
 .venv-test/
 .build-venv/
 tests/.venv/
+build-*/
 
 # Cargo build output from the rust indexer fixture: rust-analyzer
 # regenerates this whenever the indexer tests run.
@@ -21,6 +22,7 @@ scrutiny-agent.log
 # Elsa analysis cache (scripts/lint-elisp.sh --elsa).
 emacs/.elsa/
 .lint-elpa/
+emacs/*.elc
 
 # Release artifacts from scripts/package-emacs.sh.
 dist/
