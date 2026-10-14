@@ -48,6 +48,10 @@ find_package(spdlog REQUIRED)
 find_package(Boost REQUIRED COMPONENTS filesystem system)
 find_package(SQLite3 REQUIRED)
 find_package(libgit2 REQUIRED)
+# Response and tunnel compression (meta.hello `encodings`). Already in
+# the dependency graph by way of libgit2; named here because the agent
+# now calls it directly.
+find_package(ZLIB REQUIRED)
 
 if(SCRUTINY_BUILD_TESTS)
     enable_testing()

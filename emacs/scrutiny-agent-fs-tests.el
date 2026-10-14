@@ -25,6 +25,7 @@
 (require 'scrutiny-agent)
 (require 'scrutiny-agent-ops)
 (require 'scrutiny-agent-fs)
+(require 'project)
 
 ;; ---------------------------------------------------------------------
 ;; Pure functions
@@ -145,6 +146,74 @@ the handler intercepts before TRAMP ever sees it."
          (scrutiny-agent-disconnect "fstest")
          (delete-directory install t)
          (delete-directory ,root t)))))
+
+;; A root configured through a symlink.  The agent enforces the
+;; canonical path and reports both spellings; file names written the
+;; configured way must be served, not answered from structure as
+;; "outside the roots" (which is what every macOS temp path, and any
+;; /home that is a symlink, looked like before).
+(ert-deftest scrutiny-agent-fs-root-given-through-a-symlink-is-inside ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  (let* ((bin (getenv "SCRUTINY_AGENT_BIN"))
+         (install (make-temp-file "scra-fs-install" t))
+         (real (file-truename (make-temp-file "scra-fs-real" t)))
+         (link (concat (file-truename (make-temp-file "scra-fs-link" t)) "/l"))
+         (scrutiny-agent-default-config nil)
+         (scrutiny-agent-hosts
+          `(("fstest" :transport "sh" :install-dir ,install :local-binary ,bin
+             :agent-args ("--allow-root" ,link))))
+         (scrutiny-agent-fs-cache-ttl 0)
+         (delegated nil))
+    (make-symbolic-link real link)
+    (with-temp-file (expand-file-name "f.txt" real) (insert "x\n"))
+    (scrutiny-agent-connect "fstest")
+    (scrutiny-agent-fs-mode 1)
+    (unwind-protect
+        (cl-letf* ((delegate (symbol-function 'scrutiny-agent-fs--delegate))
+                   ((symbol-function 'scrutiny-agent-fs--delegate)
+                    (lambda (operation args)
+                      (push operation delegated)
+                      (funcall delegate operation args))))
+          (let ((roots (scrutiny-agent-fs--roots "fstest")))
+            (should (member real roots))
+            (should (member link roots)))
+          ;; Both spellings are inside, and both are answered by the agent.
+          (should (scrutiny-agent-fs--in-roots-p "fstest" link))
+          (should (scrutiny-agent-fs--in-roots-p "fstest" real))
+          (should (file-exists-p (format "/ssh:fstest:%s/f.txt" link)))
+          (should (file-exists-p (format "/ssh:fstest:%s/f.txt" real)))
+          (should (file-accessible-directory-p (format "/ssh:fstest:%s/" link)))
+          (should-not (file-exists-p (format "/ssh:fstest:%s/nope.txt" link)))
+          (should-not delegated))
+      (scrutiny-agent-fs-mode -1)
+      (scrutiny-agent-fs-flush-cache)
+      (scrutiny-agent-disconnect "fstest")
+      (delete-directory install t)
+      (delete-file link)
+      (delete-directory (file-name-directory link) t)
+      (delete-directory real t))))
+
+;; `executable-find' with REMOTE asks the handler for `exec-path';
+;; magit does that on its way to "not inside a repository".  TRAMP's
+;; answer opens a connection.  Ours is empty and immediate.
+(ert-deftest scrutiny-agent-fs-exec-path-never-reaches-tramp ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  (scrutiny-agent-fs-tests--with-agent (root remote)
+    (let ((delegated nil) (tramp-cmds 0))
+      (cl-letf* ((delegate (symbol-function 'scrutiny-agent-fs--delegate))
+                 ((symbol-function 'scrutiny-agent-fs--delegate)
+                  (lambda (operation args)
+                    (push operation delegated)
+                    (funcall delegate operation args)))
+                 ((symbol-function 'tramp-send-command)
+                  (lambda (&rest _) (cl-incf tramp-cmds))))
+        (let ((default-directory remote))
+          (should-not (exec-path))
+          (should-not (executable-find "git" t)))
+        (should-not (memq 'exec-path delegated))
+        (should (= 0 tramp-cmds))))))
 
 (defmacro scrutiny-agent-fs-tests--deftest (name &rest body)
   (declare (indent 1) (debug t))
@@ -613,6 +682,401 @@ the handler intercepts before TRAMP ever sees it."
         (insert-file-contents local)
         (should (equal (buffer-string) "local content\n"))))))
 
+;; ---------------------------------------------------------------------
+;; A listing proves absence
+;; ---------------------------------------------------------------------
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-missing-files-cost-nothing
+  ;; Most of what Emacs asks about is not there: `.git', `.dir-locals.el',
+  ;; backup files, lock files.  Each used to be a request of its own,
+  ;; made to learn what the listing had already said.
+  (let ((scrutiny-agent-fs-cache-ttl 60.0))
+    (scrutiny-agent-fs-tests--with-agent (root remote)
+      (let ((scrutiny-agent-fs-cache-ttl 60.0))
+        (scrutiny-agent-fs-tests--write-local (expand-file-name "real.txt" root)
+                                              "x")
+        (should (file-exists-p (concat remote "real.txt")))
+        (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                      (dolist (name '(".git" ".dir-locals.el" "real.txt~"
+                                      "#real.txt#" ".#real.txt" ".editorconfig"
+                                      ".projectile" "Makefile"))
+                        (should-not (file-exists-p (concat remote name)))
+                        (should-not (file-attributes (concat remote name)))
+                        (should-not (file-directory-p (concat remote name)))))))
+        ;; Nor does anything inside a directory that is not there.
+        (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                      (should-not (file-exists-p
+                                   (concat remote ".git/rebase-apply/onto")))
+                      (should-not (file-exists-p
+                                   (concat remote "no/such/dir/at/all")))
+                      (should-not (file-exists-p
+                                   (concat remote "real.txt/child"))))))))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-walking-up-is-one-round-trip
+  ;; `locate-dominating-file' climbs from a file to the root asking the
+  ;; same question at every level.  The first question fetches every
+  ;; level at once.
+  (let ((scrutiny-agent-fs-cache-ttl 60.0))
+    (scrutiny-agent-fs-tests--with-agent (root remote)
+      (let ((scrutiny-agent-fs-cache-ttl 60.0)
+            (deep (expand-file-name "one/two/three/four" root)))
+        (make-directory deep t)
+        (make-directory (expand-file-name "one/.git" root))
+        (scrutiny-agent-fs-flush-cache)
+        (let (found)
+          (should (= 1 (scrutiny-agent-fs-tests--count-round-trips
+                        (setq found (locate-dominating-file
+                                     (concat remote "one/two/three/four/")
+                                     ".git")))))
+          (should (equal found (concat remote "one/"))))
+        ;; A second walk, for something else, asks nothing at all.
+        (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                      (should-not (locate-dominating-file
+                                   (concat remote "one/two/three/four/")
+                                   ".dir-locals.el")))))))))
+
+;; ---------------------------------------------------------------------
+;; Listings kept current by the agent
+;; ---------------------------------------------------------------------
+
+(defmacro scrutiny-agent-fs-tests--watching (varlist &rest body)
+  "Like `scrutiny-agent-fs-tests--with-agent', with caching and watches on."
+  (declare (indent 1) (debug t))
+  `(let ((scrutiny-agent-fs-cache-ttl 0.2))
+     (scrutiny-agent-fs-tests--with-agent ,varlist
+       ;; A window far shorter than the test: anything still answered
+       ;; from the cache afterwards is there because the agent vouches
+       ;; for it, not because a timer has not run out.
+       (let ((scrutiny-agent-fs-cache-ttl 0.2)
+             (scrutiny-agent-fs-watch t))
+         (skip-unless (scrutiny-agent-feature-p
+                       (scrutiny-agent-connection "fstest") "fs.watch"))
+         ,@body))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-watched-listing-does-not-expire
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "w.txt" root) "one")
+    (should (equal 3 (file-attribute-size
+                      (file-attributes (concat remote "w.txt")))))
+    (sleep-for 0.5)                     ; well past the cache window
+    (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                  (should (file-exists-p (concat remote "w.txt")))
+                  (should (member "w.txt" (directory-files remote)))
+                  (should-not (file-exists-p (concat remote "absent"))))))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-outside-changes-are-pushed
+  ;; The other half of never expiring: it must never be stale either.
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "w.txt" root) "one")
+    (should (equal 3 (file-attribute-size
+                      (file-attributes (concat remote "w.txt")))))
+    ;; Modified, created and deleted behind our back.
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "w.txt" root)
+                                          "much longer")
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "born.txt" root)
+                                          "x")
+    (scrutiny-agent-fs-tests--settle
+     (lambda () (file-exists-p (concat remote "born.txt"))))
+    (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                  (should (equal 11 (file-attribute-size
+                                     (file-attributes
+                                      (concat remote "w.txt")))))
+                  (should (file-exists-p (concat remote "born.txt")))
+                  (should (member "born.txt" (directory-files remote))))))
+    (delete-file (expand-file-name "born.txt" root))
+    (scrutiny-agent-fs-tests--settle
+     (lambda () (not (file-exists-p (concat remote "born.txt")))))
+    (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                  (should-not (file-exists-p (concat remote "born.txt")))
+                  (should-not (member "born.txt"
+                                      (directory-files remote))))))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-outside-edit-is-noticed-before-typing
+  ;; What `lock-file' is for: the buffer's file changed on disk, and the
+  ;; first keystroke must say so.  Answered from what the agent pushed.
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "e.txt" root)
+                                          "one\n")
+    (let ((buffer (find-file-noselect (concat remote "e.txt")))
+          (asked nil))
+      (unwind-protect
+          (with-current-buffer buffer
+            (should (verify-visited-file-modtime buffer))
+            (sleep-for 0.05)
+            (scrutiny-agent-fs-tests--write-local
+             (expand-file-name "e.txt" root) "someone else\n")
+            (scrutiny-agent-fs-tests--settle
+             (lambda () (not (verify-visited-file-modtime buffer))))
+            (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                          (should-not (verify-visited-file-modtime buffer)))))
+            (cl-letf (((symbol-function 'ask-user-about-supersession-threat)
+                       (lambda (&rest _) (setq asked t))))
+              (goto-char (point-max))
+              (insert "typed"))
+            (should asked))
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer)))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-directory-reached-by-symlink-is-watched
+  ;; The agent reports changes by canonical path; the cache is filed
+  ;; under the name that was asked for.
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (make-directory (expand-file-name "real" root))
+    (make-symbolic-link (expand-file-name "real" root)
+                        (expand-file-name "link" root))
+    (should-not (file-exists-p (concat remote "link/late.txt")))
+    (scrutiny-agent-fs-tests--write-local
+     (expand-file-name "real/late.txt" root) "x")
+    (scrutiny-agent-fs-tests--settle
+     (lambda () (file-exists-p (concat remote "link/late.txt"))))
+    (should (file-exists-p (concat remote "link/late.txt")))
+    (should (file-exists-p (concat remote "real/late.txt")))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-replaced-directory-forgets-what-was-in-it
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (make-directory (expand-file-name "d/sub" root) t)
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "d/sub/x" root) "x")
+    (should (file-exists-p (concat remote "d/sub/x")))
+    (delete-directory (expand-file-name "d" root) t)
+    (scrutiny-agent-fs-tests--settle
+     (lambda () (not (file-exists-p (concat remote "d")))))
+    (should-not (file-exists-p (concat remote "d/sub/x")))
+    (should-not (file-exists-p (concat remote "d/sub")))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-disconnect-ends-every-watch
+  ;; A listing the agent vouched for is worth nothing once the
+  ;; connection that carried the vouching is gone.
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "w.txt" root) "x")
+    (should (file-exists-p (concat remote "w.txt")))
+    (should (> (hash-table-count scrutiny-agent-fs--watched) 0))
+    (scrutiny-agent-disconnect "fstest")
+    (let ((deadline (+ (float-time) 5)))
+      (while (and (scrutiny-agent-connection "fstest")
+                  (< (float-time) deadline))
+        (accept-process-output nil 0.05)))
+    (should (= 0 (hash-table-count scrutiny-agent-fs--watched)))
+    (should (= 0 (hash-table-count scrutiny-agent-fs--dir-cache)))
+    (scrutiny-agent-connect "fstest")))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-watch-can-be-turned-off
+  (let ((scrutiny-agent-fs-cache-ttl 60.0))
+    (scrutiny-agent-fs-tests--with-agent (root remote)
+      (let ((scrutiny-agent-fs-cache-ttl 60.0)
+            (scrutiny-agent-fs-watch nil))
+        (scrutiny-agent-fs-tests--write-local (expand-file-name "w.txt" root)
+                                              "x")
+        (should (file-exists-p (concat remote "w.txt")))
+        (should (= 0 (hash-table-count scrutiny-agent-fs--watched)))))))
+
+;; ---------------------------------------------------------------------
+;; Saving
+;; ---------------------------------------------------------------------
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-save-is-one-request
+  ;; Edit and save an open file: the write, and nothing else.  Not a
+  ;; lock file before, not a re-read of the directory after.
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "s.txt" root)
+                                          "one\n")
+    (let ((buffer (find-file-noselect (concat remote "s.txt")))
+          (make-backup-files nil))
+      (unwind-protect
+          (with-current-buffer buffer
+            (should (= 1 (scrutiny-agent-fs-tests--count-requests
+                          (goto-char (point-max))
+                          (insert "two\n")
+                          (save-buffer))))
+            (should-not (buffer-modified-p))
+            (should (verify-visited-file-modtime buffer))
+            (should (equal (scrutiny-agent-fs-tests--read-local
+                            (expand-file-name "s.txt" root))
+                           "one\ntwo\n"))
+            ;; What the cache now says is what is on disk, to the
+            ;; nanosecond, with nothing asked.
+            (should (= 0 (scrutiny-agent-fs-tests--count-requests
+                          (should (time-equal-p
+                                   (file-attribute-modification-time
+                                    (file-attributes (concat remote "s.txt")))
+                                   (file-attribute-modification-time
+                                    (file-attributes
+                                     (expand-file-name "s.txt" root)))))))))
+        (kill-buffer buffer)))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-save-does-not-overwrite-an-unseen-change
+  ;; The cache says the file is as we left it; the file is not.  (Here
+  ;; because watching is off; in life, because the change is a moment
+  ;; too recent to have been announced.)  The agent, which can look,
+  ;; refuses, and the question Emacs would have asked is asked.
+  (let ((scrutiny-agent-fs-cache-ttl 60.0))
+    (scrutiny-agent-fs-tests--with-agent (root remote)
+      (let* ((scrutiny-agent-fs-cache-ttl 60.0)
+             (scrutiny-agent-fs-watch nil)
+             (make-backup-files nil)
+             (local (expand-file-name "c.txt" root))
+             (buffer (progn (scrutiny-agent-fs-tests--write-local local "mine\n")
+                            (find-file-noselect (concat remote "c.txt"))))
+             (asked 0))
+        (unwind-protect
+            (with-current-buffer buffer
+              (sleep-for 0.05)
+              (scrutiny-agent-fs-tests--write-local local "theirs\n")
+              (goto-char (point-max))
+              (insert "more of mine\n")
+              ;; Declined: nothing is written.
+              (cl-letf (((symbol-function 'yes-or-no-p)
+                         (lambda (&rest _) (setq asked (1+ asked)) nil)))
+                (should-error (save-buffer) :type 'user-error))
+              (should (= asked 1))
+              (should (equal (scrutiny-agent-fs-tests--read-local local)
+                             "theirs\n"))
+              (should (buffer-modified-p))
+              ;; Confirmed: ours goes in.  The first question comes from
+              ;; Emacs itself this time -- it now knows the file changed
+              ;; -- and it is not asked twice.
+              (setq asked 0)
+              (cl-letf (((symbol-function 'yes-or-no-p)
+                         (lambda (&rest _) (setq asked (1+ asked)) t)))
+                (save-buffer))
+              (should (= asked 1))
+              (should (equal (scrutiny-agent-fs-tests--read-local local)
+                             "mine\nmore of mine\n")))
+          (with-current-buffer buffer (set-buffer-modified-p nil))
+          (kill-buffer buffer))))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-new-file-can-be-created
+  ;; `find-file' on a name that does not exist must produce an empty
+  ;; buffer that saves, which depends on the read signalling
+  ;; `file-missing' and nothing vaguer.
+  (scrutiny-agent-fs-tests--with-agent (root remote)
+    (should-error (with-temp-buffer
+                    (insert-file-contents (concat remote "nope.txt")))
+                  :type 'file-missing)
+    (let ((buffer (find-file-noselect (concat remote "fresh.txt")))
+          (make-backup-files nil))
+      (unwind-protect
+          (with-current-buffer buffer
+            (should (= (buffer-size) 0))
+            (should (equal buffer-file-name (concat remote "fresh.txt")))
+            (insert "created\n")
+            (save-buffer)
+            (should-not (buffer-modified-p)))
+        (kill-buffer buffer)))
+    (should (equal (scrutiny-agent-fs-tests--read-local
+                    (expand-file-name "fresh.txt" root))
+                   "created\n"))))
+
+;; ---------------------------------------------------------------------
+;; Nothing on the editing path goes to TRAMP
+;; ---------------------------------------------------------------------
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-editing-never-reaches-tramp
+  ;; Every operation handed to TRAMP is a chance for TRAMP to open a
+  ;; connection of its own -- on the first keystroke in a buffer, as it
+  ;; turned out, because locking a file is one of them.  Open, type,
+  ;; save, list, complete: none of it may need the remote from anyone
+  ;; but the agent.
+  (scrutiny-agent-fs-tests--watching (root remote)
+    (make-directory (expand-file-name "pkg" root))
+    (scrutiny-agent-fs-tests--write-local (expand-file-name "pkg/m.py" root)
+                                          "x = 1\n")
+    (let ((needs-remote nil)
+          (create-lockfiles t))
+      (cl-letf (((symbol-function 'tramp-send-command)
+                 (lambda (&rest _) (setq needs-remote t)
+                   (error "TRAMP was asked to talk to the remote")))
+                ((symbol-function 'tramp-maybe-open-connection)
+                 (lambda (&rest _) (setq needs-remote t)
+                   (error "TRAMP was asked to connect"))))
+        (let ((buffer (find-file-noselect (concat remote "pkg/m.py"))))
+          (unwind-protect
+              (with-current-buffer buffer
+                (goto-char (point-max))
+                (insert "y = 2\n")                ; locks, in a local Emacs
+                (save-buffer)                     ; backs up, unlocks
+                (insert "z = 3\n")
+                (save-buffer))
+            (kill-buffer buffer)))
+        (should (member "m.py" (directory-files (concat remote "pkg/"))))
+        (should (file-name-all-completions "m" (concat remote "pkg/")))
+        (should (file-accessible-directory-p (concat remote "pkg/")))
+        (should-not (file-executable-p (concat remote "pkg/m.py")))
+        (should (file-in-directory-p (concat remote "pkg/m.py") remote))
+        (should (file-equal-p (concat remote "pkg/../pkg/m.py")
+                              (concat remote "pkg/m.py")))
+        (with-temp-buffer (dired-noselect (concat remote "pkg/"))))
+      (should-not needs-remote)
+      (should (equal (scrutiny-agent-fs-tests--read-local
+                      (expand-file-name "pkg/m.py" root))
+                     "x = 1\ny = 2\nz = 3\n")))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-home-relative-names
+  ;; `~' in a remote name is the REMOTE home.  Emacs spells every name
+  ;; under it that way, and none of them may be expanded against the
+  ;; home directory of the machine Emacs runs on.
+  (scrutiny-agent-fs-tests--with-agent (root remote)
+    (ignore root remote)
+    (let* ((home (scrutiny-agent-fs--home "fstest"))
+           (dir (make-temp-file (expand-file-name "scra-tilde-" home) t))
+           (name (file-name-nondirectory dir))
+           (tilde (format "/ssh:fstest:~/%s/h.txt" name)))
+      (unwind-protect
+          (progn
+            (scrutiny-agent-fs-tests--write-local
+             (expand-file-name "h.txt" dir) "x")
+            ;; Pretend Emacs lives somewhere else entirely, as it does
+            ;; on a laptop talking to a server.
+            (let ((process-environment (cons "HOME=/nonexistent/laptop-home"
+                                             process-environment)))
+              (should (equal (file-truename tilde)
+                             (format "/ssh:fstest:%s/h.txt"
+                                     (file-truename dir))))
+              (should (equal (nth 2 (scrutiny-agent-fs--resolve tilde))
+                             (format "%s/%s/h.txt" home name)))
+              (should (file-exists-p tilde))
+              (should (equal 1 (file-attribute-size (file-attributes tilde))))
+              (should (equal "x" (with-temp-buffer
+                                   (insert-file-contents tilde)
+                                   (buffer-string))))))
+        (delete-directory dir t)))))
+
+;; ---------------------------------------------------------------------
+;; Directories too large to fetch for one answer
+;; ---------------------------------------------------------------------
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-huge-directory-is-not-fetched-for-one-file
+  (let ((scrutiny-agent-fs-cache-ttl 60.0))
+    (scrutiny-agent-fs-tests--with-agent (root remote)
+      (let ((scrutiny-agent-fs-cache-ttl 60.0)
+            (scrutiny-agent-fs-listing-max-entries 5)
+            (big (expand-file-name "big" root)))
+        (make-directory big)
+        (dotimes (i 12)
+          (scrutiny-agent-fs-tests--write-local
+           (expand-file-name (format "n%02d" i) big) "x"))
+        ;; One file's attributes: answered, without the listing.
+        (should (equal 1 (file-attribute-size
+                          (file-attributes (concat remote "big/n03")))))
+        (should-not (file-exists-p (concat remote "big/absent")))
+        (should (eq 'too-large
+                    (cdr (gethash (scrutiny-agent-fs--cache-key
+                                   "fstest" (expand-file-name "big" root))
+                                  scrutiny-agent-fs--dir-cache))))
+        ;; Asked for on purpose, all of it comes.
+        (should (= 12 (length (directory-files (concat remote "big/")
+                                               nil "\\`n"))))))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-regexp-covers-user-and-port
+  (let* ((scrutiny-agent-hosts '(("devbox" :transport "ssh devbox")))
+         (regexp (scrutiny-agent-fs--file-name-regexp)))
+    (should (string-match-p regexp "/ssh:devbox:/src/a.py"))
+    (should (string-match-p regexp "/ssh:me@devbox:/src/a.py"))
+    (should (string-match-p regexp "/ssh:devbox#2222:/src/a.py"))
+    (should (string-match-p regexp "/ssh:me@devbox#2222:/src/a.py"))
+    (should-not (string-match-p regexp "/ssh:devbox2:/src/a.py"))
+    (should-not (string-match-p regexp "/ssh:me@other:/src/devbox:/a.py"))
+    (should-not (string-match-p regexp "/ssh:devbox@other:/src/a.py"))))
+
 (provide 'scrutiny-agent-fs-tests)
 ;;; scrutiny-agent-fs-tests.el ends here
 
@@ -620,16 +1084,51 @@ the handler intercepts before TRAMP ever sees it."
 ;; Round trips -- the thing that actually costs on a slow link
 ;; ---------------------------------------------------------------------
 
+;; Two different quantities, and the difference is the point.  A REQUEST
+;; is a frame sent; a ROUND TRIP is a wait for an answer that has not
+;; arrived.  Requests sent together cost one round trip between them,
+;; and on a slow link round trips are the whole cost.
+
 (defmacro scrutiny-agent-fs-tests--count-requests (&rest body)
-  "Number of agent requests BODY causes."
+  "Number of agent requests BODY sends."
   `(let ((count 0))
-     (cl-letf* ((original (symbol-function 'scrutiny-agent-request))
-                ((symbol-function 'scrutiny-agent-request)
+     (cl-letf* ((original (symbol-function 'scrutiny-agent-async-request))
+                ((symbol-function 'scrutiny-agent-async-request)
                  (lambda (&rest args)
                    (setq count (1+ count))
                    (apply original args))))
        ,@body)
      count))
+
+(defmacro scrutiny-agent-fs-tests--count-round-trips (&rest body)
+  "Number of round trips BODY costs.
+A round trip is a burst of requests followed by a wait: however many
+requests go out together, the link is crossed once each way for all
+of them.  So what is counted is the number of times BODY sends
+something after having had to wait for something else."
+  `(let ((count 0) (waited t))
+     (cl-letf* ((send (symbol-function 'scrutiny-agent-async-request))
+                (await (symbol-function 'scrutiny-agent-await))
+                ((symbol-function 'scrutiny-agent-async-request)
+                 (lambda (&rest args)
+                   (when waited (setq count (1+ count) waited nil))
+                   (apply send args)))
+                ((symbol-function 'scrutiny-agent-await)
+                 (lambda (conn future &optional timeout)
+                   (unless (scrutiny-agent-future-done-p future)
+                     (setq waited t))
+                   (funcall await conn future timeout))))
+       ,@body)
+     count))
+
+(defun scrutiny-agent-fs-tests--settle (&optional predicate)
+  "Let notifications arrive: until PREDICATE holds, or briefly."
+  (let ((proc (scrutiny-agent--conn-process
+               (scrutiny-agent-connection "fstest")))
+        (deadline (+ (float-time) (if predicate 10 0.4))))
+    (while (and (< (float-time) deadline)
+                (not (and predicate (funcall predicate))))
+      (accept-process-output proc 0.05))))
 
 (scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-one-request-per-directory
   ;; The point of asking for attributes with the listing: a directory's
@@ -687,15 +1186,13 @@ the handler intercepts before TRAMP ever sees it."
 ;; Outside the roots
 ;; ---------------------------------------------------------------------
 
-(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-facts-are-one-request
-  ;; The roots and the remote home come from a single meta.capabilities,
-  ;; and the answer -- including a failure -- is cached. Re-asking would
-  ;; put a round trip in front of every file operation.
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-facts-cost-nothing
+  ;; The roots and the remote home arrive with the handshake, which has
+  ;; to be waited for anyway.  Asking for them separately would put a
+  ;; second round trip at the front of every session.
   (scrutiny-agent-fs-tests--with-agent (root remote)
     (ignore remote)
     (scrutiny-agent-fs-forget-connections)
-    (should (= 1 (scrutiny-agent-fs-tests--count-requests
-                  (scrutiny-agent-fs--facts "fstest"))))
     (should (= 0 (scrutiny-agent-fs-tests--count-requests
                   (scrutiny-agent-fs--facts "fstest"))))
     (should (member root (scrutiny-agent-fs--roots "fstest")))
@@ -732,6 +1229,49 @@ the handler intercepts before TRAMP ever sees it."
       (should (member (file-name-nondirectory (directory-file-name root))
                       (scrutiny-agent-fs--root-children "fstest" parent))))))
 
+;; Outside the roots, listings are answered from structure.  They must
+;; still be shaped like listings: `directory-files' names carry no
+;; slash and honour MATCH, FULL, NOSORT and COUNT.  project.el walks
+;; up with a marker pattern and takes any non-nil answer for a hit;
+;; before this, an ancestor answered its children whatever the pattern,
+;; and Emacs 30's `project-try-vc--search' recursed on that until
+;; `max-lisp-eval-depth' -- on every find-file of a file not in a
+;; repository.
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-structural-listings-are-shaped-like-listings
+  (scrutiny-agent-fs-tests--with-agent (root remote)
+    (let* ((scrutiny-agent-fs-roots-are-the-world t)
+           (base (file-name-nondirectory (directory-file-name root)))
+           (parent (file-name-directory (directory-file-name remote)))
+           (delegated nil))
+      (cl-letf* ((delegate (symbol-function 'scrutiny-agent-fs--delegate))
+                 ((symbol-function 'scrutiny-agent-fs--delegate)
+                  (lambda (operation args)
+                    (push operation delegated)
+                    (funcall delegate operation args))))
+        (should-not (scrutiny-agent-fs--in-roots-p
+                     "fstest" (file-local-name parent)))
+        (should (member base (directory-files parent)))
+        (should-not (member (file-name-as-directory base)
+                            (directory-files parent)))
+        (should (member "." (directory-files parent)))
+        (should-not (directory-files parent nil "\\`\\.git\\'"))
+        (should (equal (directory-files parent nil (regexp-quote base))
+                       (list base)))
+        (should (equal (directory-files parent t (regexp-quote base))
+                       (list (concat parent base))))
+        (should (= 1 (length (directory-files parent nil nil nil 1))))
+        (should-not (directory-files-and-attributes parent nil "\\`\\.git\\'"))
+        (should (assoc base (directory-files-and-attributes parent)))
+        (should-not (file-name-all-completions "no-such-prefix" parent))
+        (should (equal (file-name-all-completions base parent)
+                       (list (file-name-as-directory base))))
+        ;; The walk that recursed: a file in a root that is no
+        ;; repository.  It must come back, and without TRAMP.
+        (let ((max-lisp-eval-depth 600))
+          (should-not (project-current nil remote)))
+        (should-not (memq 'directory-files delegated))
+        (should-not (memq 'file-name-all-completions delegated))))))
+
 (scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-can-defer-outside-roots
   ;; With the option off, an out-of-roots path is TRAMP's business
   ;; again -- the escape hatch when a project really does live above
@@ -745,25 +1285,28 @@ the handler intercepts before TRAMP ever sees it."
         (file-exists-p "/ssh:fstest:/etc/passwd"))
       (should (memq 'file-exists-p delegated)))))
 
-(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-find-file-is-two-requests
-  ;; The property the whole file exists for: opening a remote file costs
-  ;; one listing (which warms every other file beside it) and one read.
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-find-file-is-one-round-trip
+  ;; The property the whole file exists for.  Opening a file needs its
+  ;; directory (which answers for every file beside it), every
+  ;; directory above that (for `.dir-locals.el' and the project root),
+  ;; and its contents.  All of it is asked for at once.
   (let ((scrutiny-agent-fs-cache-ttl 60.0))
     (scrutiny-agent-fs-tests--with-agent (root remote)
-      (let ((scrutiny-agent-fs-cache-ttl 60.0))
+      (let ((scrutiny-agent-fs-cache-ttl 60.0)
+            (deep (expand-file-name "a/b/c" root)))
+        (make-directory deep t)
         (dotimes (i 10)
           (scrutiny-agent-fs-tests--write-local
-           (expand-file-name (format "f%02d.py" i) root)
+           (expand-file-name (format "f%02d.py" i) deep)
            (format "# file %02d\n" i)))
-        (ignore (file-exists-p (concat remote "f00.py")))  ; warm the facts
         (scrutiny-agent-fs-flush-cache)
         (let (buffer)
-          (should (= 2 (scrutiny-agent-fs-tests--count-requests
+          (should (= 1 (scrutiny-agent-fs-tests--count-round-trips
                         (setq buffer (find-file-noselect
-                                      (concat remote "f00.py"))))))
+                                      (concat remote "a/b/c/f00.py"))))))
           ;; ...and it really opened the file, rather than failing fast.
           (with-current-buffer buffer
-            (should (equal buffer-file-name (concat remote "f00.py")))
+            (should (equal buffer-file-name (concat remote "a/b/c/f00.py")))
             (should (equal (buffer-string) "# file 00\n"))
             (should-not (buffer-modified-p))
             (should (verify-visited-file-modtime buffer)))
@@ -772,10 +1315,28 @@ the handler intercepts before TRAMP ever sees it."
         (let (second)
           (should (= 1 (scrutiny-agent-fs-tests--count-requests
                         (setq second (find-file-noselect
-                                      (concat remote "f01.py"))))))
+                                      (concat remote "a/b/c/f01.py"))))))
           (with-current-buffer second
             (should (equal (buffer-string) "# file 01\n")))
           (kill-buffer second))))))
+
+(scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-find-file-without-prefetch
+  ;; With the advice off, the same open is the listing burst and then
+  ;; the read: two round trips, and still correct.
+  (let ((scrutiny-agent-fs-cache-ttl 60.0))
+    (scrutiny-agent-fs-tests--with-agent (root remote)
+      (let ((scrutiny-agent-fs-cache-ttl 60.0)
+            (scrutiny-agent-fs-prefetch nil))
+        (scrutiny-agent-fs-tests--write-local (expand-file-name "p.py" root)
+                                              "# p\n")
+        (scrutiny-agent-fs-flush-cache)
+        (let (buffer)
+          (should (= 2 (scrutiny-agent-fs-tests--count-round-trips
+                        (setq buffer (find-file-noselect
+                                      (concat remote "p.py"))))))
+          (with-current-buffer buffer
+            (should (equal (buffer-string) "# p\n")))
+          (kill-buffer buffer))))))
 
 (scrutiny-agent-fs-tests--deftest scrutiny-agent-fs-string-ops-need-no-remote
   ;; Delegating these hands TRAMP the first remote name it has seen,

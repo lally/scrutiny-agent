@@ -642,6 +642,53 @@ def t_ensure_repository(ctx):
           "present repo -> fetched in place (same localPath)")
 
 
+@conformance("git.spawn", "git.signal")
+def t_git_spawn(ctx):
+    repo, head, _ = ctx.fx.repo()
+    r = ctx.a.call("git.spawn",
+                   {"repoPath": repo, "args": ["rev-parse", "HEAD"]})
+    tid = r.get("tunnelId")
+    check(isinstance(tid, str) and tid and isinstance(r.get("pid"), int),
+          "git.spawn returns { tunnelId, pid }")
+    closed = ctx.a.wait_notification(
+        "lsp.tunnelClosed", lambda p: p.get("tunnelId") == tid, timeout=20)
+    check(closed is not None and closed.get("exitCode") == 0 and
+          closed.get("reason") == "exit",
+          "a spawned command ends with lsp.tunnelClosed { exitCode: 0 }")
+    out = b"".join(base64.b64decode(p["data"])
+                   for m, p in list(ctx.a.notifications)
+                   if m == "lsp.tunnelRecv" and p.get("tunnelId") == tid)
+    check(out.decode().strip() == head,
+          "its output arrives as lsp.tunnelRecv, byte for byte")
+    # End of input: a command reading stdin finishes when told there is
+    # no more, and not before.
+    r = ctx.a.call("git.spawn", {"repoPath": repo,
+                                 "args": ["rev-parse", "--stdin"]})
+    tid = r["tunnelId"]
+    ctx.a.notify("lsp.tunnelSend",
+                 {"tunnelId": tid,
+                  "data": base64.b64encode(b"HEAD\n").decode(),
+                  "eof": True})
+    closed = ctx.a.wait_notification(
+        "lsp.tunnelClosed", lambda p: p.get("tunnelId") == tid, timeout=20)
+    check(closed is not None and closed.get("exitCode") == 0,
+          "lsp.tunnelSend { eof: true } closes the command's stdin")
+    # The policy is git.exec's.
+    check(ctx.a.call_error(
+        "git.spawn", {"repoPath": repo,
+                      "args": ["commit", "-m", "x"]}).code == PERMISSION_DENIED,
+        "git.spawn outside the allowlist -> PERMISSION_DENIED 1005")
+    check(ctx.a.call_error(
+        "git.spawn", {"repoPath": repo}).code == INVALID_REQUEST,
+        "git.spawn missing args -> INVALID_REQUEST 1002")
+    check(ctx.a.call_error(
+        "git.signal", {"pid": 1, "signal": "TERM"}).code == PERMISSION_DENIED,
+        "git.signal to a process it did not start -> PERMISSION_DENIED 1005")
+    check(ctx.a.call_error(
+        "git.signal", {"signal": "TERM"}).code == INVALID_REQUEST,
+        "git.signal missing pid -> INVALID_REQUEST 1002")
+
+
 @conformance("git.exec")
 def t_git_exec(ctx):
     repo, head, _ = ctx.fx.repo()

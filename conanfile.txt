@@ -5,6 +5,7 @@ spdlog/1.13.0
 boost/1.86.0
 libgit2/1.7.2
 sqlite3/3.45.3
+zlib/[>=1.2.11 <2]
 
 [test_requires]
 gtest/1.14.0

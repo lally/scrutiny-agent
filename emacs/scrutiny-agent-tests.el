@@ -365,6 +365,39 @@
     (should (member "git.exec" (scrutiny-agent--conn-capabilities conn)))
     (should (file-exists-p (expand-file-name "scrutiny-agent.conf" install)))))
 
+;; The regression this guards: every other config test names an absolute
+;; temp directory as the install dir, so none of them noticed that the
+;; DEFAULT one -- a shell expression -- reached the agent unexpanded.
+(ert-deftest scrutiny-agent-config-is-applied-from-the-default-install-dir ()
+  :tags '(integration)
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  (let* ((home (file-truename (make-temp-file "scra-home" t)))
+         ;; An abbreviated default-directory ("~/...") would be
+         ;; re-expanded against the temporary HOME below and vanish.
+         (default-directory (file-truename default-directory))
+         (process-environment (cons (concat "HOME=" home) process-environment))
+         (scrutiny-agent-default-config
+          "allow-root = src\nallow-write\ngit-exec-preset = magit\n")
+         (scrutiny-agent-hosts
+          `(("homecfg" :transport "sh"
+             :local-binary ,(getenv "SCRUTINY_AGENT_BIN"))))
+         (conn nil))
+    (make-directory (expand-file-name "src" home))
+    (unwind-protect
+        (progn
+          (setq conn (scrutiny-agent-connect "homecfg"))
+          (let ((fsa (plist-get
+                      (scrutiny-agent-request conn "meta.capabilities" nil)
+                      :fileSystemAccess)))
+            (should (equal (append (plist-get fsa :allowedRoots) nil)
+                           (list (expand-file-name "src" home))))
+            (should (eq (plist-get fsa :writable) t)))
+          (should (member "git.exec" (scrutiny-agent--conn-capabilities conn)))
+          (should (member "fs.writeFile"
+                          (scrutiny-agent--conn-capabilities conn))))
+      (scrutiny-agent-disconnect "homecfg")
+      (delete-directory home t))))
+
 (ert-deftest scrutiny-agent-config-is-not-resent-when-unchanged ()
   :tags '(integration)
   (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
@@ -563,9 +596,41 @@
             (should (string-match-p "does not run on" reason))
             ;; It names the platform and the file, so the reader knows
             ;; which host and which binary to look at.
-            (should (string-match-p "Linux" reason))
+            (should (string-match-p (if (eq system-type 'darwin) "Darwin" "Linux")
+                                    reason))
             (should (string-match-p (regexp-quote file) reason))))
       (delete-file file))))
+
+(ert-deftest scrutiny-agent-transport-with-a-terminal-is-diagnosed ()
+  :tags '(integration)
+  ;; Teleport runs a plain `tsh ssh HOST' session in a PTY, whatever
+  ;; the client asked for.  The PTY echoes the bootstrap back with a
+  ;; prompt in front of every line, so no marker ever starts a line
+  ;; and, before this, the connect sat out its first deadline and
+  ;; reported a timeout.  The echo of the probe command is the
+  ;; diagnosis; the error names the transport that works.
+  (skip-unless (getenv "SCRUTINY_AGENT_BIN"))
+  (skip-unless (executable-find "python3"))
+  (let* ((transport "python3 -c 'import pty,sys; sys.exit(pty.spawn([\"sh\"]))'")
+         (install (make-temp-file "scra-pty-install" t))
+         (scrutiny-agent-default-config nil)
+         (scrutiny-agent-hosts
+          `(("pty" :transport ,transport :install-dir ,install
+             :local-binary ,(getenv "SCRUTINY_AGENT_BIN"))))
+         (t0 (float-time))
+         (reason (unwind-protect
+                     (condition-case err
+                         (progn (scrutiny-agent-connect "pty") nil)
+                       (error (error-message-string err)))
+                   (ignore-errors (scrutiny-agent-disconnect "pty"))
+                   (delete-directory install t))))
+    (should reason)
+    (should (string-match-p "terminal" reason))
+    (should (string-search (concat transport " sh") reason))
+    ;; Recognised from the echo, not from the deadline.
+    (should (< (- (float-time) t0) 10))
+    ;; The transport is gone with its connection.
+    (should-not (scrutiny-agent-connection "pty"))))
 
 (ert-deftest scrutiny-agent-verify-rejects-a-wrong-architecture-binary ()
   :tags '(integration)

@@ -378,6 +378,46 @@ ends the run."
         (format "rev-parse matches; injection refused (%d subcommands allowed)"
                 (length (scrutiny-agent--conn-capabilities conn)))))))
 
+(defun scrutiny-agent-verify--git-spawn (conn repo)
+  "Check that git can be run as a live process, and only signalled as one."
+  (scrutiny-agent-verify--check '("git.spawn" "git.signal")
+    (unless (member "git.spawn" (scrutiny-agent--conn-capabilities conn))
+      (scrutiny-agent-verify--skip
+       "agent does not serve git.spawn (start it with --git-exec-preset)"))
+    (unless repo (scrutiny-agent-verify--skip "no repository given"))
+    (let* ((output "")
+           (exit 'running)
+           (spawned (scrutiny-agent-request
+                     conn "git.spawn"
+                     (list :repoPath repo :args (vector "rev-parse" "HEAD"))
+                     60))
+           (head (scrutiny-agent-ops-head-sha conn repo))
+           (deadline (+ (float-time) 30)))
+      (scrutiny-agent-tunnel-adopt
+       conn (plist-get spawned :tunnelId)
+       (lambda (bytes) (setq output (concat output bytes)))
+       nil
+       (lambda (code _reason) (setq exit code)))
+      (while (and (eq exit 'running) (< (float-time) deadline))
+        (accept-process-output (scrutiny-agent--conn-process conn) 0.05))
+      (scrutiny-agent-verify--expect
+       (eql exit 0) "git.spawn rev-parse HEAD ended with %S" exit)
+      (scrutiny-agent-verify--expect
+       (equal (string-trim output) head)
+       "git.spawn rev-parse HEAD printed %S, not %s" output head)
+      ;; A signal must only ever reach a process a spawned command
+      ;; started.  Process 1 is certainly not one.
+      (let ((refused
+             (condition-case err
+                 (progn (scrutiny-agent-request
+                         conn "git.signal" (list :pid 1 :signal "TERM") 30)
+                        nil)
+               (scrutiny-agent-rpc-error (equal (nth 1 err) 1005)))))
+        (scrutiny-agent-verify--expect
+         refused
+         "git.signal accepted a process this agent did not start")
+        "ran to completion with its output; foreign signal refused"))))
+
 (defun scrutiny-agent-verify--diffcache (conn cache-dir)
   (scrutiny-agent-verify--check
       '("diffcache.put" "diffcache.get" "diffcache.prune")
@@ -467,6 +507,15 @@ ends the run."
       (format "%d range(s)"
               (length (scrutiny-agent-ops-folding-ranges
                        conn workspace language file content))))
+
+    (scrutiny-agent-verify--check '("lsp.workspaceInfo")
+      ;; What the server was started with: compile database, index
+      ;; store, and the notes that explain a thin answer.
+      (let ((info (scrutiny-agent-request
+                   conn "lsp.workspaceInfo"
+                   (list :workspacePath workspace :language language))))
+        (format "%s" (or (plist-get info :source)
+                         (and info "answered") "empty"))))
 
     (scrutiny-agent-verify--check '("lsp.workspaceSymbols")
       ;; Optional in LSP; pylsp and others answer -32601. A clean
@@ -725,13 +774,15 @@ silently unverified."
             "git.diff" "git.isAncestor")
         (scrutiny-agent-verify--skip "no repository given")))
     (scrutiny-agent-verify--git-exec conn repo)
+    (scrutiny-agent-verify--git-spawn conn repo)
     (scrutiny-agent-verify--diffcache conn "scrutiny-cache/diffcache")
     (scrutiny-agent-verify--cred conn)
     (if workspace
         (scrutiny-agent-verify--lsp conn workspace language)
       (scrutiny-agent-verify--check
           '("lsp.documentSymbols" "lsp.hover" "lsp.gotoDefinition"
-            "lsp.findReferences" "lsp.foldingRange" "lsp.workspaceSymbols"
+            "lsp.findReferences" "lsp.foldingRange" "lsp.workspaceInfo"
+            "lsp.workspaceSymbols"
             "lsp.tunnelOpen" "lsp.tunnelSend" "lsp.tunnelClose")
         (scrutiny-agent-verify--skip "no workspace given")))
     (scrutiny-agent-verify--watch conn repo)

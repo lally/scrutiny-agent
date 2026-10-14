@@ -36,7 +36,7 @@
 ;; Minimal setup:
 ;;
 ;;   (setq scrutiny-agent-hosts
-;;         '(("devbox" :transport "tsh ssh devbox")))
+;;         '(("devbox" :transport "tsh ssh devbox sh")))
 ;;   M-x scrutiny-agent-connect
 ;;
 ;; See emacs/README.md for eglot wiring.
@@ -58,8 +58,10 @@ integration).  PLIST keys:
 
   :transport     (required) shell command whose stdin/stdout reach a
                  POSIX shell on the remote, e.g. \"ssh devbox\",
-                 \"tsh ssh devbox\", \"kubectl exec -i pod -- sh\", or
-                 just \"sh\" for a local agent.
+                 \"tsh ssh devbox sh\", \"kubectl exec -i pod -- sh\", or
+                 just \"sh\" for a local agent.  The shell must be on
+                 pipes: Teleport gives a plain \"tsh ssh devbox\" a
+                 terminal, which the bootstrap detects and refuses.
   :install-dir   remote directory for the agent binary, a shell
                  expression (default \"$HOME/.scrutiny-agent\").
   :agent-args    list of extra agent argv strings, e.g.
@@ -132,6 +134,19 @@ remaining ones -- `watch.headChanged', `index.progress' -- are how
 the agent tells a client that remote state moved, so a UI can react
 instead of polling.")
 
+(defvar scrutiny-agent-notification-handlers nil
+  "Alist of (METHOD . FUNCTION) for notifications with a dedicated consumer.
+FUNCTION is called with (CONN PARAMS).  Unlike
+`scrutiny-agent-notification-functions' these are dispatched without
+being written to the log: `fs.changed' arrives whenever a watched
+directory changes, and a log line apiece would bury everything else.")
+
+(defvar scrutiny-agent-disconnect-functions nil
+  "Abnormal hook run with the host NAME when its connection goes away.
+Whatever a layer has cached on the strength of the connection being
+up -- watched directory listings above all -- stops being true at
+that moment, and this is where it finds out.")
+
 (defconst scrutiny-agent-protocol-version 1)
 (defconst scrutiny-agent--tunnel-chunk (* 32 1024)
   "Max raw bytes per lsp.tunnelSend notification (protocol convention).")
@@ -147,7 +162,10 @@ instead of polling.")
   (pending (make-hash-table :test #'eql))   ; id -> callback (RESULT ERR)
   (chunks (make-hash-table :test #'equal))  ; id-key -> reversed data list
   (tunnels (make-hash-table :test #'equal)) ; tunnelId -> tunnel struct
-  capabilities agent-version frame-cap)
+  (orphans (make-hash-table :test #'equal)) ; tunnelId -> early events
+  capabilities agent-version frame-cap
+  features                   ; optional behaviors, from meta.hello
+  facts)                     ; fileSystemAccess plist from meta.hello, or nil
 
 (defvar scrutiny-agent--connections (make-hash-table :test #'equal)
   "Live connections, keyed by host NAME.")
@@ -228,13 +246,38 @@ JSON plists in arrival order."
 
 (defun scrutiny-agent--chunk-key (id) (format "%s" id))
 
-(defun scrutiny-agent--assemble-chunks (parts)
+(defcustom scrutiny-agent-compress t
+  "Whether to ask the agent to compress what it sends.
+
+Nearly all of it is text -- JSON, source files, diffs, a language
+server's completion lists -- which shrinks five to ten times, and
+which the protocol otherwise makes a third LARGER by wrapping it in
+base64.  On a link whose throughput is the constraint, that is the
+difference between a completion popup arriving now and arriving
+late.  Needs an Emacs built with zlib (nearly all are) and an agent
+that offers it; otherwise it is simply not used."
+  :type 'boolean)
+
+(defun scrutiny-agent--inflate (bytes)
+  "Decompress the zlib stream in unibyte string BYTES."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert bytes)
+    (unless (zlib-decompress-region (point-min) (point-max))
+      (error "Scrutiny-agent: could not decompress %d bytes" (length bytes)))
+    (buffer-string)))
+
+(defun scrutiny-agent--assemble-chunks (parts &optional encoding)
   "PARTS is a list of (SEQ . DATA) in any order; return the decoded
-JSON-RPC envelope they carry, parsed as a plist."
-  (let ((sorted (sort (copy-sequence parts) (lambda (a b) (< (car a) (car b))))))
+JSON-RPC envelope they carry, parsed as a plist.  ENCODING is the
+`encoding' of the final envelope: \"deflate\" when the body was
+compressed before it was chunked."
+  (let* ((sorted (sort (copy-sequence parts)
+                       (lambda (a b) (< (car a) (car b)))))
+         (bytes (base64-decode-string (mapconcat #'cdr sorted ""))))
     (json-parse-string
      (decode-coding-string
-      (base64-decode-string (mapconcat #'cdr sorted ""))
+      (if (equal encoding "deflate") (scrutiny-agent--inflate bytes) bytes)
       'utf-8)
      :object-type 'plist :null-object nil :false-object :json-false)))
 
@@ -269,6 +312,12 @@ JSON-RPC envelope they carry, parsed as a plist."
          (scrutiny-agent--on-tunnel-recv conn (plist-get msg :params)))
         ("lsp.tunnelClosed"
          (scrutiny-agent--on-tunnel-closed conn (plist-get msg :params)))
+        ((guard (assoc method scrutiny-agent-notification-handlers))
+         (condition-case err
+             (funcall (cdr (assoc method scrutiny-agent-notification-handlers))
+                      conn (plist-get msg :params))
+           (error (scrutiny-agent--log
+                   conn "handler for %s failed: %S" method err))))
         (_
          (scrutiny-agent--log conn "notification %s %S" method
                               (plist-get msg :params))
@@ -288,7 +337,8 @@ JSON-RPC envelope they carry, parsed as a plist."
           ;; Over-cap response: the real envelope arrived as chunks.
           (let* ((key (scrutiny-agent--chunk-key id))
                  (parts (gethash key (scrutiny-agent--conn-chunks conn)))
-                 (envelope (scrutiny-agent--assemble-chunks parts)))
+                 (envelope (scrutiny-agent--assemble-chunks
+                            parts (plist-get result :encoding))))
             (remhash key (scrutiny-agent--conn-chunks conn))
             (setq result (plist-get envelope :result)
                   err (plist-get envelope :error))))
@@ -322,29 +372,77 @@ in this package."
                                      :params params))
     id))
 
+;; A request and its answer are separate events, and on a slow link the
+;; difference is everything: N questions asked one after another cost N
+;; round trips, the same N asked together cost one.  The channel has
+;; always been multiplexed; what was missing was a way for a caller to
+;; send without waiting.  A FUTURE is that: `scrutiny-agent-send' returns
+;; one immediately, `scrutiny-agent-await' blocks for its answer, and
+;; any number may be in flight between the two.
+
+(defun scrutiny-agent-send (conn method params &optional then)
+  "Send request METHOD with PARAMS on CONN without waiting; return a future.
+THEN, if non-nil, is called with (RESULT ERR) when the reply arrives,
+before any waiter sees it -- the place to file the answer in a cache.
+The future is a vector [DONE RESULT ERR METHOD ID]."
+  (let ((future (vector nil nil nil method nil)))
+    (aset future 4
+          (scrutiny-agent-async-request
+           conn method params
+           (lambda (result err)
+             (aset future 1 result)
+             (aset future 2 err)
+             (when then
+               (condition-case e (funcall then result err)
+                 (error (scrutiny-agent--log
+                         conn "callback for %s failed: %S" method e))))
+             (aset future 0 t))))
+    future))
+
+(defun scrutiny-agent-future-done-p (future)
+  "Whether FUTURE has its answer."
+  (aref future 0))
+
+(defun scrutiny-agent-future-result (future)
+  "FUTURE's result, or nil if it has none (yet, or because it failed)."
+  (aref future 1))
+
+(defun scrutiny-agent-future-error (future)
+  "FUTURE's error plist (:code :message), or nil."
+  (aref future 2))
+
+(defun scrutiny-agent-await (conn future &optional timeout)
+  "Block until FUTURE on CONN is answered and return its result.
+TIMEOUT is in seconds, defaulting to 30.
+Signals `scrutiny-agent-rpc-error' with (CODE MESSAGE) on an error
+response, or a plain error on timeout/disconnect."
+  (let* ((timeout (or timeout 30))
+         (proc (scrutiny-agent--conn-process conn))
+         (deadline (+ (float-time) timeout)))
+    (while (and (not (aref future 0)) (process-live-p proc))
+      (when (> (float-time) deadline)
+        (error "Scrutiny-agent: timeout (%ss) waiting for %s"
+               timeout (aref future 3)))
+      (accept-process-output proc 0.05))
+    (unless (aref future 0)
+      (error "Scrutiny-agent: connection died during %s" (aref future 3)))
+    (when (aref future 2)
+      (signal 'scrutiny-agent-rpc-error
+              (list (plist-get (aref future 2) :code)
+                    (plist-get (aref future 2) :message))))
+    (aref future 1)))
+
 (defun scrutiny-agent-request (conn method params &optional timeout)
   "Send request METHOD with PARAMS and block for the result.
 TIMEOUT is in seconds, defaulting to 30.
 Signals `scrutiny-agent-rpc-error' with (CODE MESSAGE) on an error
 response, or a plain error on timeout/disconnect."
-  (let* ((done nil) (res nil) (err nil)
-         (timeout (or timeout 30))
-         (proc (scrutiny-agent--conn-process conn)))
-    (scrutiny-agent-async-request
-     conn method params
-     (lambda (r e) (setq res r err e done t)))
-    (let ((deadline (+ (float-time) timeout)))
-      (while (and (not done) (process-live-p proc))
-        (when (> (float-time) deadline)
-          (error "Scrutiny-agent: timeout (%ss) waiting for %s"
-                 timeout method))
-        (accept-process-output proc 0.05)))
-    (unless done
-      (error "Scrutiny-agent: connection died during %s" method))
-    (when err
-      (signal 'scrutiny-agent-rpc-error
-              (list (plist-get err :code) (plist-get err :message))))
-    res))
+  (scrutiny-agent-await conn (scrutiny-agent-send conn method params)
+                        timeout))
+
+(defun scrutiny-agent-feature-p (conn feature)
+  "Whether CONN's agent advertises optional behavior FEATURE (a string)."
+  (and (member feature (scrutiny-agent--conn-features conn)) t))
 
 (define-error 'scrutiny-agent-rpc-error "Scrutiny-agent RPC error")
 
@@ -638,13 +736,29 @@ directories win, matching the lookup order in
                   found)))))
     (nreverse found)))
 
-(defun scrutiny-agent--wait-line (proc state marker timeout)
+(defun scrutiny-agent--terminal-error (name transport)
+  "The error for a transport that handed the remote shell a terminal."
+  (error "Scrutiny-agent[%s]: the transport `%s' gave the remote shell a \
+terminal, which echoes everything sent to it; the bootstrap and the \
+protocol cannot run over one.  Teleport does this for a plain `tsh ssh \
+HOST' (even with --no-tty): give it an explicit command, e.g. `%s sh'"
+         name transport transport))
+
+(defun scrutiny-agent--wait-line (proc state marker timeout &optional echo-of)
   "Wait until STATE's transcript contains a line starting with MARKER;
 return the rest of that line.  STATE is a cons cell whose car
-accumulates raw pre-exec output."
+accumulates raw pre-exec output.
+
+ECHO-OF, when given, is text that was just sent to the remote.  A
+transport that allocated a terminal echoes it back, prefixed by a
+prompt and terminated by CR LF, so the marker never starts a line
+and the wait would run to its deadline.  Seeing the echo is a
+diagnosis, not a timeout: fail at once, naming the fix."
   (let ((deadline (+ (float-time) timeout)))
     (catch 'got
       (while t
+        (when (and echo-of (string-search echo-of (car state)))
+          (throw 'got 'terminal))
         (dolist (line (split-string (car state) "\n"))
           (when (string-prefix-p marker line)
             (throw 'got (string-trim (substring line (length marker))))))
@@ -709,9 +823,15 @@ remote shell has exec'd the agent (the pipe then speaks JSON-RPC)."
     (set-process-filter proc (lambda (_p out)
                                (setcar state (concat (car state) out))))
     ;; 1. Probe OS/arch (marker survives login banners/motd noise).
+    ;; The probe is also the terminal check: a PTY echoes the command
+    ;; itself back, and that echo is recognised before anything else.
     (process-send-string proc (concat (scrutiny-agent--probe-script) "\n"))
-    (let* ((probe (scrutiny-agent--wait-line proc state "__SCRA_PROBE__" 30))
-           (parts (split-string probe))
+    (let* ((probe (scrutiny-agent--wait-line proc state "__SCRA_PROBE__" 30
+                                             (scrutiny-agent--probe-script)))
+           (parts (if (eq probe 'terminal)
+                      (scrutiny-agent--terminal-error
+                       name (plist-get host-plist :transport))
+                    (split-string probe)))
            (uname-s (nth 0 parts)) (uname-m (nth 1 parts))
            (arch (or (scrutiny-agent--arch-asset uname-s uname-m)
                      ;; A local binary can serve a platform we publish
@@ -806,9 +926,16 @@ at it if this platform is expected to work"
         (process-send-string
          proc (format "echo __SCRA_EXEC__; exec \"%s/%s\" --rpc-stdio%s %s\n"
                       install-dir bname
+                      ;; Double-quoted, exactly like the binary beside
+                      ;; it: INSTALL-DIR is a shell expression (the
+                      ;; default is "$HOME/.scrutiny-agent") and must be
+                      ;; expanded by the remote shell.  Quoting it with
+                      ;; `shell-quote-argument' escaped the `$', so the
+                      ;; agent was handed a literal "$HOME/..." path,
+                      ;; could not read it, and silently started with
+                      ;; its defaults: read-only, no git.exec.
                       (if config-path
-                          (format " --config %s"
-                                  (shell-quote-argument config-path))
+                          (format " --config \"%s\"" config-path)
                         "")
                       args))
         (scrutiny-agent--wait-line proc state "__SCRA_EXEC__" 30)))
@@ -873,22 +1000,55 @@ at it if this platform is expected to work"
               (scrutiny-agent--on-disconnect conn))))
     (let ((hello (scrutiny-agent-request
                   conn "meta.hello"
-                  (list :clientVersion "scrutiny-agent.el"
-                        :supportedProtocolVersions
-                        (vector scrutiny-agent-protocol-version)
-                        :frameCap 131072))))
+                  (nconc
+                   (list :clientVersion "scrutiny-agent.el"
+                         :supportedProtocolVersions
+                         (vector scrutiny-agent-protocol-version)
+                         :frameCap 131072)
+                   (and scrutiny-agent-compress
+                        (fboundp 'zlib-available-p)
+                        (zlib-available-p)
+                        (list :encodings ["deflate"]))))))
       (setf (scrutiny-agent--conn-capabilities conn)
             (append (plist-get hello :capabilities) nil)
             (scrutiny-agent--conn-agent-version conn)
             (plist-get hello :agentVersion)
             (scrutiny-agent--conn-frame-cap conn)
-            (plist-get hello :frameCap)))
+            (plist-get hello :frameCap)
+            (scrutiny-agent--conn-features conn)
+            (append (plist-get hello :features) nil)
+            (scrutiny-agent--conn-facts conn)
+            (plist-get hello :fileSystemAccess))
+      (scrutiny-agent--check-config conn name hello))
     (puthash name conn scrutiny-agent--connections)
     (message "scrutiny-agent[%s]: connected (agent %s, %d capabilities)"
              name (scrutiny-agent--conn-agent-version conn)
              (length (scrutiny-agent--conn-capabilities conn)))
     (run-hook-with-args 'scrutiny-agent-after-connect-hook name)
     conn))
+
+(defun scrutiny-agent--check-config (conn name hello)
+  "Say so, loudly, if the agent could not read a config it was given.
+The agent treats that as non-fatal and starts on its defaults --
+read-only, no `git.exec' -- which leaves everything working and
+everything slow, with nothing on screen to explain why."
+  (let ((unreadable (append (plist-get (plist-get hello :config)
+                                       :unreadable)
+                            nil)))
+    (when unreadable
+      (scrutiny-agent--log conn "agent could not read config: %S" unreadable)
+      (display-warning
+       'scrutiny-agent
+       (format "%s: the agent could not read its config (%s) and is running \
+on defaults: %s, git.exec %s.  Saves and git will fall back to TRAMP."
+               name (string-join unreadable ", ")
+               (if (member "fs.writeFile"
+                           (scrutiny-agent--conn-capabilities conn))
+                   "writable" "READ-ONLY")
+               (if (member "git.exec"
+                           (scrutiny-agent--conn-capabilities conn))
+                   "on" "OFF"))
+       :warning))))
 
 (defun scrutiny-agent--on-disconnect (conn)
   "Fail all pending requests and tunnels; drop the registry entry."
@@ -897,12 +1057,17 @@ at it if this platform is expected to work"
            (scrutiny-agent--conn-pending conn))
   (clrhash (scrutiny-agent--conn-pending conn))
   (maphash (lambda (_tid tunnel)
-             (let ((cb (scrutiny-agent-tunnel-on-closed tunnel)))
+             (let ((cb (scrutiny-agent-tunnel-on-closed tunnel))
+                   (on-exit (scrutiny-agent-tunnel-on-exit tunnel)))
 	       (when cb
-		 (funcall cb "disconnected"))))
+		 (funcall cb "disconnected"))
+               (when on-exit
+                 (funcall on-exit 255 "disconnected"))))
            (scrutiny-agent--conn-tunnels conn))
   (clrhash (scrutiny-agent--conn-tunnels conn))
-  (remhash (scrutiny-agent--conn-name conn) scrutiny-agent--connections))
+  (remhash (scrutiny-agent--conn-name conn) scrutiny-agent--connections)
+  (run-hook-with-args 'scrutiny-agent-disconnect-functions
+                      (scrutiny-agent--conn-name conn)))
 
 ;;;###autoload
 (defun scrutiny-agent-disconnect (name)
@@ -957,7 +1122,44 @@ different questions that must not share a symbol.
 ;; ---------------------------------------------------------------------
 
 (cl-defstruct scrutiny-agent-tunnel
-  conn id server-path on-bytes on-closed)
+  conn id server-path on-bytes on-closed on-exit)
+
+;; A tunnel's first bytes can arrive in the same read as the reply that
+;; announces the tunnel -- a `git rev-parse' has printed its answer and
+;; exited before the client has learned its tunnel id.  Events for a
+;; tunnel nobody has registered yet are therefore kept, briefly, and
+;; handed over when it is.
+
+(defun scrutiny-agent--orphan (conn id event)
+  "Keep EVENT for tunnel ID on CONN until someone adopts the tunnel."
+  (let ((orphans (scrutiny-agent--conn-orphans conn))
+        (now (float-time)))
+    ;; Anything unclaimed for half a minute never will be.
+    (maphash (lambda (key value)
+               (when (> (- now (car value)) 30) (remhash key orphans)))
+             orphans)
+    (let ((entry (or (gethash id orphans)
+                     (puthash id (list now) orphans))))
+      (nconc entry (list event)))))
+
+(defun scrutiny-agent-tunnel-adopt (conn id &optional on-bytes on-closed
+                                         on-exit server-path)
+  "Register tunnel ID on CONN and return its `scrutiny-agent-tunnel'.
+ON-BYTES is called with each unibyte chunk the far end writes;
+ON-CLOSED with a reason string when it ends; ON-EXIT with its exit
+code and that reason.  Whatever arrived for the tunnel before this
+call is delivered first, in order."
+  (let ((tunnel (make-scrutiny-agent-tunnel
+                 :conn conn :id id :server-path server-path
+                 :on-bytes on-bytes :on-closed on-closed :on-exit on-exit))
+        (early (cdr (gethash id (scrutiny-agent--conn-orphans conn)))))
+    (remhash id (scrutiny-agent--conn-orphans conn))
+    (puthash id tunnel (scrutiny-agent--conn-tunnels conn))
+    (dolist (event early)
+      (if (stringp event)
+          (when on-bytes (funcall on-bytes event))
+        (scrutiny-agent--on-tunnel-closed conn event)))
+    tunnel))
 
 (defun scrutiny-agent-tunnel-open (conn workspace language
                                         &optional on-bytes on-closed)
@@ -966,28 +1168,30 @@ LANGUAGE is the protocol language int.  ON-BYTES is called with each
 unibyte chunk
 of server output; ON-CLOSED with a reason string when the server
 exits.  Returns a `scrutiny-agent-tunnel'."
-  (let* ((r (scrutiny-agent-request
-             conn "lsp.tunnelOpen"
-             (list :workspacePath workspace :language language)
-             60))
-         (tunnel (make-scrutiny-agent-tunnel
-                  :conn conn
-                  :id (plist-get r :tunnelId)
-                  :server-path (plist-get r :serverPath)
-                  :on-bytes on-bytes
-                  :on-closed on-closed)))
-    (puthash (scrutiny-agent-tunnel-id tunnel) tunnel
-             (scrutiny-agent--conn-tunnels conn))
-    tunnel))
+  (let ((r (scrutiny-agent-request
+            conn "lsp.tunnelOpen"
+            (list :workspacePath workspace :language language)
+            60)))
+    (scrutiny-agent-tunnel-adopt conn (plist-get r :tunnelId)
+                                 on-bytes on-closed nil
+                                 (plist-get r :serverPath))))
 
 (defun scrutiny-agent-tunnel-send (tunnel bytes)
-  "Send unibyte string BYTES to TUNNEL's language server."
+  "Send unibyte string BYTES to the process at the far end of TUNNEL."
   (dolist (chunk (scrutiny-agent--split-bytes
                   bytes scrutiny-agent--tunnel-chunk))
     (scrutiny-agent-notify (scrutiny-agent-tunnel-conn tunnel)
                            "lsp.tunnelSend"
                            (list :tunnelId (scrutiny-agent-tunnel-id tunnel)
                                  :data (base64-encode-string chunk t)))))
+
+(defun scrutiny-agent-tunnel-eof (tunnel)
+  "Close the standard input of the process at the far end of TUNNEL.
+Everything sent before this is still delivered first."
+  (scrutiny-agent-notify (scrutiny-agent-tunnel-conn tunnel)
+                         "lsp.tunnelSend"
+                         (list :tunnelId (scrutiny-agent-tunnel-id tunnel)
+                               :eof t)))
 
 (defun scrutiny-agent-tunnel-close (tunnel)
   "Close TUNNEL (idempotent).
@@ -1002,23 +1206,34 @@ if the transport dies first)."
        (list :tunnelId (scrutiny-agent-tunnel-id tunnel))))))
 
 (defun scrutiny-agent--on-tunnel-recv (conn params)
-  (let ((tunnel (gethash (plist-get params :tunnelId)
-                         (scrutiny-agent--conn-tunnels conn))))
-    (when tunnel
-      (let ((cb (scrutiny-agent-tunnel-on-bytes tunnel)))
-	(when cb
-	  (funcall cb (base64-decode-string (plist-get params :data))))))))
+  (let* ((id (plist-get params :tunnelId))
+         (tunnel (gethash id (scrutiny-agent--conn-tunnels conn)))
+         (bytes (base64-decode-string (plist-get params :data))))
+    (when (eq (plist-get params :z) t)
+      (setq bytes (scrutiny-agent--inflate bytes)))
+    (if tunnel
+        (let ((cb (scrutiny-agent-tunnel-on-bytes tunnel)))
+          (when cb (funcall cb bytes)))
+      (scrutiny-agent--orphan conn id bytes))))
 
 (defun scrutiny-agent--on-tunnel-closed (conn params)
-  (let ((tid (plist-get params :tunnelId)))
-    (let ((tunnel (gethash tid (scrutiny-agent--conn-tunnels conn))))
-      (when tunnel
-	(remhash tid (scrutiny-agent--conn-tunnels conn))
-	(let ((cb (scrutiny-agent-tunnel-on-closed tunnel)))
-	  (when cb
-	    (funcall cb (format "%s (exit %s)"
-				(or (plist-get params :reason) "exit")
-				(plist-get params :exitCode)))))))))
+  (let* ((tid (plist-get params :tunnelId))
+         (tunnel (gethash tid (scrutiny-agent--conn-tunnels conn)))
+         (reason (or (plist-get params :reason) "exit")))
+    (cond
+     (tunnel
+      (remhash tid (scrutiny-agent--conn-tunnels conn))
+      (let ((on-closed (scrutiny-agent-tunnel-on-closed tunnel))
+            (on-exit (scrutiny-agent-tunnel-on-exit tunnel)))
+        (when on-closed
+          (funcall on-closed (format "%s (exit %s)" reason
+                                     (plist-get params :exitCode))))
+        (when on-exit
+          (funcall on-exit (plist-get params :exitCode) reason))))
+     ;; "unknown tunnel" is the agent answering a send, not a tunnel
+     ;; ending; there is nothing to keep for later.
+     ((not (equal reason "unknown tunnel"))
+      (scrutiny-agent--orphan conn tid params)))))
 
 (provide 'scrutiny-agent)
 ;;; scrutiny-agent.el ends here

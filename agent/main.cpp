@@ -57,6 +57,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <fcntl.h>
@@ -66,6 +67,10 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/inotify.h>
+#include <sys/vfs.h>
+#endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>  // _NSGetExecutablePath (self-exec path for askpass)
 #endif
@@ -73,6 +78,7 @@
 #include <map>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <zlib.h>
 
 #include "GitManipBridge.h"
 #include "GitReviewCore.h"
@@ -520,6 +526,43 @@ private:
 
 Writer g_writer;
 
+// ---- Compression -------------------------------------------------------
+//
+// Negotiated in meta.hello (`encodings: ["deflate"]`), off otherwise.
+//
+// Nearly everything this agent sends is text that compresses five to
+// ten times over -- JSON, source files, diffs, a language server's
+// completion lists -- and it sends it base64-wrapped where the frame
+// cap or the tunnel requires, which inflates it by a third first. On a
+// link whose throughput is the constraint, bytes are latency.
+//
+// It applies to what the agent SENDS: large responses (carried as
+// rpc.chunk with `encoding: "deflate"` on the final envelope) and
+// lsp.tunnelRecv data (`z: true` per notification). Each compressed
+// unit is a complete zlib stream, so a client needs nothing stateful to
+// decode it.
+std::atomic<bool> g_deflate{false};
+// Set around the one reply that must go out plain whatever was just
+// negotiated: the hello that does the negotiating.
+thread_local bool t_plainReply = false;
+constexpr size_t kDeflateMinResponse = 1024;
+constexpr size_t kDeflateMinTunnel = 512;
+
+// zlib-compress `in`, or nullopt if that would not make it smaller.
+std::optional<std::string> deflateBytes(const char* in, size_t n) {
+    uLongf bound = ::compressBound(static_cast<uLong>(n));
+    std::string out(bound, '\0');
+    // Level 4: most of the ratio of the default at well under half the
+    // CPU -- this runs on a host the user is waiting on.
+    if (::compress2(reinterpret_cast<Bytef*>(out.data()), &bound,
+                    reinterpret_cast<const Bytef*>(in),
+                    static_cast<uLong>(n), 4) != Z_OK)
+        return std::nullopt;
+    if (bound + bound / 8 >= n) return std::nullopt;   // not worth it
+    out.resize(bound);
+    return out;
+}
+
 // ---- Response path (chunking) ----------------------------------------
 //
 // Worker threads build a complete JSON-RPC envelope string and hand it
@@ -530,14 +573,20 @@ Writer g_writer;
 
 void respondEnvelope(const json& id, Lane lane, const std::string& envelope) {
     const size_t cap = g_frameCap.load();
-    if (envelope.size() <= cap) {
+    std::optional<std::string> packed;
+    if (g_deflate.load() && !t_plainReply &&
+        envelope.size() >= kDeflateMinResponse)
+        packed = deflateBytes(envelope.data(), envelope.size());
+    if (!packed && envelope.size() <= cap) {
         if (logOn(LogLevel::Debug))
             logWrite(LogLevel::Debug, logTag(id, lane) + "resp bytes=" +
                      std::to_string(envelope.size()) + " chunked=false");
         g_writer.enqueue(lane, envelope);
         return;
     }
-    const std::string b64 = base64Encode(envelope);
+    // Chunked -- because it is over the cap, or because it is being
+    // sent compressed, which the plain-JSON frame cannot carry.
+    const std::string b64 = base64Encode(packed ? *packed : envelope);
     // Keep each chunk frame comfortably under the cap (the rpc.chunk
     // JSON wrapper is tiny; 4 KB headroom is ample).
     const size_t headroom = 4096;
@@ -563,6 +612,7 @@ void respondEnvelope(const json& id, Lane lane, const std::string& envelope) {
                 {"id", id},
                 {"result", {{"streamed", true},
                             {"bytes", envelope.size()}}}};
+    if (packed) fin["result"]["encoding"] = "deflate";
     g_writer.enqueue(lane, dumpSafe(fin));
     if (logOn(LogLevel::Debug))
         logWrite(LogLevel::Debug, logTag(id, lane) + "resp bytes=" +
@@ -639,6 +689,8 @@ struct GitGuard {
 // meta.hello { clientVersion, supportedProtocolVersions:[..], frameCap? }
 //   -> { agentVersion, protocolVersion, frameCap, capabilities:[..] }
 // or VERSION_MISMATCH if the client cannot speak kProtocolVersion.
+void addHelloFacts(json& hello);   // defined with meta.capabilities
+
 void handleHello(const Responder& rsp, const json& params) {
     bool ok = false;
     if (auto it = params.find("supportedProtocolVersions");
@@ -651,6 +703,13 @@ void handleHello(const Responder& rsp, const json& params) {
         rsp.error(kVersionMismatch,
                   "agent speaks protocol " + std::to_string(kProtocolVersion));
         return;
+    }
+    bool deflate = false;
+    if (auto it = params.find("encodings");
+        it != params.end() && it->is_array()) {
+        for (const auto& e : *it)
+            if (e.is_string() && e.get<std::string>() == "deflate")
+                deflate = true;
     }
     // Frame-cap negotiation: clamp the Mac's proposal into range, else
     // keep the default. Single number for the connection lifetime.
@@ -713,7 +772,11 @@ void handleHello(const Responder& rsp, const json& params) {
     // this agent actually serves -- so it is advertised only then. A
     // client (the magit integration) uses its presence to decide
     // whether it can route git through the agent at all.
-    if (!g_gitExecAllowed.empty()) capabilities.push_back("git.exec");
+    if (!g_gitExecAllowed.empty()) {
+        capabilities.push_back("git.exec");
+        capabilities.push_back("git.spawn");
+        capabilities.push_back("git.signal");
+    }
     // The fs write surface, likewise advertised only when enabled: a
     // client checks for it to decide whether it can serve save-buffer
     // itself or must fall back to its own slower path.
@@ -722,10 +785,25 @@ void handleHello(const Responder& rsp, const json& params) {
                               "fs.rename", "fs.copy", "fs.chmod"})
             capabilities.push_back(m);
     }
-    rsp.result(json{{"agentVersion", kAgentVersion},
-                    {"protocolVersion", kProtocolVersion},
-                    {"frameCap", cap},
-                    {"capabilities", capabilities}});
+    json hello{{"agentVersion", kAgentVersion},
+               {"protocolVersion", kProtocolVersion},
+               {"frameCap", cap},
+               {"capabilities", capabilities}};
+    // Everything a client needs to know about this process before its
+    // first real request, in the reply it has to wait for anyway. On a
+    // slow link a second round trip at connect (meta.capabilities) is
+    // a second of the user's time, and these facts cannot change for
+    // the life of the process.
+    addHelloFacts(hello);
+    if (deflate) hello["encoding"] = "deflate";
+    // The hello itself goes out plain; everything after it may not.
+    // Switched on BEFORE the reply is sent: a client that pipelines its
+    // first request behind the hello must get the same answer every
+    // time, not one that depends on which thread ran first.
+    g_deflate.store(deflate);
+    t_plainReply = true;
+    rsp.result(hello);
+    t_plainReply = false;
 }
 
 // git.headSha { path } -> { headSha }
@@ -1120,28 +1198,71 @@ struct GitRun { int exitCode; std::string out; std::string err; };
 // Run `exe` (PATH-resolved) with args/cwd/extra-env, capturing stdout
 // and stderr separately. `runGitEnv`/`runGit` are thin "git" wrappers;
 // the credential self-test re-execs THIS binary as the askpass child.
+//
+// `input`, when given, is fed to the child's stdin. When it is not, the
+// child's stdin is /dev/null -- never inherited. The agent's own stdin
+// is the RPC channel: a child left holding it that decides to read
+// (`git apply`, `git hash-object --stdin`, anything that prompts) would
+// consume the client's next frames as its input, and the session would
+// hang with both ends waiting.
+// Both ends close-on-exec from birth. Requests run concurrently, and a
+// pipe made here must not be inherited by a child some OTHER thread
+// forks in the meantime: a long-lived one (a language server, a git
+// waiting on an editor) would hold this command's pipe open, and its
+// reader would never see end-of-file. dup2 onto 0/1/2 in the intended
+// child clears the flag on those.
+int cloexecPipe(int fds[2]) {
+#ifdef __linux__
+    return ::pipe2(fds, O_CLOEXEC);
+#else
+    if (::pipe(fds) != 0) return -1;
+    ::fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+#endif
+}
+
 GitRun runProc(const std::string& exe, const std::vector<std::string>& args,
-                const std::string& cwd, const std::vector<std::string>& env) {
-    int outfd[2], errfd[2];
-    if (::pipe(outfd) != 0) return {-1, "", ""};
-    if (::pipe(errfd) != 0) { ::close(outfd[0]); ::close(outfd[1]);
+                const std::string& cwd, const std::vector<std::string>& env,
+                const std::string* input = nullptr) {
+    int outfd[2], errfd[2], infd[2] = {-1, -1};
+    if (cloexecPipe(outfd) != 0) return {-1, "", ""};
+    if (cloexecPipe(errfd) != 0) { ::close(outfd[0]); ::close(outfd[1]);
                               return {-1, "", ""}; }
-    pid_t pid = ::fork();
-    if (pid < 0) {
+    if (input != nullptr && cloexecPipe(infd) != 0) {
         ::close(outfd[0]); ::close(outfd[1]);
         ::close(errfd[0]); ::close(errfd[1]);
         return {-1, "", ""};
     }
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        ::close(outfd[0]); ::close(outfd[1]);
+        ::close(errfd[0]); ::close(errfd[1]);
+        if (infd[0] >= 0) { ::close(infd[0]); ::close(infd[1]); }
+        return {-1, "", ""};
+    }
     if (pid == 0) {
         ::close(outfd[0]); ::close(errfd[0]);
+        if (infd[0] >= 0) {
+            ::close(infd[1]);
+            ::dup2(infd[0], STDIN_FILENO);
+            ::close(infd[0]);
+        } else {
+            const int devnull = ::open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                ::dup2(devnull, STDIN_FILENO);
+                if (devnull != STDIN_FILENO) ::close(devnull);
+            }
+        }
         ::dup2(outfd[1], STDOUT_FILENO); ::close(outfd[1]);
         ::dup2(errfd[1], STDERR_FILENO); ::close(errfd[1]);
         if (::chdir(cwd.c_str()) != 0) _exit(127);
         // setenv after fork (child is single-threaded; immediately
         // exec's) -- the standard, portable askpass-env technique.
+        // "KEY=VALUE" sets; a bare "KEY" unsets.
         for (const auto& kv : env) {
             auto eq = kv.find('=');
-            if (eq == std::string::npos) continue;
+            if (eq == std::string::npos) { ::unsetenv(kv.c_str()); continue; }
             ::setenv(kv.substr(0, eq).c_str(),
                      kv.substr(eq + 1).c_str(), 1);
         }
@@ -1155,12 +1276,33 @@ GitRun runProc(const std::string& exe, const std::vector<std::string>& args,
     }
     ::close(outfd[1]); ::close(errfd[1]);
     std::string out, errOut;
-    // Drain both pipes so neither blocks the child on a full pipe.
-    struct pollfd pf[2] = {{outfd[0], POLLIN, 0}, {errfd[0], POLLIN, 0}};
+    // Feed stdin and drain both outputs in one loop, so that a child
+    // which writes before it has finished reading (or the reverse)
+    // cannot deadlock against us on a full pipe.
+    size_t fed = 0;
+    if (infd[0] >= 0) {
+        ::close(infd[0]);
+        ::fcntl(infd[1], F_SETFL, ::fcntl(infd[1], F_GETFL) | O_NONBLOCK);
+        if (input->empty()) { ::close(infd[1]); infd[1] = -1; }
+    }
+    struct pollfd pf[3] = {{outfd[0], POLLIN, 0}, {errfd[0], POLLIN, 0},
+                           {infd[1], POLLOUT, 0}};
     int open = 2;
     char buf[65536];
     while (open > 0) {
-        if (::poll(pf, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+        if (::poll(pf, 3, -1) < 0) { if (errno == EINTR) continue; break; }
+        if (pf[2].fd >= 0 && (pf[2].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            const ssize_t w = ::write(pf[2].fd, input->data() + fed,
+                                      input->size() - fed);
+            if (w > 0) fed += static_cast<size_t>(w);
+            // Done, or the child stopped reading (EPIPE): either way
+            // close our end so it sees EOF.
+            if (fed >= input->size() ||
+                (w < 0 && errno != EAGAIN && errno != EINTR)) {
+                ::close(pf[2].fd);
+                pf[2].fd = -1;
+            }
+        }
         for (int i = 0; i < 2; ++i) {
             if (pf[i].fd < 0) continue;
             if (pf[i].revents & (POLLIN | POLLHUP)) {
@@ -1171,6 +1313,7 @@ GitRun runProc(const std::string& exe, const std::vector<std::string>& args,
             }
         }
     }
+    if (pf[2].fd >= 0) ::close(pf[2].fd);
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -1186,8 +1329,9 @@ GitRun runProc(const std::string& exe, const std::vector<std::string>& args,
 }
 
 GitRun runGitEnv(const std::vector<std::string>& args, const std::string& cwd,
-                 const std::vector<std::string>& env) {
-    return runProc("git", args, cwd, env);
+                 const std::vector<std::string>& env,
+                 const std::string* input = nullptr) {
+    return runProc("git", args, cwd, env, input);
 }
 
 GitRun runGit(const std::vector<std::string>& args, const std::string& cwd) {
@@ -1256,13 +1400,18 @@ GitRun runGitBrokered(const std::vector<std::string>& args,
 // injecting them.
 
 // Subcommands that only read. Safe to expose on their own.
+//
+// `branch`, `tag`, `symbolic-ref` and `config` are not in this list
+// although a UI cannot draw a status buffer without them: each of them
+// both reads and writes, depending on its arguments. Under this preset
+// they are served in their reading forms only (isReadOnlyInvocation).
 const char* const kGitExecReadOnly[] = {
-    "blame", "branch", "cat-file", "check-ignore", "check-ref-format",
+    "blame", "cat-file", "check-attr", "check-ignore", "check-ref-format",
     "count-objects", "describe", "diff", "diff-files", "diff-index",
     "diff-tree", "for-each-ref", "grep", "log", "ls-files", "ls-remote",
-    "ls-tree", "merge-base", "name-rev", "rev-list", "rev-parse",
-    "shortlog", "show", "show-ref", "status", "symbolic-ref", "tag",
-    "var", "version", "whatchanged"};
+    "ls-tree", "merge-base", "name-rev", "patch-id", "rev-list",
+    "rev-parse", "shortlog", "show", "show-ref", "status",
+    "var", "verify-commit", "verify-tag", "version", "whatchanged"};
 
 // What magit needs to be magit: the read-only set plus the working
 // operations. This is a broad grant -- close to "git" -- and is
@@ -1273,7 +1422,208 @@ const char* const kGitExecMagit[] = {
     "clean", "commit", "fetch", "format-patch", "merge", "mv", "notes",
     "pull", "push", "range-diff", "rebase", "reflog", "remote", "reset",
     "restore", "revert", "rm", "stash", "submodule", "switch",
-    "update-index", "worktree"};
+    "update-index", "worktree",
+    "branch", "tag", "symbolic-ref",
+    // The plumbing magit builds stashes, work-in-progress refs and
+    // resets out of. Each of these was missing, so each was refused
+    // here and re-run by the client over its fallback path -- in the
+    // middle of sequences whose other half DID run here.
+    "read-tree", "write-tree", "commit-tree", "update-ref", "mktree",
+    "hash-object", "checkout-index", "merge-tree", "sparse-checkout",
+    "request-pull", "bundle", "subtree", "init", "interpret-trailers",
+    "rerere", "stripspace",
+    // magit reads configuration on every refresh (`config --list -z`,
+    // `config --get-all ...`) and writes it from its branch and remote
+    // popups. Without this each of those was refused here and re-run
+    // by the client over its slow fallback path, several per refresh.
+    "config"};
+
+// Set by the read-only preset: subcommands that both read and write
+// are then served in their reading forms only (isReadOnlyInvocation).
+bool g_gitExecReadForms = false;
+
+// Whether `args[from..]` -- everything after the `config` subcommand --
+// can only READ configuration. Deliberately strict: an explicit getter
+// action is required, because the bare forms are ambiguous by arity
+// (`config k` reads, `config k v` writes), and every option must be
+// one that merely scopes or formats the answer. `--file`/`--blob`
+// would point git at an arbitrary path and are not accepted.
+bool isReadOnlyConfigQuery(const std::vector<std::string>& args, size_t from) {
+    static const char* const kActions[] = {
+        "--get", "--get-all", "--get-regexp", "--get-urlmatch",
+        "--list", "-l", "--get-color", "--get-colorbool"};
+    static const char* const kModifiers[] = {
+        "--local", "--global", "--system", "--worktree",
+        "-z", "--null", "--name-only", "--show-origin", "--show-scope",
+        "--includes", "--no-includes", "--include",
+        "--bool", "--int", "--bool-or-int", "--path", "--expiry-date",
+        "--fixed-value"};
+    bool sawAction = false;
+    for (size_t j = from; j < args.size(); ++j) {
+        const std::string& a = args[j];
+        if (a.empty() || a[0] != '-') continue;      // a key or a pattern
+        bool known = false;
+        for (const char* act : kActions)
+            if (a == act) { known = true; sawAction = true; }
+        for (const char* mod : kModifiers)
+            if (a == mod) known = true;
+        if (a.rfind("--type=", 0) == 0 || a.rfind("--default=", 0) == 0)
+            known = true;
+        if (!known) return false;
+    }
+    return sawAction;
+}
+
+// Whether every option in `args[from..]` is one of `allowed` (exactly,
+// or as `--name=value` when listed with a trailing '='), and whether
+// any positional argument is present.
+bool onlyTheseOptions(const std::vector<std::string>& args, size_t from,
+                      std::initializer_list<const char*> allowed,
+                      bool& sawPositional) {
+    sawPositional = false;
+    for (size_t j = from; j < args.size(); ++j) {
+        const std::string& a = args[j];
+        if (a.empty() || a[0] != '-') { sawPositional = true; continue; }
+        bool ok = false;
+        for (const char* opt : allowed) {
+            const size_t n = std::strlen(opt);
+            if (n > 0 && opt[n - 1] == '=' ? a.rfind(opt, 0) == 0 : a == opt)
+                ok = true;
+        }
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool hasArg(const std::vector<std::string>& args, size_t from,
+            std::initializer_list<const char*> any) {
+    for (size_t j = from; j < args.size(); ++j)
+        for (const char* opt : any)
+            if (args[j] == opt) return true;
+    return false;
+}
+
+// The reading forms of the subcommands that also write. Allowlisted
+// option by option: `git branch` lists with no arguments and creates
+// with one, `git tag x` creates and `git tag -l x` matches, so "no
+// mutating option was given" is not the same as "this only reads".
+bool isReadOnlyInvocation(const std::string& subcommand,
+                          const std::vector<std::string>& args, size_t from) {
+    bool positional = false;
+    if (subcommand == "config") return isReadOnlyConfigQuery(args, from);
+    if (subcommand == "branch") {
+        if (!onlyTheseOptions(
+                args, from,
+                {"--list", "-l", "-a", "--all", "-r", "--remotes", "-v", "-vv",
+                 "--verbose", "--show-current", "--no-color", "--color",
+                 "--color=", "--no-column", "--column", "--column=",
+                 "--format=", "--sort=", "--abbrev=", "--no-abbrev",
+                 "-i", "--ignore-case", "--contains=", "--no-contains=",
+                 "--merged=", "--no-merged=", "--points-at="},
+                positional))
+            return false;
+        // A positional is a pattern only when listing was asked for.
+        return !positional || hasArg(args, from, {"--list", "-l"});
+    }
+    if (subcommand == "tag") {
+        if (!onlyTheseOptions(
+                args, from,
+                {"--list", "-l", "-n", "--no-color", "--color", "--color=",
+                 "--no-column", "--column", "--column=", "--format=",
+                 "--sort=", "-i", "--ignore-case", "--contains=",
+                 "--no-contains=", "--merged=", "--no-merged=",
+                 "--points-at="},
+                positional))
+            return false;
+        return !positional || hasArg(args, from, {"--list", "-l"});
+    }
+    if (subcommand == "symbolic-ref") {
+        // `symbolic-ref NAME` reads; a second name, -d or -m writes.
+        if (!onlyTheseOptions(args, from,
+                              {"--short", "-q", "--quiet", "--no-recurse"},
+                              positional))
+            return false;
+        size_t names = 0;
+        for (size_t j = from; j < args.size(); ++j)
+            if (!args[j].empty() && args[j][0] != '-') ++names;
+        return names == 1;
+    }
+    return false;
+}
+
+// git's option parser accepts any unambiguous ABBREVIATION of a long
+// option (`--upload-p=...` is `--upload-pack=...`, `--outp x` is
+// `--output x`), and takes a value either attached with `=` or as the
+// next argument. So an option is refused by every spelling that could
+// resolve to it: any argument whose name -- the part before `=` -- is
+// a prefix of the denied name. Comparing whole strings, which is what
+// this code did at first, stops only the client that spells it out.
+bool spellsLongOption(const std::string& arg, const char* denied) {
+    if (arg.size() < 3 || arg[0] != '-' || arg[1] != '-') return false;
+    const std::string name = arg.substr(0, arg.find('='));
+    return std::strncmp(name.c_str(), denied, name.size()) == 0;
+}
+
+// A cluster of single-letter options (`-lO`, `-nf`) containing `letter`.
+// Over-inclusive on purpose: `-eOops` (a pattern that happens to hold
+// the letter) is refused as well, and costs that request the fast path.
+bool hasShortOption(const std::string& arg, char letter) {
+    return arg.size() >= 2 && arg[0] == '-' && arg[1] != '-' &&
+           arg.find(letter, 1) != std::string::npos;
+}
+
+// A path that is absolute, or climbs with `..`.
+bool leavesTheRepository(const std::string& arg) {
+    if (arg.empty() || arg[0] == '-') return false;
+    if (arg[0] == '/') return true;
+    size_t at = 0;
+    while (at <= arg.size()) {
+        size_t slash = arg.find('/', at);
+        if (slash == std::string::npos) slash = arg.size();
+        if (arg.compare(at, slash - at, "..") == 0) return true;
+        at = slash + 1;
+    }
+    return false;
+}
+
+// Options that are harmless for most subcommands and a way out of the
+// sandbox, or into a shell, for particular ones. Checked in addition
+// to isForbiddenGitArg, which is subcommand-blind.
+bool isForbiddenFor(const std::string& subcommand, const std::string& arg) {
+    auto spells = [&](const char* d) { return spellsLongOption(arg, d); };
+    if (subcommand == "diff" || subcommand == "grep") {
+        // Compare / search arbitrary files, repository or not: reads
+        // anything the agent's user can.
+        if (spells("--no-index")) return true;
+    }
+    if (subcommand == "diff") {
+        // ...and `git diff` does the same thing unasked when handed a
+        // path outside the work tree.
+        if (leavesTheRepository(arg)) return true;
+    }
+    if (subcommand == "grep") {
+        // `-O<cmd>` runs <cmd> on the matching files; `-f <file>`
+        // reads patterns from any file, which makes it an oracle for
+        // that file's contents.
+        if (spells("--open-files-in-pager") || spells("--file") ||
+            hasShortOption(arg, 'O') || hasShortOption(arg, 'f'))
+            return true;
+    }
+    if (subcommand == "blame" || subcommand == "annotate") {
+        // Blame an arbitrary file's contents as if it were the tracked
+        // one; `-S` and `--ignore-revs-file` read a file and quote it
+        // back in their error messages.
+        if (spells("--contents") || spells("--ignore-revs-file") ||
+            hasShortOption(arg, 'S'))
+            return true;
+    }
+    if (subcommand == "ls-files") {
+        // Exclude patterns read from any file: an oracle again.
+        if (spells("--exclude-from") || hasShortOption(arg, 'X'))
+            return true;
+    }
+    return false;
+}
 
 // `-c <key>=<value>` config keys a request may set. Allowlisted by
 // key, never deny-listed: the keys that make git run a program
@@ -1322,23 +1672,39 @@ bool isAllowedGitConfig(const std::string& setting) {
     return false;
 }
 
-// Options that hand git a command to execute, or relocate what "the
-// repository" means. Refused anywhere in the argument list.
-bool isForbiddenGitArg(const std::string& arg) {
-    static const char* const kExactDeny[] = {
-        "-c", "--config-env", "--exec-path", "--upload-pack",
-        "--receive-pack", "--git-dir", "--work-tree", "--namespace", "-C",
-        "--ext-diff"};
+// Options that hand git a command to execute, write a file of the
+// client's choosing, or relocate what "the repository" means. Refused
+// anywhere in the argument list, in every spelling (spellsLongOption).
+//
+// Two options that really exist are prefixes of a denied one and would
+// be caught with it: `--text` (treat as text; `--textconv` runs a
+// program) and `--path` (`git config --path`). An exact match wins in
+// git's parser, so they are let through -- except where the subcommand
+// has no such option of its own and the short spelling could only be
+// an abbreviation of the denied one.
+bool isForbiddenGitArg(const std::string& subcommand,
+                       const std::string& arg) {
+    static const char* const kExactDeny[] = {"-c", "-C"};
     for (const char* deny : kExactDeny)
         if (arg == deny) return true;
-    static const char* const kPrefixDeny[] = {
-        "-c=", "--config-env=", "--exec-path=", "--upload-pack=",
-        "--receive-pack=", "--git-dir=", "--work-tree=", "--namespace=",
-        "--output=",         // writes wherever the client points it
-        "--gpg-sign=",       // invokes an arbitrary signing program
-        "--textconv"};
-    for (const char* deny : kPrefixDeny)
-        if (arg.rfind(deny, 0) == 0) return true;
+    if (arg.rfind("-c=", 0) == 0) return true;
+    // `-O<orderfile>` (diff family) reads any file; `-O<cmd>` (grep)
+    // runs one.
+    if (arg.rfind("-O", 0) == 0) return true;
+    if (arg.rfind("--textconv", 0) == 0) return true;
+    const std::string name = arg.substr(0, arg.find('='));
+    if (name == "--text" && subcommand != "cat-file") return false;
+    if (name == "--path" && subcommand == "config") return false;
+    static const char* const kDeny[] = {
+        "--config-env", "--exec-path", "--upload-pack", "--receive-pack",
+        "--git-dir", "--work-tree", "--namespace", "--ext-diff",
+        "--output",              // writes wherever the client points it
+        "--gpg-sign",            // invokes an arbitrary signing program
+        "--textconv",
+        "--pathspec-from-file",  // reads any file
+    };
+    for (const char* deny : kDeny)
+        if (spellsLongOption(arg, deny)) return true;
     return false;
 }
 
@@ -1400,7 +1766,10 @@ bool gitExecPermitted(const std::vector<std::string>& args,
     }
 
     subcommand = args[i];
-    if (std::find(g_gitExecAllowed.begin(), g_gitExecAllowed.end(),
+    const bool readForm =
+        g_gitExecReadForms && isReadOnlyInvocation(subcommand, args, i + 1);
+    if (!readForm &&
+        std::find(g_gitExecAllowed.begin(), g_gitExecAllowed.end(),
                   subcommand) == g_gitExecAllowed.end()) {
         err = "git subcommand '" + subcommand + "' is not in this agent's "
               "git.exec allowlist";
@@ -1411,7 +1780,28 @@ bool gitExecPermitted(const std::vector<std::string>& args,
     // here (it was already consumed above if legitimate), as are the
     // options that hand git a program to run or move the repository.
     for (size_t j = i; j < args.size(); ++j) {
-        if (isForbiddenGitArg(args[j])) {
+        // `rev-parse --git-dir` is a question ("where is the git
+        // directory?"), not the global option of the same spelling
+        // that relocates the repository -- that one takes a value and
+        // is only meaningful before the subcommand, where pass 1
+        // already refused it. Every git UI asks this on every refresh.
+        if (subcommand == "rev-parse" && j > i && args[j] == "--git-dir")
+            continue;
+        // `-c` and `-C` set configuration and change directory only as
+        // GLOBAL options, which pass 1 has already dealt with. After
+        // the subcommand they are that subcommand's own: `log -c`
+        // (combined diffs), `diff -C` and `blame -C` (copy detection),
+        // `commit -C` (reuse a message), `grep -c` (count), `switch -c`
+        // (create). Refusing them here protected nothing and sent every
+        // one of those commands down the client's fallback path.
+        if (j > i && (args[j] == "-c" || args[j] == "-C")) continue;
+        if (isForbiddenFor(subcommand, args[j])) {
+            err = "argument '" + args[j] + "' is refused for 'git " +
+                  subcommand + "': it reaches outside the repository or "
+                  "runs a program";
+            return false;
+        }
+        if (isForbiddenGitArg(subcommand, args[j])) {
             err = "argument '" + args[j] + "' is refused: it would let the "
                   "request run an arbitrary command through git";
             return false;
@@ -1436,6 +1826,112 @@ bool gitExecNeedsCredentials(const std::string& subcommand) {
 // without saying so.
 constexpr size_t kGitExecMaxOutput = 16 * 1024 * 1024;
 
+void fsBarrier();   // defined with the directory watcher
+std::optional<std::string> resolveAndAuthorize(
+    const std::string& userPath, int& code, std::string& err);
+std::optional<std::string> resolveAndAuthorizeForCreate(
+    const std::string& userPath, int& code, std::string& err);
+
+// Environment a request may set for the git it runs.
+//
+// A git UI does not only pass arguments. magit builds a stash by
+// pointing GIT_INDEX_FILE at a scratch index and running `update-index`
+// and `write-tree` against THAT; run the same commands without the
+// variable and they are applied to the user's real index instead --
+// which is what happened to every command sent here before this
+// existed, since nothing carried the environment across. So the
+// variables that change what a command MEANS must travel with it, and a
+// request naming one this agent will not honor is refused rather than
+// run without it: the client then takes its slow path, which does
+// carry it.
+//
+// Allowlisted by name, like `-c` keys and for the same reason: the
+// variables that make git run a program (GIT_EDITOR, GIT_SSH_COMMAND,
+// GIT_EXTERNAL_DIFF, GIT_ASKPASS, GIT_PAGER, GIT_EXEC_PATH, ...) or look
+// somewhere else for the repository or its configuration (GIT_DIR,
+// GIT_WORK_TREE, GIT_CONFIG_*) are too many to enumerate reliably.
+bool isAllowedGitEnv(const std::string& key) {
+    static const char* const kAllow[] = {
+        "GIT_INDEX_FILE",
+        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+        "GIT_OPTIONAL_LOCKS", "GIT_REFLOG_ACTION", "GIT_MERGE_AUTOEDIT",
+        "GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+        "LC_ALL", "LC_MESSAGES", "LC_CTYPE", "LANG", "LANGUAGE", "TZ",
+        "INSIDE_EMACS", "NO_COLOR", "TERM"};
+    for (const char* ok : kAllow)
+        if (key == ok) return true;
+    return false;
+}
+
+// Set by the magit preset (or `git-exec-editor`): a request may then
+// name the program git runs to edit a commit message or a rebase
+// plan. That is arbitrary execution, and so is only offered where it
+// already is -- the magit preset serves `rebase --exec` -- but it is
+// what lets a commit be written in the client's own editor: the
+// "editor" git is given announces the file and waits to be signalled.
+bool g_gitExecEditors = false;
+
+// `env`: { NAME: value | null } -- set, or unset, for one command.
+// Appends "KEY=VALUE" / "KEY" entries to `env`. Returns false, having
+// responded, when a variable is refused or malformed.
+bool gitEnvFromParams(const Responder& rsp, const json& params,
+                      const std::string& repoPath,
+                      std::vector<std::string>& env) {
+    auto ev = params.find("env");
+    if (ev == params.end() || ev->is_null()) return true;
+    if (!ev->is_object()) {
+        rsp.error(kInvalidRequest, "'env' must be an object");
+        return false;
+    }
+    for (auto it2 = ev->begin(); it2 != ev->end(); ++it2) {
+        const std::string& key = it2.key();
+        // UNSETTING a git variable only removes an influence this
+        // process might have inherited; it cannot add one. Callers do
+        // it defensively (project.el clears GIT_DIR before every
+        // `ls-files`), and refusing would cost them the fast path for
+        // asking that nothing unusual be in effect.
+        if (it2->is_null() && key.rfind("GIT_", 0) == 0) {
+            env.push_back(key);
+            continue;
+        }
+        // All four are how git is told which editor to run.
+        const bool editor = g_gitExecEditors &&
+                            (key == "GIT_EDITOR" ||
+                             key == "GIT_SEQUENCE_EDITOR" ||
+                             key == "EDITOR" || key == "VISUAL");
+        if (!editor && !isAllowedGitEnv(key)) {
+            rsp.error(kPermissionDenied,
+                      "environment variable '" + key + "' is not one "
+                      "this agent will set for git; the command was "
+                      "not run");
+            return false;
+        }
+        if (it2->is_null()) { env.push_back(key); continue; }
+        if (!it2->is_string()) {
+            rsp.error(kInvalidRequest,
+                      "'env' values must be strings or null");
+            return false;
+        }
+        std::string value = it2->get<std::string>();
+        if (key == "GIT_INDEX_FILE") {
+            // A path git will read and WRITE: it stays inside the
+            // sandbox like every other path a client names.
+            int code = 0;
+            std::string why;
+            auto canon = resolveAndAuthorizeForCreate(
+                value.empty() || value[0] == '/' ? value
+                                                 : repoPath + "/" + value,
+                code, why);
+            if (!canon) { rsp.error(code, why); return false; }
+            value = *canon;
+        }
+        env.push_back(key + "=" + value);
+    }
+    return true;
+}
+
 void handleGitExec(const Responder& rsp, const json& params) {
     std::string repoPath;
     if (!reqStr(rsp, params, "repoPath", "git.exec", repoPath)) return;
@@ -1459,24 +1955,68 @@ void handleGitExec(const Responder& rsp, const json& params) {
         rsp.error(kPermissionDenied, err);
         return;
     }
+    // The directory git runs in is a path a client named, and gets the
+    // same treatment as every other one: resolved, and inside the
+    // roots. Without this the fs sandbox ended wherever git.exec began.
+    {
+        int code = 0;
+        std::string why;
+        auto canonRepo = resolveAndAuthorize(repoPath, code, why);
+        if (!canonRepo) { rsp.error(code, why); return; }
+        repoPath = *canonRepo;
+    }
     if (logOn(LogLevel::Info))
         logWrite(LogLevel::Info,
                  "git.exec " + subcommand + " in " + repoPath);
 
     // Never let git page or prompt: both would hang a request forever
     // on a pipe with no terminal.
-    std::vector<std::string> env{"GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0"};
+    // Applied AFTER whatever the request asked for, so that asking to
+    // unset them does not work.
+    std::vector<std::string> env;
     std::vector<std::string> argv{"--no-pager"};
     argv.insert(argv.end(), args.begin(), args.end());
+
+    if (!gitEnvFromParams(rsp, params, repoPath, env)) return;
+    const bool customEnv = !env.empty();
+    env.push_back("GIT_PAGER=cat");
+    env.push_back("GIT_TERMINAL_PROMPT=0");
+
+    // `stdinBase64`: what the command reads on stdin. This is how a
+    // hunk is staged (`git apply --cached -`), so without it the most
+    // common thing done in a git UI could not go over this channel.
+    std::optional<std::string> input;
+    if (auto in = params.find("stdinBase64");
+        in != params.end() && in->is_string()) {
+        input = base64Decode(in->get<std::string>());
+        if (!input) {
+            rsp.error(kInvalidRequest,
+                      "git.exec 'stdinBase64' is not valid base64");
+            return;
+        }
+    }
 
     GitRun g;
     std::string authOpId;
     if (gitExecNeedsCredentials(subcommand) &&
         reqStrOptional(params, "authOpId", authOpId)) {
+        // The brokered path carries neither; say so rather than run
+        // the command without something it was told it depends on.
+        if (customEnv || input) {
+            rsp.error(kInvalidRequest,
+                      "git.exec cannot combine 'authOpId' with 'env' or "
+                      "'stdinBase64'; use git.spawn");
+            return;
+        }
         g = runGitBrokered(argv, repoPath, authOpId);
     } else {
-        g = runGitEnv(argv, repoPath, env);
+        g = runGitEnv(argv, repoPath, env, input ? &*input : nullptr);
     }
+    // Whatever this command changed on disk is announced (fs.changed)
+    // BEFORE its reply, so a client that keeps a copy of the
+    // directories involved has an up-to-date one by the time it reads
+    // the exit code. Its next question is about exactly those files.
+    fsBarrier();
 
     bool truncated = false;
     if (g.out.size() > kGitExecMaxOutput) {
@@ -1561,6 +2101,24 @@ std::string resolveRoot(const std::string& p);
 //     does so by passing --allow-root on the host's bootstrap line.
 std::vector<std::string> g_allowedRoots;
 
+// The same roots as they were given (anchored, not realpath()'d), for
+// the ones whose spelling realpath() changed. Reported beside
+// g_allowedRoots so a client can recognise a name written the way the
+// user wrote it -- "/home/dev/src" when /home is a symlink to
+// /data/home, "/var/folders/..." on macOS where /var is one -- as
+// inside the sandbox without a round trip to be told so. The sandbox
+// itself never consults this list: every request path is still
+// canonicalized and checked against g_allowedRoots.
+std::vector<std::string> g_allowedRootsAsGiven;
+
+// Config files named on the exec line (or by another config) that could
+// not be read. Not fatal -- see applyConfigFile -- but no longer silent
+// either: meta.capabilities reports them, so a client that sent a
+// config can tell the user the agent is not running the policy it
+// thinks it is. Written in main() before any worker starts.
+std::vector<std::string> g_configUnreadable;
+std::vector<std::string> g_configLoaded;
+
 // True iff `path` is at-or-below `root` on a component boundary. Both
 // must be canonical absolutes ('/'-free of '..' and trailing '/'). The
 // component boundary matters: "/a/bc" must NOT be considered under
@@ -1604,6 +2162,7 @@ std::optional<std::string> resolveAndAuthorize(
 // Defined with the fs metadata section below; the read handlers above
 // it report size/mtime through the same helper.
 json statJson(const std::string& path);
+long long mtimeNanos(const struct stat& st);
 
 // fs.readFile { path } -> { content }
 // Working-tree read via the Core fs surface (grc_fs_read_file). Pure
@@ -1623,6 +2182,23 @@ void handleFsReadFile(const Responder& rsp, const json& params) {
     if (!canon) {
         rsp.error(code, err);
         return;
+    }
+    // `maxBytes`: decline, with the size, rather than send more than
+    // the client is prepared to hold. A client fetching a body ahead of
+    // knowing its size (so that the open costs one round trip, not
+    // two) needs the agent to be the one that looks first.
+    if (auto it = params.find("maxBytes");
+        it != params.end() && it->is_number_integer()) {
+        struct stat pre{};
+        if (::stat(canon->c_str(), &pre) == 0 && S_ISREG(pre.st_mode) &&
+            static_cast<long long>(pre.st_size) > it->get<long long>()) {
+            rsp.result(json{{"tooLarge", true},
+                            {"size", static_cast<long long>(pre.st_size)},
+                            {"mtime", static_cast<long long>(pre.st_mtime)},
+                            {"mtimeNs", mtimeNanos(pre)},
+                            {"mode", static_cast<int>(pre.st_mode & 07777)}});
+            return;
+        }
     }
     char* buf = nullptr;
     int64_t size = 0;
@@ -1654,10 +2230,367 @@ void handleFsReadFile(const Responder& rsp, const json& params) {
         json st = statJson(*canon);
         out["size"] = st.value("size", 0LL);
         out["mtime"] = st.value("mtime", 0LL);
+        out["mtimeNs"] = st.value("mtimeNs", 0LL);
         out["mode"] = st.value("mode", 0);
     }
     rsp.result(out);
 }
+
+// One directory entry with attributes, in the shape fs.listDirectory
+// returns and fs.changed pushes. `{ name, deleted: true }` when the
+// name is no longer there -- which is itself the news, for a watcher.
+json attributedEntry(const std::string& dir, const std::string& name) {
+    const std::string child = dir + "/" + name;
+    json st = statJson(child);
+    if (!st.value("exists", false))
+        return json{{"name", name}, {"deleted", true}};
+    json entry{{"name", name}, {"isDir", st.value("isDir", false)}};
+    for (const char* key : {"size", "mtime", "mtimeNs", "mode", "isSymlink",
+                            "symlinkTarget", "isRegular", "uid", "gid",
+                            "readable", "writable"}) {
+        if (st.contains(key)) entry[key] = st[key];
+    }
+    // The resolved path, so a client can answer file-truename from the
+    // listing instead of stat'ing every entry again.
+    char real[4096];
+    entry["path"] = ::realpath(child.c_str(), real) != nullptr
+                        ? std::string(real)
+                        : child;
+    return entry;
+}
+
+// ---- Directory watches: fs.changed -----------------------------------
+//
+// A client that has listed a directory holds a copy of it. Without
+// this, the copy can only be trusted for a guessed number of seconds,
+// and every command issued after that pays a round trip to re-read
+// state that almost never changed. With it, the agent keeps the copy
+// current: it watches each directory a client asks to have watched and
+// pushes the entries that changed. The client's copy is then good for
+// as long as the connection is, and a directory listing becomes
+// something that is fetched once.
+//
+// What is pushed is the new STATE of each changed name (its attributes,
+// or `deleted`), not an invalidation -- so the client never has to come
+// back and ask, and applying a notification twice, or one that a
+// listing already reflects, is harmless.
+//
+// Linux only (inotify). Elsewhere, and on filesystems where inotify
+// cannot see changes made by other machines (NFS, SMB, FUSE, ...),
+// `watch` is declined and the listing says `watching: false`; the
+// client then falls back to its time-based cache for that directory.
+class DirWatcher {
+public:
+    // Start watching `dir` (canonical). Returns whether it is watched.
+    // Call BEFORE reading the directory: a change that lands between
+    // the two is then reported rather than lost.
+    bool watch(const std::string& dir) {
+#if defined(__linux__)
+        std::lock_guard<std::mutex> l(m_);
+        if (byDir_.count(dir) != 0) return true;
+        if (stopping_ || !localFilesystem(dir)) return false;
+        if (fd_ < 0 && !startLocked()) return false;
+        const int wd = ::inotify_add_watch(
+            fd_, dir.c_str(),
+            IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
+                IN_CLOSE_WRITE | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF |
+                IN_MOVE_SELF | IN_ONLYDIR);
+        if (wd < 0) return false;   // ENOSPC (watch limit), EACCES, ...
+        byDir_[dir] = wd;
+        byWd_[wd] = Watch{dir, {}};
+        order_.push_back(dir);
+        // Bounded: the oldest watch gives way. Its directory is told,
+        // so the client stops treating its copy as live.
+        while (byDir_.size() > kMaxWatches && !order_.empty()) {
+            const std::string victim = order_.front();
+            order_.pop_front();
+            if (victim == dir) { order_.push_back(dir); continue; }
+            dropLocked(victim, true);
+        }
+        return true;
+#else
+        (void)dir;
+        return false;
+#endif
+    }
+
+    // Stop watching `dir` without telling anyone (the caller is about
+    // to say what it needs to in its own reply).
+    void forget(const std::string& dir) {
+#if defined(__linux__)
+        std::lock_guard<std::mutex> l(m_);
+        dropLocked(dir, false);
+#else
+        (void)dir;
+#endif
+    }
+
+    // Deliver every change that has already happened, now, and return
+    // once the notifications are queued. A request handler calls this
+    // before replying to anything that modified the filesystem; since
+    // fs.changed travels on the interactive lane, it is then on the
+    // wire ahead of that reply. The kernel queues an inotify event as
+    // part of the operation that causes it, so "already happened" is
+    // exactly what is in the queue at this moment.
+    void barrier() {
+#if defined(__linux__)
+        std::unique_lock<std::mutex> l(m_);
+        if (fd_ < 0 || stopping_ || byDir_.empty()) return;
+        const unsigned long want = ++barrierAsked_;
+        const char b = 2;
+        (void)!::write(wake_[1], &b, 1);
+        barrierCv_.wait_for(l, std::chrono::milliseconds(500),
+                            [&] { return barrierDone_ >= want || stopping_; });
+#endif
+    }
+
+    void stop() {
+#if defined(__linux__)
+        {
+            std::lock_guard<std::mutex> l(m_);
+            stopping_ = true;
+            if (fd_ < 0) return;
+        }
+        barrierCv_.notify_all();
+        const char b = 1;
+        (void)!::write(wake_[1], &b, 1);
+        if (thread_.joinable()) thread_.join();
+        ::close(fd_);
+        ::close(wake_[0]);
+        ::close(wake_[1]);
+        fd_ = -1;
+#endif
+    }
+
+    size_t count() {
+        std::lock_guard<std::mutex> l(m_);
+        return byDir_.size();
+    }
+
+private:
+#if defined(__linux__)
+    static constexpr size_t kMaxWatches = 2048;
+    // Names changed in one directory within one coalescing window
+    // beyond which the whole listing is declared stale instead.
+    static constexpr size_t kMaxNamesPerNote = 256;
+    // A directory that keeps changing (a build tree, a log directory)
+    // is not worth narrating: after this many notifications inside
+    // kBusyWindowMs its watch is dropped and the client goes back to
+    // its time-based cache for it.
+    static constexpr int kBusyNotes = 40;
+    static constexpr int kBusyWindowMs = 10000;
+    static constexpr int kQuietMs = 25;     // coalesce until this quiet...
+    static constexpr int kMaxHoldMs = 150;  // ...but never hold longer
+
+    struct Watch {
+        std::string dir;
+        std::deque<std::chrono::steady_clock::time_point> notes;
+    };
+
+    // inotify reports only what happens through THIS machine's kernel.
+    // On a network filesystem another host's write is invisible, and a
+    // watch there would vouch for a copy it cannot keep current.
+    static bool localFilesystem(const std::string& dir) {
+        struct statfs sf{};
+        if (::statfs(dir.c_str(), &sf) != 0) return false;
+        switch (static_cast<unsigned long>(sf.f_type)) {
+        case 0x6969UL:       // NFS
+        case 0x517BUL:       // SMB
+        case 0xFF534D42UL:   // CIFS
+        case 0xFE534D42UL:   // SMB2
+        case 0x65735546UL:   // FUSE (sshfs, rclone, ...)
+        case 0x00C36400UL:   // Ceph
+        case 0x01021997UL:   // 9p
+        case 0x0BD00BD0UL:   // Lustre
+        case 0x47504653UL:   // GPFS
+        case 0x5346414FUL:   // AFS
+        case 0x73757245UL:   // Coda
+        case 0x564CUL:       // NCP
+            return false;
+        default:
+            return true;
+        }
+    }
+
+    bool startLocked() {
+        fd_ = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        if (fd_ < 0) return false;
+        if (::pipe(wake_) != 0) { ::close(fd_); fd_ = -1; return false; }
+        ::fcntl(wake_[0], F_SETFD, FD_CLOEXEC);
+        ::fcntl(wake_[1], F_SETFD, FD_CLOEXEC);
+        thread_ = std::thread([this] { loop(); });
+        return true;
+    }
+
+    void dropLocked(const std::string& dir, bool tell) {
+        auto it = byDir_.find(dir);
+        if (it == byDir_.end()) return;
+        ::inotify_rm_watch(fd_, it->second);
+        byWd_.erase(it->second);
+        byDir_.erase(it);
+        order_.erase(std::remove(order_.begin(), order_.end(), dir),
+                     order_.end());
+        if (tell) emit(json{{"path", dir}, {"reset", true},
+                            {"unwatched", true}});
+    }
+
+    static void emit(json params) {
+        g_writer.enqueue(Lane::Interactive,
+                         dumpSafe(json{{"jsonrpc", "2.0"},
+                                       {"method", "fs.changed"},
+                                       {"params", std::move(params)}}));
+    }
+
+    void loop() {
+        // dir -> names changed in the current window; an empty set with
+        // `reset` means "re-read the whole thing".
+        std::map<std::string, std::unordered_set<std::string>> pending;
+        std::unordered_set<std::string> resets, gone;
+        bool overflow = false;
+        alignas(struct inotify_event) char buf[64 * 1024];
+        while (true) {
+            struct pollfd pf[2] = {{fd_, POLLIN, 0}, {wake_[0], POLLIN, 0}};
+            const bool holding = !pending.empty() || !resets.empty() ||
+                                 !gone.empty() || overflow;
+            // Idle: sleep until something happens. Holding: wait for
+            // the burst to go quiet, bounded by kMaxHoldMs overall.
+            auto holdStart = std::chrono::steady_clock::now();
+            int timeout = holding ? kQuietMs : -1;
+            int n = ::poll(pf, 2, timeout);
+            if (n < 0 && errno == EINTR) continue;
+            unsigned long barrier = 0;
+            if (pf[1].revents != 0) {
+                char wake[64];
+                (void)!::read(wake_[0], wake, sizeof(wake));
+                std::lock_guard<std::mutex> l(m_);
+                if (stopping_) return;
+                barrier = barrierAsked_;
+            }
+            bool flush = (n == 0) || barrier != 0;
+            // A barrier drains whatever is queued even if poll did not
+            // report it yet in this pass.
+            if ((n > 0 && (pf[0].revents & POLLIN) != 0) || barrier != 0) {
+                while (true) {
+                    const ssize_t r = ::read(fd_, buf, sizeof(buf));
+                    if (r <= 0) break;
+                    std::lock_guard<std::mutex> l(m_);
+                    for (char* p = buf; p < buf + r;) {
+                        auto* ev = reinterpret_cast<struct inotify_event*>(p);
+                        p += sizeof(struct inotify_event) + ev->len;
+                        if ((ev->mask & IN_Q_OVERFLOW) != 0) {
+                            overflow = true;
+                            continue;
+                        }
+                        auto it = byWd_.find(ev->wd);
+                        if (it == byWd_.end()) continue;
+                        const std::string& dir = it->second.dir;
+                        if ((ev->mask & (IN_DELETE_SELF | IN_MOVE_SELF |
+                                         IN_IGNORED)) != 0) {
+                            gone.insert(dir);
+                            continue;
+                        }
+                        if (ev->len == 0) continue;
+                        const std::string name(ev->name);
+                        // Our own atomic-write temp files come and go
+                        // inside one request; nobody needs to hear.
+                        if (name.rfind(".scrutiny-write-", 0) == 0) continue;
+                        auto& names = pending[dir];
+                        if (names.size() >= kMaxNamesPerNote)
+                            resets.insert(dir);
+                        else
+                            names.insert(name);
+                    }
+                }
+                if (!holdStartSet_) {
+                    firstEvent_ = holdStart;
+                    holdStartSet_ = true;
+                }
+                flush = barrier != 0 ||
+                        std::chrono::steady_clock::now() - firstEvent_ >=
+                            std::chrono::milliseconds(kMaxHoldMs);
+            }
+            struct BarrierDone {
+                DirWatcher* w; unsigned long n;
+                ~BarrierDone() {
+                    if (n == 0) return;
+                    { std::lock_guard<std::mutex> l(w->m_);
+                      w->barrierDone_ = std::max(w->barrierDone_, n); }
+                    w->barrierCv_.notify_all();
+                }
+            } barrierDone{this, flush ? barrier : 0};
+            if (!flush) continue;
+            holdStartSet_ = false;
+
+            if (overflow) {
+                // The kernel dropped events: nothing a client holds can
+                // be vouched for. Watches stay; copies must be re-read.
+                emit(json{{"all", true}, {"reset", true}});
+                overflow = false;
+                pending.clear();
+                resets.clear();
+            }
+            for (const auto& dir : gone) {
+                std::lock_guard<std::mutex> l(m_);
+                pending.erase(dir);
+                resets.erase(dir);
+                dropLocked(dir, true);
+            }
+            gone.clear();
+            const auto now = std::chrono::steady_clock::now();
+            for (auto& kv : pending) {
+                const std::string& dir = kv.first;
+                bool busy = false;
+                {
+                    std::lock_guard<std::mutex> l(m_);
+                    auto wdIt = byDir_.find(dir);
+                    if (wdIt == byDir_.end()) continue;   // dropped meanwhile
+                    auto& notes = byWd_[wdIt->second].notes;
+                    notes.push_back(now);
+                    while (!notes.empty() &&
+                           now - notes.front() >
+                               std::chrono::milliseconds(kBusyWindowMs))
+                        notes.pop_front();
+                    if (static_cast<int>(notes.size()) > kBusyNotes) {
+                        dropLocked(dir, true);
+                        busy = true;
+                    }
+                }
+                if (busy) continue;
+                if (resets.count(dir) != 0) {
+                    emit(json{{"path", dir}, {"reset", true}});
+                    continue;
+                }
+                json entries = json::array();
+                for (const auto& name : kv.second)
+                    entries.push_back(attributedEntry(dir, name));
+                emit(json{{"path", dir},
+                          {"entries", std::move(entries)},
+                          {"self", statJson(dir)}});
+            }
+            pending.clear();
+            resets.clear();
+        }
+    }
+
+    int fd_ = -1;
+    int wake_[2] = {-1, -1};
+    std::unordered_map<int, Watch> byWd_;
+    std::deque<std::string> order_;
+    std::thread thread_;
+    std::chrono::steady_clock::time_point firstEvent_{};
+    bool holdStartSet_ = false;
+    std::condition_variable barrierCv_;
+    unsigned long barrierAsked_ = 0;
+    unsigned long barrierDone_ = 0;
+#endif
+    std::mutex m_;
+    std::unordered_map<std::string, int> byDir_;
+    [[maybe_unused]] bool stopping_ = false;  // read only on Linux
+};
+
+DirWatcher g_dirWatcher;
+
+void fsBarrier() { g_dirWatcher.barrier(); }
 
 // fs.listDirectory { path } -> { path, entries: [{ name, isDir }] }
 // Read-only listing for the remote-clone directory browser. Relative
@@ -1685,6 +2618,10 @@ void handleFsListDirectory(const Responder& rsp, const json& params) {
         return;
     }
     path = *canon;
+    // Watch first, read second: a change landing between the two is
+    // then delivered as fs.changed instead of falling in the gap.
+    const bool wantWatch = params.value("watch", false);
+    const bool watching = wantWatch && g_dirWatcher.watch(path);
     std::error_code ec;
     std::filesystem::directory_iterator it(path, ec), end;
     if (ec) {
@@ -1699,35 +2636,46 @@ void handleFsListDirectory(const Responder& rsp, const json& params) {
         bool isDir = it->is_directory(dec);  // follows symlinks
         kids.emplace_back(it->path().filename().string(), isDir);
     }
+    // A client that only wants to know about ONE name in here asks for
+    // the listing because the listing answers its next ten questions
+    // too -- but not at any price. Past `maxEntries` it gets the count
+    // instead and asks about that one name directly; a directory of
+    // fifty thousand files must not become megabytes on a slow link
+    // because somebody ran file-exists-p in it.
+    if (auto it = params.find("maxEntries");
+        it != params.end() && it->is_number_integer() &&
+        kids.size() > static_cast<size_t>(std::max(0, it->get<int>()))) {
+        if (watching) g_dirWatcher.forget(path);
+        json big{{"path", path}, {"tooLarge", true}, {"count", kids.size()}};
+        if (wantAttributes) big["self"] = statJson(path);
+        if (wantWatch) big["watching"] = false;
+        rsp.result(big);
+        return;
+    }
     std::sort(kids.begin(), kids.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
     json entries = json::array();
     for (const auto& k : kids) {
-        json entry{{"name", k.first}, {"isDir", k.second}};
         if (wantAttributes) {
             // Attributes for the whole listing in one reply: dired and
             // minibuffer completion would otherwise stat every entry
             // individually, which is exactly the round-trip storm this
             // method exists to avoid.
-            const std::string child = path + "/" + k.first;
-            json st = statJson(child);
-            for (const char* key : {"size", "mtime", "mode", "isSymlink",
-                                    "symlinkTarget", "isRegular", "uid",
-                                    "gid", "readable", "writable"}) {
-                if (st.contains(key)) entry[key] = st[key];
-            }
-            // The resolved path, so a client can answer file-truename
-            // from the listing instead of stat'ing every entry again.
-            char real[4096];
-            entry["path"] = ::realpath(child.c_str(), real) != nullptr
-                                ? std::string(real)
-                                : child;
+            json entry = attributedEntry(path, k.first);
+            // Vanished between readdir and stat: it is not there.
+            if (entry.value("deleted", false)) continue;
+            entries.push_back(std::move(entry));
+        } else {
+            entries.push_back(json{{"name", k.first}, {"isDir", k.second}});
         }
-        entries.push_back(std::move(entry));
     }
-    rsp.result(json{{"path", path}, {"entries", entries}});
+    json out{{"path", path}, {"entries", entries}};
+    // The directory's own attributes ride along: the next thing a
+    // client asks after listing a directory is about the directory.
+    if (wantAttributes) out["self"] = statJson(path);
+    if (wantWatch) out["watching"] = watching;
+    rsp.result(out);
 }
-
 // ---- fs metadata and writes ------------------------------------------
 //
 // These exist so an Emacs file-name handler can serve find-file, save,
@@ -1843,6 +2791,16 @@ bool writesPermitted(const Responder& rsp, const char* method) {
 // Emacs `file-attributes` list. mtime is seconds since the epoch;
 // `mode` is the permission bits only, so a client never has to know
 // the platform's S_IF* encoding.
+long long mtimeNanos(const struct stat& st) {
+#if defined(__APPLE__)
+    return static_cast<long long>(st.st_mtimespec.tv_sec) * 1000000000LL +
+           st.st_mtimespec.tv_nsec;
+#else
+    return static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL +
+           st.st_mtim.tv_nsec;
+#endif
+}
+
 json statJson(const std::string& path) {
     struct stat st{};
     struct stat lst{};
@@ -1875,6 +2833,10 @@ json statJson(const std::string& path) {
                 {"symlinkTarget", target},
                 {"size", static_cast<long long>(st.st_size)},
                 {"mtime", static_cast<long long>(st.st_mtime)},
+                // Whole seconds cannot tell two saves in the same second
+                // apart, and a conditional write (fs.writeFile ifMtimeNs)
+                // is only as good as the timestamp it compares.
+                {"mtimeNs", mtimeNanos(st)},
                 {"mode", static_cast<int>(st.st_mode & 07777)},
                 {"uid", static_cast<int>(st.st_uid)},
                 {"gid", static_cast<int>(st.st_gid)},
@@ -2026,7 +2988,33 @@ void handleFsWriteFile(const Responder& rsp, const json& params) {
     // explicit mode, else fall back to the process umask's 0644.
     mode_t mode = 0644;
     struct stat st{};
-    if (::stat(canon->c_str(), &st) == 0) mode = st.st_mode & 07777;
+    const bool existed = (::stat(canon->c_str(), &st) == 0);
+    if (existed) mode = st.st_mode & 07777;
+
+    // Conditional write: "replace the file I read, not whatever is
+    // there now". The client names the mtime it last saw; if the file
+    // has moved on (or appeared, or gone) the write is not installed
+    // and the answer says so -- as data, because a conflict is a
+    // question for the user, not a failure of the request. This is
+    // what lets a client trust its cached attributes when saving
+    // instead of spending a round trip re-checking them first.
+    // `ifMtimeNs: 0` means "only if it does not exist".
+    if (auto it = params.find("ifMtimeNs");
+        it != params.end() && it->is_number_integer()) {
+        const long long expected = it->get<long long>();
+        const long long actual = existed ? mtimeNanos(st) : 0;
+        if (expected != actual) {
+            ::unlink(tmp.c_str());
+            json cur = existed ? statJson(*canon) : json{{"exists", false}};
+            rsp.result(json{{"ok", false},
+                            {"conflict", true},
+                            {"exists", existed},
+                            {"size", cur.value("size", 0LL)},
+                            {"mtime", cur.value("mtime", 0LL)},
+                            {"mtimeNs", cur.value("mtimeNs", 0LL)}});
+            return;
+        }
+    }
     if (auto it = params.find("mode");
         it != params.end() && it->is_number_integer())
         mode = static_cast<mode_t>(it->get<int>() & 07777);
@@ -2040,9 +3028,17 @@ void handleFsWriteFile(const Responder& rsp, const json& params) {
         return;
     }
     json out = statJson(*canon);
+    fsBarrier();
     rsp.result(json{{"ok", true},
                     {"size", out.value("size", 0LL)},
-                    {"mtime", out.value("mtime", 0LL)}});
+                    {"mtime", out.value("mtime", 0LL)},
+                    {"mtimeNs", out.value("mtimeNs", 0LL)},
+                    {"mode", out.value("mode", 0)},
+                    // The file as a directory entry, exactly as a
+                    // listing would show it: a client keeping a copy
+                    // of the directory files this and is current,
+                    // without waiting to be told by fs.changed.
+                    {"entry", attributedEntry(dir, canon->substr(slash + 1))}});
 }
 
 // fs.mkdir { path, parents? } -> { ok }
@@ -2065,6 +3061,7 @@ void handleFsMkdir(const Responder& rsp, const json& params) {
                   "could not create '" + *canon + "': " + ec.message());
         return;
     }
+    fsBarrier();
     rsp.result(json{{"ok", true}});
 }
 
@@ -2091,6 +3088,7 @@ void handleFsDelete(const Responder& rsp, const json& params) {
                   "could not delete '" + *canon + "': " + ec.message());
         return;
     }
+    fsBarrier();
     rsp.result(json{{"ok", true},
                     {"removed", static_cast<long long>(removed)}});
 }
@@ -2115,6 +3113,7 @@ void handleFsRename(const Responder& rsp, const json& params) {
                                  *canonTo + "': " + ec.message());
         return;
     }
+    fsBarrier();
     rsp.result(json{{"ok", true}});
 }
 
@@ -2142,6 +3141,7 @@ void handleFsCopy(const Responder& rsp, const json& params) {
                                  *canonTo + "': " + ec.message());
         return;
     }
+    fsBarrier();
     rsp.result(json{{"ok", true}});
 }
 
@@ -2165,6 +3165,7 @@ void handleFsChmod(const Responder& rsp, const json& params) {
                                  std::strerror(errno));
         return;
     }
+    fsBarrier();
     rsp.result(json{{"ok", true}});
 }
 
@@ -2643,6 +3644,17 @@ struct Tunnel {
     std::condition_variable cv;
     std::deque<std::string> outq;
     size_t outqBytes = 0;
+    // Set by lsp.tunnelSend{eof}: close the process's stdin once what
+    // is queued has been written. A language server never needs it; a
+    // `git apply` reading a patch does not finish without it.
+    std::atomic<bool> eof{false};
+    std::atomic<bool> stdinGone{false};  // process exited / closed its stdin
+    // A process started by git.spawn rather than lsp.tunnelOpen: it
+    // leads its own process group (so a signal can be aimed at the
+    // editor it started, and at nothing else), and it is forgotten
+    // when it exits rather than when the client closes it.
+    bool isGit = false;
+    std::shared_ptr<void> keepAlive;       // e.g. its credential broker
 };
 
 std::mutex g_tunMu;
@@ -2658,8 +3670,12 @@ void tunnelStdinLoop(std::shared_ptr<Tunnel> t) {
         std::string chunk;
         {
             std::unique_lock<std::mutex> l(t->mu);
-            t->cv.wait(l, [&] { return t->closing.load() || !t->outq.empty(); });
-            if (t->outq.empty()) break;  // closing and drained
+            t->cv.wait(l, [&] {
+                return t->closing.load() || t->eof.load() ||
+                       t->stdinGone.load() || !t->outq.empty();
+            });
+            // closing or end-of-input, drained -- or nobody to write to
+            if (t->outq.empty() || t->stdinGone.load()) break;
             chunk = std::move(t->outq.front());
             t->outq.pop_front();
             t->outqBytes -= chunk.size();
@@ -2673,7 +3689,13 @@ void tunnelStdinLoop(std::shared_ptr<Tunnel> t) {
             if (w <= 0) { failed = true; break; }
             off += static_cast<size_t>(w);
         }
-        if (failed) break;  // server stdin gone; reader will see EOF too
+        if (failed) {
+            // Its stdin is gone. Whoever is waiting for room in the
+            // queue will never get any; let them go.
+            t->stdinGone.store(true);
+            t->cv.notify_all();
+            break;
+        }
     }
     ::close(t->stdinFd);
     t->stdinDone.store(true);
@@ -2681,6 +3703,8 @@ void tunnelStdinLoop(std::shared_ptr<Tunnel> t) {
 
 void tunnelStdoutLoop(std::shared_ptr<Tunnel> t) {
     std::vector<char> buf(kTunnelChunk);
+    bool leaderExited = false;
+    int leaderStatus = 0;
     while (true) {
         // Back-pressure: don't pull from a chatty server while the
         // transport is behind.
@@ -2688,21 +3712,51 @@ void tunnelStdoutLoop(std::shared_ptr<Tunnel> t) {
                !t->closing.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
+        if (t->isGit && !leaderExited) {
+            // A command is over when IT exits, not when the last
+            // process holding its output pipe does. A hook or an
+            // editor that leaves something running in the background
+            // must not keep the client waiting on a commit that has
+            // already been made -- so watch the process as well as
+            // the pipe, and once it is gone take only what is already
+            // written.
+            struct pollfd pf{t->stdoutFd, POLLIN, 0};
+            const int ready = ::poll(&pf, 1, 100);
+            if (ready < 0 && errno == EINTR) continue;
+            // Checked every time round, not only when the pipe is
+            // quiet: something chatty left running in the background
+            // must not be able to postpone this indefinitely.
+            if (::waitpid(t->pid, &leaderStatus, WNOHANG) == t->pid) {
+                leaderExited = true;
+                // From here the pid may be reused; nothing may signal
+                // it on this command's behalf any more.
+                t->reaped.store(true);
+                ::fcntl(t->stdoutFd, F_SETFL,
+                        ::fcntl(t->stdoutFd, F_GETFL) | O_NONBLOCK);
+            }
+            if (ready == 0) continue;
+        }
         ssize_t n = ::read(t->stdoutFd, buf.data(), buf.size());
-        if (n <= 0) break;
+        if (n <= 0) break;   // EOF -- or, after the leader exited, drained
+        std::optional<std::string> packed;
+        if (g_deflate.load() && static_cast<size_t>(n) >= kDeflateMinTunnel)
+            packed = deflateBytes(buf.data(), static_cast<size_t>(n));
         json note = {{"jsonrpc", "2.0"},
                      {"method", "lsp.tunnelRecv"},
                      {"params",
                       {{"tunnelId", t->id},
-                       {"data", base64Encode(std::string(buf.data(),
-                                             static_cast<size_t>(n)))}}}};
+                       {"data", base64Encode(
+                                    packed ? *packed
+                                           : std::string(buf.data(),
+                                                         static_cast<size_t>(n)))}}}};
+        if (packed) note["params"]["z"] = true;
         g_writer.enqueue(Lane::Interactive, dumpSafe(note));
     }
     ::close(t->stdoutFd);
-    int status = 0;
+    int status = leaderStatus;
     int exitCode = -1;
     std::string reason = "exit";
-    if (::waitpid(t->pid, &status, 0) == t->pid) {
+    if (leaderExited || ::waitpid(t->pid, &status, 0) == t->pid) {
         if (WIFEXITED(status)) {
             exitCode = WEXITSTATUS(status);
         } else if (WIFSIGNALED(status)) {
@@ -2711,6 +3765,27 @@ void tunnelStdoutLoop(std::shared_ptr<Tunnel> t) {
         }
     }
     t->reaped.store(true);
+    // The process is gone: nothing more will be written to it. Release
+    // the stdin thread (otherwise it waits forever for input that has
+    // nowhere to go, and this tunnel is never freed) and anyone blocked
+    // in tunnelSend waiting for room in its queue -- that is the
+    // connection's reader thread, and it would never come back.
+    // (Not `closing`: that would make a send racing with this exit
+    // answer "unknown tunnel" ahead of the real exit status below.)
+    t->stdinGone.store(true);
+    t->cv.notify_all();
+    if (t->isGit) {
+        // Whatever the command did to the repository is announced
+        // before its exit is: the client's next move is a refresh.
+        fsBarrier();
+        // Nobody closes a finished command; forget it here.
+        std::lock_guard<std::mutex> g(g_tunMu);
+        auto it = g_tunnels.find(t->id);
+        if (it != g_tunnels.end()) {
+            g_tunnelGraveyard.push_back(it->second);
+            g_tunnels.erase(it);
+        }
+    }
     json note = {{"jsonrpc", "2.0"},
                  {"method", "lsp.tunnelClosed"},
                  {"params", {{"tunnelId", t->id},
@@ -2777,7 +3852,7 @@ void handleTunnelOpen(const Responder& rsp, const json& p) {
     // ends are CLOEXEC immediately so concurrently forked children
     // (git, askpass) can't hold a tunnel pipe open past our close.
     int inPipe[2] = {-1, -1}, outPipe[2] = {-1, -1};
-    if (::pipe(inPipe) != 0 || ::pipe(outPipe) != 0) {
+    if (cloexecPipe(inPipe) != 0 || cloexecPipe(outPipe) != 0) {
         rsp.error(kInternal, "pipe() failed: " +
                                  std::string(std::strerror(errno)));
         return;
@@ -2836,9 +3911,9 @@ void handleTunnelOpen(const Responder& rsp, const json& p) {
 void tunnelSend(const json& p) {
     auto idIt = p.find("tunnelId");
     auto dIt = p.find("data");
-    if (idIt == p.end() || !idIt->is_string() || dIt == p.end() ||
-        !dIt->is_string())
-        return;
+    const bool eof = p.value("eof", false);
+    if (idIt == p.end() || !idIt->is_string()) return;
+    if (!eof && (dIt == p.end() || !dIt->is_string())) return;
     const std::string id = idIt->get<std::string>();
     std::shared_ptr<Tunnel> t;
     {
@@ -2855,11 +3930,17 @@ void tunnelSend(const json& p) {
         g_writer.enqueue(Lane::Interactive, dumpSafe(note));
         return;
     }
-    auto bytes = base64Decode(dIt->get<std::string>());
+    std::optional<std::string> bytes = std::string();
+    if (dIt != p.end() && dIt->is_string())
+        bytes = base64Decode(dIt->get<std::string>());
     if (!bytes) {
         if (logOn(LogLevel::Warn))
             logWrite(LogLevel::Warn,
                      "lsp.tunnelSend id=" + id + " invalid base64; dropped");
+        return;
+    }
+    if (bytes->empty()) {
+        if (eof) { t->eof.store(true); t->cv.notify_all(); }
         return;
     }
     {
@@ -2868,11 +3949,13 @@ void tunnelSend(const json& p) {
         // it back-pressures the whole connection rather than letting a
         // runaway client balloon agent memory.
         t->cv.wait(l, [&] {
-            return t->closing.load() || t->outqBytes < kTunnelOutqMax;
+            return t->closing.load() || t->stdinGone.load() ||
+                   t->outqBytes < kTunnelOutqMax;
         });
-        if (t->closing.load()) return;
+        if (t->closing.load() || t->stdinGone.load()) return;
         t->outqBytes += bytes->size();
         t->outq.push_back(std::move(*bytes));
+        if (eof) t->eof.store(true);
     }
     t->cv.notify_all();
 }
@@ -2893,7 +3976,10 @@ void closeTunnel(const std::string& id, bool force) {
     }
     t->closing.store(true);
     t->cv.notify_all();
-    if (!t->reaped.load()) ::kill(t->pid, force ? SIGKILL : SIGTERM);
+    // A git process leads a group: its editor, its hooks and its ssh go
+    // with it.
+    if (!t->reaped.load())
+        ::kill(t->isGit ? -t->pid : t->pid, force ? SIGKILL : SIGTERM);
     if (logOn(LogLevel::Info))
         logWrite(LogLevel::Info, "lsp.tunnelClose id=" + id +
                  (force ? " (forced)" : ""));
@@ -2918,14 +4004,27 @@ void shutdownTunnels() {
         for (auto& kv : g_tunnels) ids.push_back(kv.first);
     }
     for (const auto& id : ids) closeTunnel(id, true);
-    std::lock_guard<std::mutex> g(g_tunMu);
-    for (auto& t : g_tunnelGraveyard) {
-        if (!t->reaped.load()) ::kill(t->pid, SIGKILL);
+    // Join with g_tunMu RELEASED. A tunnel's reader thread takes that
+    // mutex on its way out (it moves its tunnel to the graveyard), so
+    // joining it under the lock deadlocked: the agent then never
+    // exited after stdin EOF while a git command was still running --
+    // a commit waiting on its editor when the client's link dropped
+    // was enough to leave an agent behind on the host for good.
+    std::vector<std::shared_ptr<Tunnel>> dead;
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        dead = g_tunnelGraveyard;
+    }
+    for (auto& t : dead) {
+        // The whole group for a git command: its editor and hooks hold
+        // the output pipe open and would keep the reader waiting.
+        if (!t->reaped.load()) ::kill(t->isGit ? -t->pid : t->pid, SIGKILL);
         t->closing.store(true);
         t->cv.notify_all();
         if (t->stdinWriter.joinable()) t->stdinWriter.join();
         if (t->stdoutReader.joinable()) t->stdoutReader.join();
     }
+    std::lock_guard<std::mutex> g(g_tunMu);
     g_tunnelGraveyard.clear();
 }
 
@@ -3357,6 +4456,200 @@ GitRun runGitBrokered(const std::vector<std::string>& args,
 
 // git.clone { fullName, cloneURL, installDir, authOpId }
 //   -> { localPath, cloneURL, lastFetched }
+// ---- git.spawn: a git command as a live process ------------------------
+//
+// git.exec runs a command to completion and returns what it printed.
+// That is the wrong shape for the commands a person watches or takes
+// part in: a push that reports progress and may ask for a password, a
+// commit that stops to have its message written, a patch fed in on
+// standard input. Those need a process -- bytes in, bytes out, a
+// status at the end.
+//
+// The agent already has that, for language servers: a tunnel. So
+// git.spawn starts git and returns a tunnel to it, and everything a
+// tunnel does applies unchanged -- lsp.tunnelSend writes to its stdin
+// (with `eof: true` to close it), lsp.tunnelRecv carries what it
+// prints (stdout and stderr together, in the order written, as a
+// terminal would show them), lsp.tunnelClosed reports how it ended,
+// lsp.tunnelClose kills it.
+//
+// Policy is git.exec's, exactly: the same subcommand allowlist, the
+// same argument scan, the same environment allowlist, the same
+// sandbox for the directory it runs in.
+//
+// git.spawn { repoPath, args[], env? } -> { tunnelId, pid }
+void handleGitSpawn(const Responder& rsp, const json& params) {
+    std::string repoPath;
+    if (!reqStr(rsp, params, "repoPath", "git.spawn", repoPath)) return;
+    auto it = params.find("args");
+    if (it == params.end() || !it->is_array()) {
+        rsp.error(kInvalidRequest, "git.spawn requires array param 'args'");
+        return;
+    }
+    std::vector<std::string> args;
+    for (const auto& arg : *it) {
+        if (!arg.is_string()) {
+            rsp.error(kInvalidRequest,
+                      "git.spawn 'args' must contain only strings");
+            return;
+        }
+        args.push_back(arg.get<std::string>());
+    }
+    std::string subcommand, err;
+    if (!gitExecPermitted(args, subcommand, err)) {
+        rsp.error(kPermissionDenied, err);
+        return;
+    }
+    {
+        int code = 0;
+        std::string why;
+        auto canonRepo = resolveAndAuthorize(repoPath, code, why);
+        if (!canonRepo) { rsp.error(code, why); return; }
+        repoPath = *canonRepo;
+    }
+    std::vector<std::string> env;
+    if (!gitEnvFromParams(rsp, params, repoPath, env)) return;
+    env.push_back("GIT_PAGER=cat");
+    env.push_back("GIT_TERMINAL_PROMPT=0");
+
+    // Anything that may authenticate gets the credential broker: git's
+    // prompt, and ssh's, become cred.request notifications and are
+    // answered by the person at the client. There is no terminal here
+    // for them to appear on.
+    std::shared_ptr<CredBroker> broker;
+    if (gitExecNeedsCredentials(subcommand)) {
+        broker = std::shared_ptr<CredBroker>(new CredBroker(),
+                                             [](CredBroker* b) {
+                                                 b->stop();
+                                                 delete b;
+                                             });
+        if (broker->start("git.spawn", repoPath)) {
+            for (const auto& kv : credEnv(broker->sockPath)) env.push_back(kv);
+            env.push_back("SSH_ASKPASS=" + g_selfExe);
+            env.push_back("SSH_ASKPASS_REQUIRE=force");
+        } else {
+            broker.reset();
+        }
+    }
+
+    int inPipe[2] = {-1, -1}, outPipe[2] = {-1, -1};
+    if (cloexecPipe(inPipe) != 0 || cloexecPipe(outPipe) != 0) {
+        rsp.error(kInternal, "pipe() failed: " +
+                                 std::string(std::strerror(errno)));
+        return;
+    }
+    for (int fd : {inPipe[0], inPipe[1], outPipe[0], outPipe[1]})
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        for (int fd : {inPipe[0], inPipe[1], outPipe[0], outPipe[1]})
+            ::close(fd);
+        rsp.error(kInternal, "fork() failed: " +
+                                 std::string(std::strerror(errno)));
+        return;
+    }
+    if (pid == 0) {
+        // Its own process group, so that a signal for "this command and
+        // what it started" reaches exactly that.
+        ::setpgid(0, 0);
+        ::dup2(inPipe[0], STDIN_FILENO);
+        ::dup2(outPipe[1], STDOUT_FILENO);
+        ::dup2(outPipe[1], STDERR_FILENO);
+        if (::chdir(repoPath.c_str()) != 0) _exit(126);
+        for (const auto& kv : env) {
+            auto eq = kv.find('=');
+            if (eq == std::string::npos) { ::unsetenv(kv.c_str()); continue; }
+            ::setenv(kv.substr(0, eq).c_str(), kv.substr(eq + 1).c_str(), 1);
+        }
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>("git"));
+        argv.push_back(const_cast<char*>("--no-pager"));
+        for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        ::execvp("git", argv.data());
+        _exit(127);
+    }
+    ::setpgid(pid, pid);   // also from here: no window before the child does
+    ::close(inPipe[0]);
+    ::close(outPipe[1]);
+
+    const std::string id = "t-" + std::to_string(g_tunSeq.fetch_add(1) + 1);
+    auto t = std::make_shared<Tunnel>();
+    t->id = id;
+    t->pid = pid;
+    t->isGit = true;
+    t->keepAlive = broker;
+    t->stdinFd = inPipe[1];
+    t->stdoutFd = outPipe[0];
+    {
+        // Registered before the threads start: a command that exits at
+        // once must find itself in the table to remove itself from.
+        std::lock_guard<std::mutex> g(g_tunMu);
+        g_tunnels.emplace(id, t);
+        reapTunnelGraveyardLocked();
+        // ...and started under the lock, so nothing that finds the
+        // tunnel in the table can see its thread handles half-made.
+        t->stdinWriter = std::thread(tunnelStdinLoop, t);
+        t->stdoutReader = std::thread(tunnelStdoutLoop, t);
+    }
+    if (logOn(LogLevel::Info))
+        logWrite(LogLevel::Info, "git.spawn id=" + id + " " + subcommand +
+                 " in " + repoPath + " pid=" + std::to_string(pid));
+    rsp.result(json{{"tunnelId", id}, {"pid", static_cast<int>(pid)}});
+}
+
+// git.signal { pid, signal } -> { ok }
+//
+// Deliver a signal to a process that a git.spawn command started --
+// in practice the placeholder editor that is holding a commit open
+// until the client has finished writing its message. `pid` must
+// belong to the process group of a live git.spawn command; this is
+// not a way to signal anything else on the host.
+void handleGitSignal(const Responder& rsp, const json& params) {
+    auto pit = params.find("pid");
+    std::string name;
+    if (pit == params.end() || !pit->is_number_integer() ||
+        !reqStr(rsp, params, "signal", "git.signal", name)) {
+        if (pit == params.end() || !pit->is_number_integer())
+            rsp.error(kInvalidRequest, "git.signal requires int param 'pid'");
+        return;
+    }
+    const pid_t pid = static_cast<pid_t>(pit->get<long long>());
+    static const std::pair<const char*, int> kSignals[] = {
+        {"USR1", SIGUSR1}, {"USR2", SIGUSR2}, {"TERM", SIGTERM},
+        {"INT", SIGINT},   {"HUP", SIGHUP},   {"KILL", SIGKILL}};
+    int signo = 0;
+    if (name.rfind("SIG", 0) == 0) name = name.substr(3);
+    for (const auto& kv : kSignals)
+        if (name == kv.first) signo = kv.second;
+    if (signo == 0) {
+        rsp.error(kInvalidRequest, "git.signal: unsupported signal '" +
+                                       name + "'");
+        return;
+    }
+    if (pid <= 1) {
+        rsp.error(kPermissionDenied, "git.signal: not a process of ours");
+        return;
+    }
+    const pid_t group = ::getpgid(pid);
+    bool ours = false;
+    {
+        std::lock_guard<std::mutex> g(g_tunMu);
+        for (const auto& kv : g_tunnels)
+            if (kv.second->isGit && !kv.second->reaped.load() &&
+                kv.second->pid == group)
+                ours = true;
+    }
+    if (!ours) {
+        rsp.error(kPermissionDenied,
+                  "git.signal: process " + std::to_string(pid) +
+                  " was not started by a git.spawn command");
+        return;
+    }
+    rsp.result(json{{"ok", ::kill(pid, signo) == 0}});
+}
+
 void handleGitClone(const Responder& rsp, const json& p) {
     std::string fullName, cloneURL, installDir, authOpId;
     if (!reqStr(rsp, p, "fullName", "git.clone", fullName)) return;
@@ -3714,6 +5007,47 @@ void handleMetaStat(const Responder& rsp, const json&) {
 //     fileSystemAccess: { absolutePathsAllowed, relativeAnchoredUnderHome },
 //     languageServers: { binaries: [...] },
 //     network: "stdio-only-and-git-via-transport" }
+std::string remoteHome() {
+    const char* h = ::getenv("HOME");
+    return std::string(h != nullptr ? h : "");
+}
+
+// Behaviors a client can rely on beyond the method list. `capabilities`
+// is contractually the list of METHODS; these name optional parameters
+// and notifications, which a method name cannot express.
+const char* const kFeatures[] = {
+    "hello.facts",             // this block
+#if defined(__linux__)
+    // The watcher is inotify. Elsewhere every watch request is declined
+    // (`watching: false`) and nothing is ever announced, so the feature
+    // is not claimed: a client that sees it keeps listings forever.
+    "fs.watch",                // fs.listDirectory{watch} + fs.changed
+    "fs.changed.ordered",      // changes are announced before the reply
+                               // to the request that made them
+#endif
+    "fs.listDirectory.self",   // the directory's own attributes
+    "fs.mtimeNs",              // nanosecond mtimes everywhere
+    "fs.writeFile.ifMtimeNs",  // conditional write
+    "fs.listDirectory.maxEntries",
+    "fs.readFile.maxBytes",
+    "git.exec.stdin",          // git.exec{stdinBase64}
+    "git.exec.env",            // git.exec{env}
+    "rpc.deflate",             // meta.hello{encodings:["deflate"]}
+    "lsp.tunnelSend.eof",      // half-close a tunnel's stdin
+};
+
+void addHelloFacts(json& hello) {
+    hello["fileSystemAccess"] = json{{"allowedRoots", g_allowedRoots},
+                                     {"allowedRootsAsGiven", g_allowedRootsAsGiven},
+                                     {"writable", g_allowWrite},
+                                     {"home", remoteHome()}};
+    hello["config"] = json{{"loaded", g_configLoaded},
+                           {"unreadable", g_configUnreadable}};
+    json features = json::array();
+    for (const char* f : kFeatures) features.push_back(f);
+    hello["features"] = features;
+}
+
 void handleMetaCapabilities(const Responder& rsp, const json&) {
     // GRCLanguage in GitReviewCore.h goes UNKNOWN(0) -> SWIFT(8); we
     // skip UNKNOWN. Hardcoded bound mirrors the enum to avoid an
@@ -3738,14 +5072,14 @@ void handleMetaCapabilities(const Responder& rsp, const json&) {
             // then show what this agent can reach without guessing at
             // the bootstrap line.
             {"allowedRoots", g_allowedRoots},
+            // Spellings of the same roots before symlink resolution,
+            // where that changed them (see g_allowedRootsAsGiven).
+            {"allowedRootsAsGiven", g_allowedRootsAsGiven},
             {"writable", g_allowWrite},
             // The remote $HOME. A client needs it to expand "~" and to
             // abbreviate names, and cannot get it from fs.listDirectory
             // when $HOME is not itself inside the allowed roots.
-            {"home", []() {
-                 const char* h = ::getenv("HOME");
-                 return std::string(h != nullptr ? h : "");
-             }()},
+            {"home", remoteHome()},
             {"description",
              "fs.readFile and fs.listDirectory resolve symlinks, then "
              "require the canonical path to lie inside a configured "
@@ -3758,6 +5092,11 @@ void handleMetaCapabilities(const Responder& rsp, const json&) {
              "The agent spawns language-server binaries by absolute path "
              "from grc_language_server_path(); each speaks LSP over stdio "
              "to the agent and has no separate network surface."}}},
+        // Which config files this process read, and which it was told
+        // to read but could not. The second list being non-empty means
+        // the agent is running on defaults the operator did not choose.
+        {"config", json{{"loaded", g_configLoaded},
+                        {"unreadable", g_configUnreadable}}},
         {"network", "no outbound sockets opened by the agent itself"},
         {"selftestMethod", "fs.selftest"}});
 }
@@ -3906,6 +5245,10 @@ void dispatch(const std::string& method, const Responder& rsp, const json& param
         handleTunnelOpen(rsp, params);
     } else if (method == "lsp.tunnelClose") {
         handleTunnelClose(rsp, params);
+    } else if (method == "git.spawn") {
+        handleGitSpawn(rsp, params);
+    } else if (method == "git.signal") {
+        handleGitSignal(rsp, params);
     } else if (method == "meta.debug") {
         handleDebug(rsp, params);
     } else if (method == "meta.stat") {
@@ -4190,7 +5533,7 @@ struct StartupOptions {
 };
 
 bool optionIsBoolean(const std::string& key) {
-    return key == "allow-write";
+    return key == "allow-write" || key == "git-exec-editor";
 }
 
 // Apply one setting. Returns false with a reason for anything unknown;
@@ -4206,6 +5549,10 @@ bool applyOption(const std::string& key, const std::string& value,
         return true;
     }
     if (key == "git-exec") { g_gitExecAllowed.push_back(value); return true; }
+    if (key == "git-exec-editor") {
+        g_gitExecEditors = !(value == "false" || value == "no" || value == "0");
+        return true;
+    }
     if (key == "git-exec-config") {
         g_gitExecConfigKeys.push_back(asciiLower(value));
         return true;
@@ -4214,10 +5561,12 @@ bool applyOption(const std::string& key, const std::string& value,
         if (value == "read-only" || value == "magit") {
             for (const char* sub : kGitExecReadOnly)
                 g_gitExecAllowed.emplace_back(sub);
+            g_gitExecReadForms = true;
         }
         if (value == "magit") {
             for (const char* sub : kGitExecMagit)
                 g_gitExecAllowed.emplace_back(sub);
+            g_gitExecEditors = true;
         }
         if (value != "read-only" && value != "magit") {
             err = "unknown git-exec-preset '" + value +
@@ -4243,6 +5592,7 @@ bool applyConfigFile(const std::string& path, StartupOptions& opts) {
     if (!in) {
         std::fprintf(stderr, "scrutiny-agent: cannot read config %s\n",
                      resolved.c_str());
+        g_configUnreadable.push_back(resolved);
         return true;   // not fatal: the exec line may carry everything
     }
     auto trim = [](std::string& text) {
@@ -4273,6 +5623,7 @@ bool applyConfigFile(const std::string& path, StartupOptions& opts) {
         }
     }
     std::fprintf(stderr, "scrutiny-agent: config: %s\n", resolved.c_str());
+    g_configLoaded.push_back(resolved);
     return true;
 }
 
@@ -4377,10 +5728,15 @@ int main(int argc, char** argv) {
     {
         std::vector<std::string> roots;
         for (const auto& raw : rawAllowedRoots) {
-            const std::string anchored = resolveRoot(raw);
+            std::string anchored = resolveRoot(raw);
+            while (anchored.size() > 1 && anchored.back() == '/') anchored.pop_back();
             char real[4096];
             if (::realpath(anchored.c_str(), real) != nullptr) {
                 roots.emplace_back(real);
+                if (anchored != real &&
+                    std::find(g_allowedRootsAsGiven.begin(), g_allowedRootsAsGiven.end(),
+                              anchored) == g_allowedRootsAsGiven.end())
+                    g_allowedRootsAsGiven.push_back(anchored);
             } else {
                 std::fprintf(stderr,
                     "scrutiny-agent: --allow-root %s does not resolve "
@@ -4526,6 +5882,7 @@ int main(int argc, char** argv) {
     // Kill + join every LSP tunnel (their reader threads enqueue final
     // lsp.tunnelClosed frames, so this must precede the writer stop).
     shutdownTunnels();
+    g_dirWatcher.stop();
     g_writer.stop();
     return 0;
 }

@@ -16,6 +16,7 @@ fails a test instead of hanging the run. stderr is drained by a thread
 buffer fills) and kept for assertions and failure output.
 """
 import base64
+import zlib
 import json
 import os
 import subprocess
@@ -187,11 +188,13 @@ class Agent:
 
     # -- lifecycle -------------------------------------------------------
     def handshake(self, client_version="pytest", versions=(1,),
-                  frame_cap=None, timeout=DEFAULT_TIMEOUT):
+                  frame_cap=None, timeout=DEFAULT_TIMEOUT, encodings=None):
         params = {"clientVersion": client_version,
                   "supportedProtocolVersions": list(versions)}
         if frame_cap is not None:
             params["frameCap"] = frame_cap
+        if encodings is not None:
+            params["encodings"] = list(encodings)
         self.hello = self.call("meta.hello", params, timeout=timeout)
         return self.hello
 
@@ -352,7 +355,10 @@ class Agent:
         elif method == "lsp.tunnelRecv":
             tunnel = self._tunnels.get(params.get("tunnelId"))
             if tunnel is not None:
-                tunnel._feed(base64.b64decode(params["data"]))
+                data = base64.b64decode(params["data"])
+                if params.get("z") is True:
+                    data = zlib.decompress(data)
+                tunnel._feed(data)
         elif method == "lsp.tunnelClosed":
             tunnel = self._tunnels.get(params.get("tunnelId"))
             if tunnel is not None:
@@ -366,7 +372,10 @@ class Agent:
                 parts = self._chunks.pop(msg_id, {})
             blob = "".join(parts[seq] for seq in sorted(parts))
             try:
-                message = json.loads(base64.b64decode(blob))
+                raw = base64.b64decode(blob)
+                if result.get("encoding") == "deflate":
+                    raw = zlib.decompress(raw)
+                message = json.loads(raw)
             except (ValueError, TypeError) as exc:
                 message = {"id": msg_id,
                            "error": {"code": -1,
@@ -501,7 +510,10 @@ class Agent:
         # Bytes may already have arrived before registration.
         for method, params in list(self.notifications):
             if method == "lsp.tunnelRecv" and params.get("tunnelId") == tunnel.id:
-                tunnel._feed(base64.b64decode(params["data"]))
+                data = base64.b64decode(params["data"])
+                if params.get("z") is True:
+                    data = zlib.decompress(data)
+                tunnel._feed(data)
         return tunnel
 
     def tunnel(self, tunnel_id):

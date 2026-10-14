@@ -17,7 +17,7 @@
 ;;
 ;;   (require 'scrutiny-agent-remote)
 ;;   (scrutiny-agent-remote-setup
-;;    '(("devbox" :transport "tsh ssh devbox"
+;;    '(("devbox" :transport "tsh ssh devbox sh"
 ;;               :roots ("src" "work"))))
 ;;
 ;; That configures the host, derives the agent's argv from `:roots',
@@ -159,10 +159,10 @@ to the derived argv."
   ;; which `scrutiny-agent-fs-mode' takes care of.
   (scrutiny-agent-fs-mode 1)
 
-  ;; git, if magit is installed.
+  ;; git.  Not conditional on magit being installed: the routing lives
+  ;; behind `process-file', so it serves whatever runs git there.
   (when (require 'scrutiny-agent-magit nil t)
-    (when (require 'magit-process nil t)
-      (scrutiny-agent-magit-mode 1)))
+    (scrutiny-agent-magit-mode 1))
 
   ;; LSP through the tunnel, for the modes eglot knows.
   (when (require 'scrutiny-agent-eglot nil t)

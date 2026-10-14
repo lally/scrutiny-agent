@@ -7,6 +7,7 @@ target_link_libraries(scrutiny-agent
     PRIVATE
         GitReviewCore
         nlohmann_json::nlohmann_json
+        ZLIB::ZLIB
 )
 
 target_compile_definitions(scrutiny-agent PRIVATE

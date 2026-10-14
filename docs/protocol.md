@@ -51,6 +51,14 @@ itself instead of surfacing as a timeout at the handshake.
 | 5 | **Install the config** (hash-gated like 2/3) | base64 heredoc | `__SCRA_CFG__ …`, `__SCRA_CFGDONE__ OK` |
 | 6 | **Hand over** | `echo __SCRA_EXEC__; exec "$B" --rpc-stdio …` | `__SCRA_EXEC__` |
 
+**Step 1** is also the terminal check. The transport must put the
+remote shell on pipes; a PTY echoes every line back, prompt first and
+CR LF terminated, so no marker ever starts a line. Teleport allocates
+one for a plain `tsh ssh HOST` session whatever the client asks
+(`tsh ssh HOST sh` is an exec request and gets pipes). A client that
+sees its own probe command echoed back fails immediately, naming the
+transport to use, rather than waiting out the deadline.
+
 **Step 1** uses only `uname -s` and `uname -m`: both are POSIX, and
 both exist everywhere this could run. `uname -o`/`-i`/`-p` are not
 portable. `uname -m` spellings are normalized (`amd64` → `x86_64`,
@@ -167,6 +175,58 @@ matching binary. `frameCap` is the client's proposal, clamped into
 connection. `capabilities` is the exhaustive list of methods the
 agent serves (the conformance contract).
 
+The hello result also carries what a client would otherwise spend its
+first round trips discovering:
+
+```
+  features: [...],                       // see below
+  fileSystemAccess: { allowedRoots, allowedRootsAsGiven, writable, home },
+  config: { loaded, unreadable },        // was a --config file read?
+  encoding?: "deflate"                   // only when negotiated
+```
+
+`features` names behaviours *within* a method, which `capabilities`
+(a list of methods) cannot express. A client must test for a feature
+before relying on it; an agent without `features` has none of them.
+
+| Feature | Meaning |
+| --- | --- |
+| `hello.facts` | the hello result carries `fileSystemAccess` and `config` |
+| `fs.watch` | `fs.listDirectory {watch}` and `fs.changed` (Linux/inotify; not claimed elsewhere, where every watch is declined) |
+| `fs.changed.ordered` | the causal-ordering guarantee under *Directory watches* (Linux only, like `fs.watch`) |
+| `fs.listDirectory.self` | attributed listings carry `self`, the directory's own entry |
+| `fs.listDirectory.maxEntries`, `fs.readFile.maxBytes` | the `tooLarge` refusals |
+| `fs.mtimeNs` | every entry / stat / write result carries `mtimeNs` |
+| `fs.writeFile.ifMtimeNs` | conditional write |
+| `git.exec.stdin`, `git.exec.env` | `stdinBase64` and `env` on `git.exec` |
+| `rpc.deflate` | the agent can compress (see *Compression*) |
+| `lsp.tunnelSend.eof` | `eof: true` half-closes a tunnel's stdin |
+
+`config.loaded: false` with a client that believes it sent a config is
+the single most consequential misconfiguration there is: the agent is
+then read-only, has no `git.exec`, and is rooted at `$HOME`, and
+every client quietly falls back to something slower. Clients should
+say so loudly.
+
+### Compression
+
+A client that lists `encodings: ["deflate"]` in `meta.hello` gets
+`encoding: "deflate"` back from an agent that supports it, and from
+then on, on that connection:
+
+- a response whose body is at least 1024 bytes is sent as `rpc.chunk`
+  notifications carrying the base64 of the **zlib-deflated** JSON
+  envelope, and its final frame is
+  `{ result: { streamed: true, bytes, encoding: "deflate" } }`
+  (`bytes` is the inflated size). Without `encoding` the chunks are
+  the plain envelope, as before.
+- an `lsp.tunnelRecv` whose payload is at least 512 bytes carries
+  `z: true`, and `data` is the base64 of the deflated bytes.
+
+Requests are never compressed. Source, diffs and listings deflate
+3-5x, which is what matters on a link where the bytes are the cost;
+base64 alone had been *adding* 34-78 % to every large reply.
+
 ## Error model
 
 ```
@@ -219,7 +279,7 @@ absolute; relative cache/install paths anchor under `$HOME`.
 | `meta.hello` | `clientVersion`, `supportedProtocolVersions[]`, `frameCap?` | `{ agentVersion, protocolVersion, frameCap, capabilities[] }` |
 | `meta.debug` | `sleepMs?`, `padBytes?` | `{ echoId, pad }` — diagnostics: sleeps (cancellable), pads the result to exercise chunking |
 | `meta.stat` | — | `{ lanes: {interactive,normal,bulk}, lspSessions, lspTunnels, uptimeMs, gitParallel, logLevel, agentVersion }` |
-| `meta.capabilities` | — | `{ agentVersion, protocolVersion, outboundIO[], fileSystemAccess{}, languageServers{}, network, selftestMethod }` — the agent's security/IO posture. `fileSystemAccess` carries `allowedRoots` (the roots **this process** is running with, so a client reports fact rather than default), `writable` (whether the write surface is served), and `home` (the remote `$HOME` — a client needs it to expand `~`, and cannot discover it by listing when `$HOME` is not itself inside the roots). |
+| `meta.capabilities` | — | `{ agentVersion, protocolVersion, outboundIO[], fileSystemAccess{}, languageServers{}, network, selftestMethod }` — the agent's security/IO posture. `fileSystemAccess` carries `allowedRoots` (the roots **this process** is running with, canonical, so a client reports fact rather than default), `allowedRootsAsGiven` (the spellings those roots were configured with, listed only where `realpath` changed them -- `/home/dev/src` when `/home` is a symlink; the sandbox enforces the canonical path, but a client can then tell that a name written the configured way is inside it without asking), `writable` (whether the write surface is served), and `home` (the remote `$HOME` — a client needs it to expand `~`, and cannot discover it by listing when `$HOME` is not itself inside the roots). |
 | `logs.tail` | `maxBytes?` (≤ 1 MiB) | `{ enabled, path?, level?, bytes?, text? }` — tail of the `--log` file; `{ enabled: false }` when logging is off |
 
 ### git.* (read surfaces)
@@ -271,7 +331,9 @@ scrutiny-agent --rpc-stdio \
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `git.exec` | `repoPath`, `args[]`, `authOpId?` | `{ exitCode, stdout, stderr, truncated }` |
+| `git.exec` | `repoPath`, `args[]`, `authOpId?`, `stdinBase64?`, `env?` | `{ exitCode, stdout, stderr, truncated }` |
+| `git.spawn` | `repoPath`, `args[]`, `env?` | `{ tunnelId, pid }` — the same policy as `git.exec`, but the command runs as a tunnel (below) |
+| `git.signal` | `pid`, `signal` | `{ ok }` — `pid` must be in the process group of a live `git.spawn` command |
 
 A non-zero `exitCode` is **data, not an error**: git answers questions
 with exit codes (`diff --quiet`, `merge-base --is-ancestor`). Output
@@ -280,6 +342,45 @@ bites. Subcommands that can reach the network (`fetch`, `pull`,
 `push`, `ls-remote`, `clone`, `submodule`) go through the credential
 broker when `authOpId` is given. Runs on the `normal` lane by default;
 override with the top-level `lane` field.
+
+`repoPath` is authorized against the fs roots like any other path.
+The child's stdin is `/dev/null`, or exactly the bytes of
+`stdinBase64` (`git apply --cached -`, `hash-object --stdin`,
+`update-index --index-info`); it is never the agent's own stdin,
+which is the RPC channel.
+
+`env` is an object, `{ "NAME": "value" }` to set and `{ "NAME": null }`
+to unset. Only an allowlist of names may be set — the ones that change *what
+git computes* without changing *what git runs*: `GIT_INDEX_FILE`
+(which must itself lie inside the roots), the author/committer
+identity and dates, `GIT_OPTIONAL_LOCKS`, `GIT_LITERAL_PATHSPECS`,
+`GIT_REFLOG_ACTION`, `GIT_MERGE_AUTOEDIT`, `LC_ALL`/`LANG`/`TZ` and a
+few like them. Unsetting any `GIT_*` name is always allowed, except
+that the agent's own `GIT_PAGER=cat` and `GIT_TERMINAL_PROMPT=0` are
+applied last. `env` and `stdinBase64` cannot be combined with
+`authOpId` (use `git.spawn`). Dropping
+`env` on the floor is not an option: a client that builds a tree
+against a temporary index (`GIT_INDEX_FILE=… git read-tree`, as magit
+does for stashes and WIP commits) would be run against the **real
+index** instead.
+
+`git.spawn` is `git.exec` for commands that are long-running, read
+stdin incrementally, prompt, or wait on an editor (`commit`, `rebase
+-i`, `push`, `pull`, `apply` fed a hunk). The result's `tunnelId` is
+an ordinary tunnel: output (stdout and stderr merged) arrives as
+`lsp.tunnelRecv`, input goes by `lsp.tunnelSend` (`eof: true` closes
+stdin), exit is `lsp.tunnelClosed`. The command gets its own process
+group and the credential broker. Exit is detected by `waitpid`, not
+by EOF on the pipe, so a detached grandchild holding the pipe open
+does not hide it.
+
+When the operator allows editors (the `magit` preset, or
+`--git-exec-editor`), `env` may also set `GIT_EDITOR`,
+`GIT_SEQUENCE_EDITOR`, `EDITOR` and `VISUAL`. That is deliberately a
+grant of command execution to the client — it is what lets a client
+install a "sleeping editor" that prints the file to edit and waits
+for `git.signal { signal: "USR1" }` (finish) or `"USR2"` (abort)
+while the user writes the commit message over `fs.*`.
 
 Two checks, and the second is the one that matters:
 
@@ -291,7 +392,25 @@ Two checks, and the second is the one that matters:
    turn *any* permitted subcommand into arbitrary code execution.
    Also refused: `--git-dir`/`--work-tree`/`-C`/`--namespace` (which
    would move the repository out from under `repoPath`),
-   `--gpg-sign=`, `--output=`, and `--textconv`. Before the
+   `--gpg-sign=`, `--output=`, and `--textconv`. Refused per
+   subcommand: `--no-index` (`diff`, `grep` — it reads any file on
+   the host), `grep -O`/`--open-files-in-pager` and `--exec` on
+   `ls-remote`/`fetch`/`pull`/`push`/`clone` (command execution),
+   `blame --contents`/`--ignore-revs-file`/`-S`, `grep -f`/`--file`,
+   `ls-files -X`/`--exclude-from`, `--pathspec-from-file`, `-O<file>`
+   (arbitrary file read), and, for `diff`, any path argument that is
+   absolute or contains a `..` component (`git diff` compares
+   arbitrary files, unasked, when given paths outside the work tree).
+
+   Every long option above is refused in **every spelling git
+   accepts**: git's parser takes any unambiguous abbreviation
+   (`--upload-pa=…`, `--outp …`, `--cont …`) and a value either
+   attached with `=` or as the next argument, so the check is "is this
+   argument's name a prefix of a refused option", not string equality.
+   Single-letter options are looked for inside bundles (`-lO<cmd>`).
+   The price is the occasional false refusal (a `grep` pattern given
+   as `-eOops`), which costs that request the fast path and nothing
+   else. Before the
    subcommand, only a fixed set of global options is accepted at all,
    so an unanticipated spelling cannot slip through.
 
@@ -305,6 +424,12 @@ magit sends `-c core.preloadIndex=true -c log.showSignature=false -c
 color.ui=false -c color.diff=false -c diff.noPrefix=false` on every
 invocation; refusing `-c` outright would mean refusing magit.
 
+Some subcommands are both a query and a mutation (`config`, `branch`,
+`tag`, `symbolic-ref`). The `read-only` preset admits only their read
+forms (`config --get…`/`--list`, `branch --list`/`--show-current`/…,
+`tag -l`, `symbolic-ref <name>`); the `magit` preset admits them
+whole.
+
 Failures of the policy answer `PERMISSION_DENIED` (1005) and start no
 process at all. Repository-local config and hooks are out of scope
 here: they are the user's own, already reachable through `git.fetch`,
@@ -315,11 +440,54 @@ prevents is the *client* injecting them.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `fs.readFile` | `path`, `base64?`, `stat?` | `{ content }`, or `{ contentBase64 }` with `base64: true`; `stat: true` adds `size`, `mtime`, `mode`. Base64 exists because a JSON string cannot carry arbitrary bytes — a client that must reproduce a file exactly asks for it. |
-| `fs.listDirectory` | `path`, `attributes?` | `{ path (canonical absolute), entries: [{ name, isDir }] }` sorted by name; symlinks followed for `isDir`. With `attributes: true` each entry also carries `size`, `mtime`, `mode`, `isRegular`, `isSymlink`, `symlinkTarget`, `uid`, `gid`, `readable`, `writable`, and `path` (the resolved name, so a client can answer `file-truename` from the listing) — one request answers everything a client is about to ask about that directory. |
+| `fs.readFile` | `path`, `base64?`, `stat?`, `maxBytes?` | `{ content }`, or `{ contentBase64 }` with `base64: true`; `stat: true` adds `size`, `mtime`, `mode`. Base64 exists because a JSON string cannot carry arbitrary bytes — a client that must reproduce a file exactly asks for it. A regular file larger than `maxBytes` answers `{ tooLarge: true, size, mtime, mtimeNs, mode }` and no content, so a client can prefetch speculatively without ever paying for a huge file it did not mean to open. |
+| `fs.listDirectory` | `path`, `attributes?`, `watch?`, `maxEntries?` | `{ path (canonical absolute), entries: [{ name, isDir }] }` sorted by name; symlinks followed for `isDir`. With `attributes: true` each entry also carries `size`, `mtime`, `mode`, `isRegular`, `isSymlink`, `symlinkTarget`, `uid`, `gid`, `readable`, `writable`, and `path` (the resolved name, so a client can answer `file-truename` from the listing) — one request answers everything a client is about to ask about that directory. Attributed listings also carry `self`, the directory's own entry. A directory with more than `maxEntries` children answers `{ path, tooLarge: true, count, self? }` instead. `watch: true` adds `watching: true|false`; see *Directory watches*. |
 | `fs.stat` | `path` | `{ exists, isDir, isRegular, isSymlink, symlinkTarget, size, mtime, mode, uid, gid, readable, writable, path }`, or `{ exists: false }`. **Does not follow the final component**: the parent is canonicalized and authorized, then the leaf is `lstat`ed, so a symlink is described rather than resolved away (`path` still names the resolved target). A path inside the roots that is simply absent answers `exists: false`, not an error — that is the question being asked. |
 | `fs.statBatch` | `paths[]` | `{ stats: [...] }` in the order asked. One bad path yields a per-entry `{ exists: false }` (plus `denied: true` when outside the roots) rather than failing the batch. |
 | `fs.selftest` | — | `{ probe, succeeded, errorCode, reason?, firstBytesReadable, sampleSnippet }` — runtime sandbox probe of /etc/passwd. The probe takes the same route a client request takes (resolve, authorize, read the canonical path), so it reports **this agent's** posture; a denied probe returns `succeeded: false`, `errorCode: "PERMISSION_DENIED"`, and no content. |
+
+Every entry, stat and write result carries `mtimeNs` (nanoseconds
+since the epoch) beside the whole-second `mtime`; it is the version
+stamp used by conditional writes.
+
+#### Directory watches
+
+A complete attributed listing is a proof: a name that is not in it
+does not exist. That makes one listing answer every later `stat`,
+`file-exists-p` and completion in that directory — for as long as the
+listing is still true. `watch: true` is how the agent keeps it true:
+
+```
+fs.listDirectory { path, attributes: true, watch: true }
+  -> { ..., watching: true }
+fs.changed { path, entries: [ entry | { name, deleted: true } ], self }
+fs.changed { path, reset: true [, unwatched: true] }
+fs.changed { all: true, reset: true }
+```
+
+`entries` are full attributed entries for names created or modified
+and tombstones for names removed; `self` is the directory's new
+entry. `reset` means "discard what you hold for this directory"
+(events were lost, or it was removed); `unwatched` adds "and I have
+stopped watching it". `all` is a queue overflow: discard everything.
+A client holding a watched listing therefore needs **no TTL** — its
+cache is exact until told otherwise.
+
+`watching: false` means the agent declined and the client must fall
+back to expiring the listing by time. It declines on network
+filesystems (inotify sees only local changes there). It later
+withdraws a watch, with `unwatched`, from a directory that changes
+too often to be worth describing (more than 40 notifications in 10 s
+— a build directory) and from the least recently listed directory
+once more than 2048 are watched.
+Notifications are coalesced (25 ms quiet, 150 ms at most).
+
+**Ordering guarantee** (`fs.changed.ordered`): the reply to any
+request that changes the filesystem through the agent — an `fs.*`
+write, `git.exec`, the close of a `git.spawn` — is sent *after* the
+`fs.changed` notifications that request caused. A client that has
+processed a reply has already seen its consequences; it never needs
+to invalidate defensively after its own writes.
 
 ### fs.* (writes; opt-in)
 
@@ -331,7 +499,7 @@ widens *what* may be done to a path, never *which* paths are reachable.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `fs.writeFile` | `path`, `content` \| `contentBase64`, `mode?`, `createDirs?` | `{ ok, size, mtime }` |
+| `fs.writeFile` | `path`, `content` \| `contentBase64`, `mode?`, `createDirs?`, `ifMtimeNs?` | `{ ok, size, mtime, mtimeNs, mode, entry }`, or `{ ok: false, conflict: true, exists, size, mtime, mtimeNs }` |
 | `fs.mkdir` | `path`, `parents?` | `{ ok }` |
 | `fs.delete` | `path`, `recursive?` | `{ ok, removed }` |
 | `fs.rename` | `from`, `to` | `{ ok }` |
@@ -345,6 +513,16 @@ buffer. An existing file's mode is preserved unless `mode` is given,
 so saving an executable script does not silently drop its `+x` bit.
 The returned `mtime` lets a client track the file without a second
 round trip.
+
+`ifMtimeNs` makes the write **conditional**: it happens only if the
+file's `mtimeNs` is still that value (`0`: only if the file does not
+exist). A mismatch changes nothing and answers `conflict: true` with
+the file's current stamp. This is compare-and-swap for "has this
+file changed on disk since I read it?": the check an editor makes
+before every save costs no round trip of its own, and unlike a
+separate stat it cannot race. `entry` is the file's full attributed
+entry after the write, so the client's cache needs no follow-up
+`fs.stat`.
 
 Authorizing a path that does not exist yet resolves the deepest
 component that does and appends the rest, so every existing directory
@@ -389,7 +567,7 @@ the server runs on the remote box. It coexists with the request-level
 | Method | Kind | Params | Result / behavior |
 | --- | --- | --- | --- |
 | `lsp.tunnelOpen` | request | `workspacePath`, `language` | `{ tunnelId, serverPath }` — spawns the server with cwd = workspacePath, stderr inherited. `LSP_FAILED` if no server binary is installed for the language. |
-| `lsp.tunnelSend` | notification | `tunnelId`, `data` (base64) | client → server bytes, written to the server's stdin in notification-arrival order. Invalid base64 is dropped (logged). Unknown/closed tunnelId elicits a `lsp.tunnelClosed { reason: "unknown tunnel" }` notification. |
+| `lsp.tunnelSend` | notification | `tunnelId`, `data` (base64), `eof?` | client → server bytes, written to the server's stdin in notification-arrival order. Invalid base64 is dropped (logged). Unknown/closed tunnelId elicits a `lsp.tunnelClosed { reason: "unknown tunnel" }` notification. `eof: true` (with or without `data`) closes the server's stdin once everything queued has been written. |
 | `lsp.tunnelClose` | request | `tunnelId` | `{ ok }` (idempotent). Closes the server's stdin and sends SIGTERM; the server's exit then produces `lsp.tunnelClosed`. |
 
 Agent → client:
@@ -459,5 +637,6 @@ immutable so there is no invalidation, only mtime-based pruning.
 | `index.progress` | `{ indexerId, filePath, current, total }` | during `index.run` (coalesced ≈ per percent) |
 | `watch.headChanged` | `{ watchId }` | watched HEAD file changed |
 | `cred.request` | `{ authOpId, credId, prompt }` | git prompts during a brokered op |
-| `lsp.tunnelRecv` | `{ tunnelId, data }` | server → client bytes on an open tunnel |
+| `lsp.tunnelRecv` | `{ tunnelId, data, z? }` | server → client bytes on an open tunnel (LSP server or `git.spawn` command) |
+| `fs.changed` | see *Directory watches* | a watched directory changed |
 | `lsp.tunnelClosed` | `{ tunnelId, exitCode, reason }` | tunnel's server exited (or a send targeted an unknown tunnel) |

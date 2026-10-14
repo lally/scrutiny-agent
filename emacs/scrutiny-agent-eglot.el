@@ -92,6 +92,8 @@ it.  Closing either side tears down the other and the tunnel."
   (let* ((conn (scrutiny-agent-connect host))
          (accepted nil)
          (tunnel nil)
+         (pending nil)                  ; bytes from eglot not yet sent
+         (flush nil)                    ; timer that will send them
          (server
           (make-network-process
            :name (format "scrutiny-eglot-bridge[%s]" host)
@@ -102,9 +104,28 @@ it.  Closing either side tears down the other and the tunnel."
                   (set-process-query-on-exit-flag client nil)
                   (set-process-coding-system client 'binary 'binary)
                   (set-process-filter
-                   client (lambda (_p bytes)
-                            (when tunnel
-                              (scrutiny-agent-tunnel-send tunnel bytes))))
+                   client
+                   ;; Emacs hands a filter what it read from the socket
+                   ;; in pieces of a few kilobytes, so one large message
+                   ;; from eglot (a didOpen carrying a whole file) shows
+                   ;; up here as dozens of calls.  Forwarding each as it
+                   ;; comes would wrap every piece in its own frame.
+                   ;; Gather what arrives in one pass of the event loop
+                   ;; and send it together.
+                   (lambda (_p bytes)
+                     (push bytes pending)
+                     (unless flush
+                       (setq flush
+                             (run-at-time
+                              0 nil
+                              (lambda ()
+                                (setq flush nil)
+                                (let ((all (apply #'concat
+                                                  (nreverse pending))))
+                                  (setq pending nil)
+                                  (when tunnel
+                                    (scrutiny-agent-tunnel-send
+                                     tunnel all)))))))))
                   (set-process-sentinel
                    client (lambda (p _e)
                             (unless (process-live-p p)

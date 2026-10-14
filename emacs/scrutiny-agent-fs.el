@@ -100,13 +100,83 @@ holding the whole thing in a base64 payload."
   :type 'integer)
 
 (defvar scrutiny-agent-fs--dir-cache (make-hash-table :test #'equal)
-  "HOST+DIR -> (TIMESTAMP . ((NAME . ATTRS-PLIST) ...)).")
+  "HOST+DIR -> (TIMESTAMP . LISTING).
+LISTING is an alist ((NAME . ATTRS-PLIST) ...), or one of two symbols:
+`unavailable' (the directory could not be listed) and `too-large' (it
+holds more entries than `scrutiny-agent-fs-listing-max-entries', so
+its files are asked about one at a time instead).")
 
-(defvar scrutiny-agent-fs--pending-fetches (make-hash-table :test #'equal)
-  "Directories currently being fetched in the background.")
+(defvar scrutiny-agent-fs--self (make-hash-table :test #'equal)
+  "HOST+DIR -> the directory's own attributes, as of its listing.")
+
+(defvar scrutiny-agent-fs--watched (make-hash-table :test #'equal)
+  "HOST+DIR -> canonical remote path, for listings the agent keeps current.
+A listing in here has no expiry: the agent is watching the directory
+and pushes every change to it (`fs.changed'), so the copy held in
+`scrutiny-agent-fs--dir-cache' is true for as long as the connection
+is up.  See `scrutiny-agent-fs-watch'.")
+
+(defvar scrutiny-agent-fs--canonical (make-hash-table :test #'equal)
+  "HOST+CANONICAL-PATH -> the cache keys that path's listing is filed under.
+A directory reached through a symlink is cached under the name it was
+asked for, while the agent reports changes by canonical path.")
+
+(defvar scrutiny-agent-fs--inflight (make-hash-table :test #'equal)
+  "HOST+DIR -> (FUTURE . FULL) for a listing sent and not yet answered.")
+
+(defvar scrutiny-agent-fs--bodies (make-hash-table :test #'equal)
+  "HOST+PATH -> (TIMESTAMP . FUTURE): file bodies asked for ahead of the read.")
+
+(defvar scrutiny-agent-fs--changes nil
+  "Recent `fs.changed' notifications, newest first: (SEQ HOST . PARAMS).
+Kept so that a change which overtakes the listing reply it belongs
+with is not lost; see `scrutiny-agent-fs--install-listing'.")
+
+(defvar scrutiny-agent-fs--change-seq 0
+  "Number of `fs.changed' notifications received so far.")
 
 (defvar scrutiny-agent-fs--roots-cache (make-hash-table :test #'equal)
   "HOST -> (ROOTS . HOME), the connection facts. Fixed per connection.")
+
+(defcustom scrutiny-agent-fs-watch t
+  "Whether to have the agent keep cached directory listings current.
+
+With this on (and an agent that supports it), every directory this
+client lists is watched on the far end, and changes are pushed as
+they happen.  A cached listing then never expires, so the questions
+Emacs asks constantly -- does this file exist, has it changed on
+disk, what is in this directory -- are answered from memory for as
+long as the connection is up, instead of costing a round trip each
+time `scrutiny-agent-fs-cache-ttl' runs out.
+
+The agent declines to watch where it cannot see every change:
+network filesystems, where another machine's writes are invisible to
+it, and directories that change continuously.  Those fall back to
+the time-based cache automatically.  Set to nil to use the
+time-based cache everywhere."
+  :type 'boolean)
+
+(defcustom scrutiny-agent-fs-listing-max-entries 4000
+  "Largest directory fetched whole just to answer a question about one file.
+
+Asking the agent for a directory's listing answers everything Emacs
+is about to ask about the files in it, which is nearly always a
+bargain.  It stops being one for a directory with tens of thousands
+of entries; past this size, files there are asked about one at a
+time.  Listing such a directory deliberately (Dired, completion)
+still fetches all of it."
+  :type 'integer)
+
+(defcustom scrutiny-agent-fs-prefetch t
+  "Whether `find-file' asks for a file's contents before it needs them.
+
+Opening a file asks about the file, then about every directory above
+it (for `.dir-locals.el', the project root, version control), then
+reads it.  With this on, all of those requests are sent together the
+moment `find-file-noselect' is entered, so the whole open costs one
+round trip.  It is implemented as advice on `find-file-noselect'
+that sends requests and does nothing else."
+  :type 'boolean)
 
 (defcustom scrutiny-agent-fs-verbose nil
   "When non-nil, log diagnostic messages for fs-mode operations.
@@ -247,59 +317,71 @@ rather than blocking on bootstrap."
       (and (member "fs.writeFile" (scrutiny-agent--conn-capabilities conn)) t))))
 
 (defun scrutiny-agent-fs--interactive-p ()
-  "Non-nil if we're in a context where blocking is unacceptable.
-During minibuffer completion, any RPC would freeze the UI."
-  (let* ((mb (minibufferp))
-         (wmb (window-minibuffer-p))
-         (mwa (minibuffer-window-active-p (minibuffer-window)))
-         (cc (bound-and-true-p company-candidates))
-         (result (or mb wmb mwa cc)))
-    ;; Debug output - remove after fixing
-    (when scrutiny-agent-fs-verbose
-      (message "interactive-p: mb=%S wmb=%S mwa=%S cc=%S => %S"
-               mb wmb mwa cc result))
-    result))
+  "Non-nil where a wait must give way to the user's next keystroke.
+That is minibuffer completion, mostly: a listing that takes a second
+to arrive must not hold up the characters typed in the meantime."
+  (or (minibufferp)
+      (window-minibuffer-p)
+      (minibuffer-window-active-p (minibuffer-window))
+      (bound-and-true-p company-candidates)))
+
+(defun scrutiny-agent-fs--facts-from (fsa)
+  "(ROOTS . HOME) from a `fileSystemAccess' plist FSA.
+
+ROOTS holds every spelling the agent reports: the canonical ones it
+enforces with, and -- `allowedRootsAsGiven', from a current agent --
+the ones it was configured with where a symlink made realpath change
+them.  Both name the same directories, and a user writes file names
+the way the root was configured (\"/home/dev/src\" when /home is a
+symlink), so a check against the canonical spelling alone would call
+the whole sandbox \"outside the roots\" and answer it from structure."
+  (let ((home (plist-get fsa :home)))
+    (cons (delete-dups
+           (append (scrutiny-agent-ops--list (plist-get fsa :allowedRoots))
+                   (scrutiny-agent-ops--list
+                    (plist-get fsa :allowedRootsAsGiven))))
+          (and (stringp home) (not (string-empty-p home))
+               (directory-file-name home)))))
 
 (defun scrutiny-agent-fs--facts (host)
   "The agent's roots and remote home for HOST, as (ROOTS . HOME).
 
-One `meta.capabilities' answers both, and both are fixed for the life
-of a connection -- so this is asked once and the failure is cached
-too. Retrying a lookup that cannot succeed puts a round trip in front
-of every single file operation."
+Both are fixed for the life of a connection.  A current agent states
+them in its `meta.hello' reply, so they cost nothing; an older one is
+asked once (`meta.capabilities'), and the failure is cached too --
+retrying a lookup that cannot succeed puts a round trip in front of
+every single file operation."
   (let ((cached (gethash host scrutiny-agent-fs--roots-cache 'miss)))
     (cond
-     ;; Cache hit - return immediately (facts don't expire)
      ((not (eq cached 'miss)) cached)
-     ;; Interactive context with no cache - don't block
-     ((scrutiny-agent-fs--interactive-p)
-      (scrutiny-agent-fs--warn host "no cached facts during completion, using TRAMP")
-      nil)
-     ;; Non-interactive - OK to block for the RPC
      (t
-      (puthash host
-               (let ((conn (scrutiny-agent-fs--conn host)))
-                 (if (null conn)
-                     (progn
-                       (scrutiny-agent-fs--warn host "no connection, cannot fetch capabilities")
-                       nil)
-                   (condition-case err
-                       (let* ((caps (scrutiny-agent-ops-capabilities conn))
-                              (fsa (plist-get caps :fileSystemAccess))
-                              (roots (scrutiny-agent-ops--list
-                                      (plist-get fsa :allowedRoots)))
-                              (home (plist-get fsa :home)))
-                         (when (null roots)
-                           (scrutiny-agent-fs--warn
-                            host "no allowedRoots in capabilities (agent may not serve fs)"))
-                         (cons roots
-                               (and (stringp home)
-                                    (not (string-empty-p home))
-                                    (directory-file-name home))))
-                     (error
-                      (scrutiny-agent-fs--record-error host 'capabilities err)
-                      nil))))
-               scrutiny-agent-fs--roots-cache)))))
+      (let* ((conn (scrutiny-agent-fs--conn host))
+             (told (and conn (scrutiny-agent--conn-facts conn))))
+        (cond
+         ((null conn)
+          (scrutiny-agent-fs--warn host "no connection, roots unknown")
+          nil)
+         (told
+          (puthash host (scrutiny-agent-fs--facts-from told)
+                   scrutiny-agent-fs--roots-cache))
+         ;; An older agent, asked from where the user is typing: do
+         ;; not block the minibuffer for it.
+         ((scrutiny-agent-fs--interactive-p) nil)
+         (t
+          (puthash
+           host
+           (condition-case err
+               (let ((facts (scrutiny-agent-fs--facts-from
+                             (plist-get (scrutiny-agent-ops-capabilities conn)
+                                        :fileSystemAccess))))
+                 (when (null (car facts))
+                   (scrutiny-agent-fs--warn
+                    host "no allowedRoots in capabilities"))
+                 facts)
+             (error
+              (scrutiny-agent-fs--record-error host 'capabilities err)
+              nil))
+           scrutiny-agent-fs--roots-cache))))))))
 
 (defun scrutiny-agent-fs--roots (host)
   "The filesystem roots HOST's agent will serve, or nil if unknown."
@@ -357,16 +439,25 @@ which is the behavior from before this check existed."
 ;; Delegation
 ;; ---------------------------------------------------------------------
 
+(defvar scrutiny-agent-fs-delegations nil
+  "Alist of (OPERATION . COUNT): what has been handed to TRAMP so far.
+Only calls naming a file on a configured host are counted.  An entry
+here is not necessarily slow -- TRAMP answers many operations without
+touching the network -- but when something IS slow, this is the list
+of suspects, and `M-x scrutiny-agent-fs-status' prints it.")
+
 (defun scrutiny-agent-fs--delegate (operation args)
   "Run OPERATION with ARGS as if this handler were not installed.
 The standard idiom: inhibit ourselves for exactly this call, so the
 next handler in `file-name-handler-alist' -- TRAMP -- takes it."
-  ;; Only log delegations for remote files (to reduce noise from local files)
-  (when (and scrutiny-agent-fs-verbose
-             (car args)
-             (stringp (car args))
-             (file-remote-p (car args)))
-    (message "DELEGATE TO TRAMP: %s %S" operation (car args)))
+  (when (or (and (stringp (car args))
+                 (scrutiny-agent-fs--parse (car args)))
+            (and (memq operation '(process-file start-file-process
+                                   make-process shell-command))
+                 (scrutiny-agent-fs--parse default-directory)))
+    (cl-incf (alist-get operation scrutiny-agent-fs-delegations 0))
+    (when scrutiny-agent-fs-verbose
+      (scrutiny-agent-fs--warn nil "to TRAMP: %s %S" operation (car args))))
   (let ((inhibit-file-name-handlers
          (cons 'scrutiny-agent-fs-handler
                (and (eq inhibit-file-name-operation operation)
@@ -394,6 +485,20 @@ next handler in `file-name-handler-alist' -- TRAMP -- takes it."
         (setf (nth 9 s) (if (eq (nth 9 s) ?x) ?t ?T)))
       (apply #'string s))))
 
+(defun scrutiny-agent-fs--mtime (stat)
+  "The modification time in STAT as a Lisp timestamp, or nil.
+Nanoseconds when the agent reports them: two saves inside one second
+must not look like the same file."
+  (let ((ns (plist-get stat :mtimeNs))
+        (seconds (plist-get stat :mtime)))
+    (cond ((and (integerp ns) (> ns 0))
+           (time-convert (cons ns 1000000000) 'list))
+          ((numberp seconds) (time-convert seconds 'list)))))
+
+(defun scrutiny-agent-fs--time-ns (time)
+  "Lisp timestamp TIME as integer nanoseconds since the epoch."
+  (car (time-convert time 1000000000)))
+
 (defun scrutiny-agent-fs--attributes (stat &optional id-format)
   "Emacs `file-attributes' list for a protocol STAT plist, or nil."
   (when (scrutiny-agent-ops-bool (plist-get stat :exists))
@@ -401,8 +506,8 @@ next handler in `file-name-handler-alist' -- TRAMP -- takes it."
            (islink (scrutiny-agent-ops-bool (plist-get stat :isSymlink)))
            (target (plist-get stat :symlinkTarget))
            (mode (or (plist-get stat :mode) 0))
-           (mtime (or (plist-get stat :mtime) 0))
-           (time (time-convert mtime 'list))
+           (time (or (scrutiny-agent-fs--mtime stat)
+                     (time-convert 0 'list)))
            (uid (or (plist-get stat :uid) 0))
            (gid (or (plist-get stat :gid) 0)))
       (list (cond ((and islink (stringp target) (not (string-empty-p target)))
@@ -427,13 +532,53 @@ Also collapses double slashes: `//foo//bar` becomes `/foo/bar`."
          (collapsed (replace-regexp-in-string "/+" "/" expanded)))
     (concat host "\0" (directory-file-name collapsed))))
 
+(defun scrutiny-agent-fs--forget-key (key)
+  "Drop the listing filed under KEY, and the agent's vouching for it."
+  (remhash key scrutiny-agent-fs--dir-cache)
+  (remhash key scrutiny-agent-fs--self)
+  (remhash key scrutiny-agent-fs--watched))
+
 (defun scrutiny-agent-fs-flush-cache (&optional host directory)
   "Forget cached attributes, for DIRECTORY on HOST or for everything."
   (interactive)
   (if (and host directory)
-      (remhash (scrutiny-agent-fs--cache-key host directory)
-               scrutiny-agent-fs--dir-cache)
-    (clrhash scrutiny-agent-fs--dir-cache)))
+      (scrutiny-agent-fs--forget-key
+       (scrutiny-agent-fs--cache-key host directory))
+    (clrhash scrutiny-agent-fs--dir-cache)
+    (clrhash scrutiny-agent-fs--self)
+    (clrhash scrutiny-agent-fs--watched)
+    (clrhash scrutiny-agent-fs--canonical)
+    (clrhash scrutiny-agent-fs--bodies)))
+
+(defun scrutiny-agent-fs--forget-host (host)
+  "Forget everything held on the strength of HOST's connection.
+A watched listing is only as good as the connection that carries the
+watch; when that goes, so does every copy it vouched for."
+  (let ((prefix (concat host "\0")))
+    (dolist (table (list scrutiny-agent-fs--dir-cache
+                         scrutiny-agent-fs--self
+                         scrutiny-agent-fs--watched
+                         scrutiny-agent-fs--canonical
+                         scrutiny-agent-fs--inflight
+                         scrutiny-agent-fs--bodies))
+      (maphash (lambda (key _value)
+                 (when (or (string-prefix-p prefix key)
+                           (string-prefix-p (concat "\0stat\0" prefix) key))
+                   (remhash key table)))
+               table)))
+  (remhash host scrutiny-agent-fs--roots-cache))
+
+(defun scrutiny-agent-fs--forget-subtree (host path)
+  "Drop every listing at or below PATH on HOST.
+Called when PATH stops being the directory it was: what is cached
+beneath it describes something that is no longer there."
+  (let* ((clean (directory-file-name path))
+         (exact (concat host "\0" clean))
+         (below (concat exact "/")))
+    (maphash (lambda (key _value)
+               (when (or (string= key exact) (string-prefix-p below key))
+                 (scrutiny-agent-fs--forget-key key)))
+             scrutiny-agent-fs--dir-cache)))
 
 (defun scrutiny-agent-fs-forget-connections ()
   "Forget per-connection facts: the allowed roots and the remote home.
@@ -447,158 +592,392 @@ them costs a round trip. They change only when the connection does."
   "Drop everything cached about LOCALNAME: its directory, and itself."
   (let ((clean (directory-file-name localname)))
     (scrutiny-agent-fs-flush-cache host (file-name-directory clean))
-    (scrutiny-agent-fs-flush-cache host clean)
+    (scrutiny-agent-fs--forget-subtree host clean)
     (remhash (concat "\0stat\0" host "\0" clean)
              scrutiny-agent-fs--dir-cache)))
 
-(defun scrutiny-agent-fs--fetch-async (host directory)
-  "Fetch DIRECTORY listing for HOST in the background.
-Populates the cache so the next access is fast."
-  (let ((key (scrutiny-agent-fs--cache-key host directory)))
-    (unless (gethash key scrutiny-agent-fs--pending-fetches)
-      (puthash key t scrutiny-agent-fs--pending-fetches)
-      ;; Use run-at-time with 0 delay - fires on next event loop iteration
-      (run-at-time
-       0 nil
-       (lambda ()
-         (unwind-protect
-             (let ((conn (scrutiny-agent-connection host)))
-               (when conn
-                 (condition-case nil
-                     (let* ((result (scrutiny-agent-request
-                                     conn "fs.listDirectory"
-                                     (list :path (directory-file-name directory)
-                                           :attributes t)
-                                     60))
-                            (entries
-                             (mapcar (lambda (entry)
-                                       (cons (plist-get entry :name)
-                                             (plist-put (copy-sequence entry)
-                                                        :exists t)))
-                                     (scrutiny-agent-ops--list
-                                      (plist-get result :entries)))))
-                       (puthash key (cons (current-time) entries)
-                                scrutiny-agent-fs--dir-cache)
-                       (when scrutiny-agent-fs-verbose
-                         (message "scrutiny-agent-fs[%s]: fetched %s (%d entries)"
-                                  host directory (length entries))))
-                   (error nil))))
-           (remhash key scrutiny-agent-fs--pending-fetches)))))))
+(defun scrutiny-agent-fs--file-entry (host localname entry)
+  "File ENTRY as what the cache knows about LOCALNAME on HOST.
+ENTRY is a directory entry as the agent reports one, or nil when the
+name no longer exists.  Returns non-nil if a cached listing was
+brought up to date -- if there was none, there was nothing to do,
+and the next question about this directory fetches a current one."
+  (let* ((clean (directory-file-name localname))
+         (key (scrutiny-agent-fs--cache-key host (file-name-directory clean)))
+         (hit (gethash key scrutiny-agent-fs--dir-cache))
+         (base (file-name-nondirectory clean)))
+    (remhash (concat "\0stat\0" host "\0" clean) scrutiny-agent-fs--dir-cache)
+    (when (and hit (listp (cdr hit)))
+      (let ((old (assoc base (cdr hit))))
+        (when (and old
+                   (or (null entry)
+                       (not (eq (scrutiny-agent-ops-bool
+                                 (plist-get (cdr old) :isDir))
+                                (scrutiny-agent-ops-bool
+                                 (plist-get entry :isDir))))))
+          (scrutiny-agent-fs--forget-subtree host clean))
+        (cond
+         ((null entry) (setcdr hit (delq old (cdr hit))))
+         (old (setcdr old (plist-put (copy-sequence entry) :exists t)))
+         (t (setcdr hit (cons (cons base (plist-put (copy-sequence entry)
+                                                    :exists t))
+                              (cdr hit))))))
+      t)))
 
-(defun scrutiny-agent-fs--listing (host directory)
-  "Cached (NAME . STAT-PLIST) alist for DIRECTORY on HOST.
+;; ---------------------------------------------------------------------
+;; Changes pushed by the agent
+;; ---------------------------------------------------------------------
+
+(defun scrutiny-agent-fs--apply-change (host params)
+  "Bring the cache up to date with one `fs.changed' notification.
+PARAMS names a directory by canonical path and carries the new state
+of each name in it that changed -- attributes, or `deleted'.  State,
+not an instruction to re-read: applying one twice, or one the cached
+listing already reflects, changes nothing."
+  (if (eq (plist-get params :all) t)
+      ;; The agent lost track (its event queue overflowed).  Nothing
+      ;; held for this host can be vouched for; the watches stand, so
+      ;; whatever is re-read is current again.
+      (let ((prefix (concat host "\0")))
+        (maphash (lambda (key _value)
+                   (when (string-prefix-p prefix key)
+                     (remhash key scrutiny-agent-fs--dir-cache)
+                     (remhash key scrutiny-agent-fs--self)))
+                 scrutiny-agent-fs--dir-cache))
+    (let* ((canonical (plist-get params :path))
+           (ckey (concat host "\0" (or canonical "")))
+           (reset (eq (plist-get params :reset) t))
+           (unwatched (eq (plist-get params :unwatched) t)))
+      (dolist (key (gethash ckey scrutiny-agent-fs--canonical))
+        (let ((directory (substring key (1+ (length host)))))
+          (cond
+           (reset
+            (remhash key scrutiny-agent-fs--dir-cache)
+            (remhash key scrutiny-agent-fs--self)
+            (when unwatched (remhash key scrutiny-agent-fs--watched)))
+           ((gethash key scrutiny-agent-fs--watched)
+            (dolist (entry (scrutiny-agent-ops--list
+                            (plist-get params :entries)))
+              (scrutiny-agent-fs--file-entry
+               host
+               (concat (file-name-as-directory directory)
+                       (plist-get entry :name))
+               (and (not (eq (plist-get entry :deleted) t)) entry)))
+            (let ((self (plist-get params :self)))
+              (when (and self (gethash key scrutiny-agent-fs--self))
+                (puthash key (plist-put (copy-sequence self) :path canonical)
+                         scrutiny-agent-fs--self)))))))
+      (when unwatched (remhash ckey scrutiny-agent-fs--canonical)))))
+
+(defun scrutiny-agent-fs--on-changed (conn params)
+  "Notification handler for `fs.changed' on CONN."
+  (let ((host (scrutiny-agent--conn-name conn)))
+    (push (cons (cl-incf scrutiny-agent-fs--change-seq) (cons host params))
+          scrutiny-agent-fs--changes)
+    (let ((tail (nthcdr 127 scrutiny-agent-fs--changes)))
+      (when tail (setcdr tail nil)))
+    (scrutiny-agent-fs--apply-change host params)))
+
+;; ---------------------------------------------------------------------
+;; Listings
+;; ---------------------------------------------------------------------
+;;
+;; Everything Emacs asks about a file -- does it exist, is it a
+;; directory, when did it change -- is answered from the listing of the
+;; directory it is in.  Three things make that cheap on a slow link:
+;;
+;;   * Requests are sent in bursts.  The first question about a path
+;;     asks for its directory AND every directory above it at once,
+;;     because `locate-dominating-file' is about to walk all of them
+;;     (for `.git', `.dir-locals.el', the project root).  A burst costs
+;;     one round trip however many requests are in it.
+;;   * A listing proves absence.  Most of what Emacs probes for is not
+;;     there; a name missing from a complete listing needs no request.
+;;   * Listings stay true.  The agent watches what was listed and
+;;     pushes changes, so a listing is fetched once per connection
+;;     rather than once per `scrutiny-agent-fs-cache-ttl'.
+
+(defun scrutiny-agent-fs--fresh (key)
+  "The cache entry (TIMESTAMP . LISTING) for KEY if it may be used now."
+  (let ((hit (gethash key scrutiny-agent-fs--dir-cache)))
+    (and hit
+         (> scrutiny-agent-fs-cache-ttl 0)
+         (or (gethash key scrutiny-agent-fs--watched)
+             (< (float-time (time-since (car hit)))
+                scrutiny-agent-fs-cache-ttl))
+         hit)))
+
+(defun scrutiny-agent-fs--install-listing (host key result err seq)
+  "File the reply to a listing request for KEY on HOST.
+RESULT and ERR are the reply; SEQ is the value of
+`scrutiny-agent-fs--change-seq' when the request was sent."
+  (remhash key scrutiny-agent-fs--inflight)
+  (cond
+   (err
+    ;; Cache the failure as well: a directory the agent will not serve
+    ;; is asked about once, not once per file whose attributes are
+    ;; wanted.  Not when the transport died, though -- that says
+    ;; nothing about the directory.
+    (unless (eql (plist-get err :code) -1)
+      (puthash key (cons (current-time) 'unavailable)
+               scrutiny-agent-fs--dir-cache))
+    (remhash key scrutiny-agent-fs--self)
+    (remhash key scrutiny-agent-fs--watched))
+   (t
+    (let ((canonical (plist-get result :path))
+          (self (plist-get result :self)))
+      (puthash key
+               (cons (current-time)
+                     (if (eq (plist-get result :tooLarge) t)
+                         'too-large
+                       (mapcar (lambda (entry)
+                                 (cons (plist-get entry :name)
+                                       (plist-put (copy-sequence entry)
+                                                  :exists t)))
+                               (scrutiny-agent-ops--list
+                                (plist-get result :entries)))))
+               scrutiny-agent-fs--dir-cache)
+      (if self
+          (puthash key (plist-put (copy-sequence self) :path canonical)
+                   scrutiny-agent-fs--self)
+        (remhash key scrutiny-agent-fs--self))
+      (if (not (eq (plist-get result :watching) t))
+          (remhash key scrutiny-agent-fs--watched)
+        (puthash key canonical scrutiny-agent-fs--watched)
+        (let ((ckey (concat host "\0" canonical)))
+          (cl-pushnew key (gethash ckey scrutiny-agent-fs--canonical)
+                      :test #'equal))
+        ;; A change made while this reply was on its way may have been
+        ;; announced ahead of it, when there was no listing yet to
+        ;; apply it to.  Apply those now, oldest first.
+        (dolist (change (reverse scrutiny-agent-fs--changes))
+          (when (and (> (car change) seq)
+                     (equal (cadr change) host)
+                     (equal (plist-get (cddr change) :path) canonical))
+            (scrutiny-agent-fs--apply-change host (cddr change)))))))))
+
+(defun scrutiny-agent-fs--request-listing (conn host directory &optional full)
+  "Send a listing request for DIRECTORY on HOST unless one is not needed.
+Returns the future to wait on, or nil when a usable listing is
+already cached.  FULL asks for every entry however many there are;
+otherwise a directory larger than
+`scrutiny-agent-fs-listing-max-entries' answers `too-large'."
+  (let* ((key (scrutiny-agent-fs--cache-key host directory))
+         (pending (gethash key scrutiny-agent-fs--inflight))
+         (hit (scrutiny-agent-fs--fresh key)))
+    (cond
+     ((and pending (or (cdr pending) (not full))) (car pending))
+     ((and hit (not (and full (eq (cdr hit) 'too-large)))) nil)
+     (t
+      (let* ((seq scrutiny-agent-fs--change-seq)
+             (future
+              (scrutiny-agent-send
+               conn "fs.listDirectory"
+               (nconc
+                (list :path (directory-file-name directory) :attributes t)
+                (and scrutiny-agent-fs-watch
+                     (scrutiny-agent-feature-p conn "fs.watch")
+                     (list :watch t))
+                (and (not full)
+                     (scrutiny-agent-feature-p
+                      conn "fs.listDirectory.maxEntries")
+                     (list :maxEntries
+                           scrutiny-agent-fs-listing-max-entries)))
+               (lambda (result err)
+                 (scrutiny-agent-fs--install-listing
+                  host key result err seq)))))
+        (puthash key (cons future full) scrutiny-agent-fs--inflight)
+        future)))))
+
+(defun scrutiny-agent-fs--ancestors (host directory)
+  "DIRECTORY and every directory above it inside HOST's roots."
+  (let ((dir (directory-file-name (expand-file-name directory "/")))
+        (out nil))
+    (while (and (not (string= dir "/"))
+                (scrutiny-agent-fs--in-roots-p host dir))
+      (push dir out)
+      (setq dir (directory-file-name (file-name-directory dir))))
+    out))
+
+(defun scrutiny-agent-fs--known-absent-p (host directory)
+  "Non-nil when what is cached proves DIRECTORY is not a directory.
+Looks only at listings already held, and asks nothing: if some
+component on the way to DIRECTORY is missing from a current listing
+of its parent, or is there as a plain file, there is no DIRECTORY."
+  (let ((path (directory-file-name (expand-file-name directory "/")))
+        (absent nil))
+    (while (and (not absent)
+                (not (string= path "/"))
+                (scrutiny-agent-fs--in-roots-p host path))
+      (let* ((parent (file-name-directory path))
+             (hit (scrutiny-agent-fs--fresh
+                   (scrutiny-agent-fs--cache-key host parent))))
+        (when (and hit (listp (cdr hit)))
+          (let ((entry (cdr (assoc (file-name-nondirectory path) (cdr hit)))))
+            (unless (and entry (scrutiny-agent-ops-bool
+                                (plist-get entry :isDir)))
+              (setq absent t))))
+        (setq path (directory-file-name parent))))
+    absent))
+
+(defun scrutiny-agent-fs--await (conn host future)
+  "Wait for FUTURE on CONN; non-nil unless the wait was abandoned.
+Where the user is typing (see `scrutiny-agent-fs--interactive-p') the
+wait ends at the next keystroke -- the request stays in flight and
+its reply still lands in the cache, so nothing is wasted, but Emacs
+is never held up for it."
+  (condition-case err
+      (if (scrutiny-agent-fs--interactive-p)
+          (eq 'answered
+              (while-no-input
+                (scrutiny-agent-await conn future 60)
+                'answered))
+        (scrutiny-agent-await conn future 60)
+        t)
+    ;; An error reply is still a reply; the callback has filed it.
+    (scrutiny-agent-rpc-error t)
+    (error
+     (scrutiny-agent-fs--record-error host 'listing err)
+     nil)))
+
+(defun scrutiny-agent-fs--listing (host directory &optional full also)
+  "The cached (NAME . STAT-PLIST) alist for DIRECTORY on HOST.
 
 Returns the symbol `unavailable' when the directory could not be read
 -- NOT nil, which is the correct answer for a directory that is simply
-empty. Conflating the two makes every empty directory look like a
-failure and silently fall back to TRAMP.
+empty.  Without FULL it may also return `too-large', for a directory
+with more entries than `scrutiny-agent-fs-listing-max-entries'; a
+caller that only wants one file's attributes then asks for those
+instead.  With FULL the listing is fetched whatever its size.
 
-One `fs.listDirectory' with attributes answers every question Emacs is
-about to ask about the files in it."
+On a miss the request goes out together with one for every directory
+above DIRECTORY that is not already cached, so that the walk up the
+tree which follows costs nothing further.  ALSO, if non-nil, is one
+more directory to ask for in the same burst: the caller expects to
+want it next."
   (let* ((key (scrutiny-agent-fs--cache-key host directory))
-         (hit (gethash key scrutiny-agent-fs--dir-cache)))
+         (hit (scrutiny-agent-fs--fresh key)))
     (cond
-     ;; Cache hit (fresh)
-     ((and hit (> scrutiny-agent-fs-cache-ttl 0)
-           (< (float-time (time-since (car hit)))
-              scrutiny-agent-fs-cache-ttl))
+     ((and hit (not (and full (eq (cdr hit) 'too-large))))
       (cdr hit))
-     ;; Interactive context - use stale cache or trigger background fetch
-     ((scrutiny-agent-fs--interactive-p)
-      (if hit
-          (cdr hit)  ; Use stale data rather than blocking
-        ;; No cache - trigger background fetch for next time
-        (scrutiny-agent-fs--fetch-async host directory)
-        (scrutiny-agent-fs--warn host "fetching %s in background" directory)
-        'unavailable))
-     ;; Fetch from agent
+     ((scrutiny-agent-fs--known-absent-p host directory)
+      'unavailable)
      (t
       (let ((conn (scrutiny-agent-fs--conn host)))
         (if (null conn)
             'unavailable
-          (condition-case err
-              (let* ((result (scrutiny-agent-request
-                              conn "fs.listDirectory"
-                              (list :path (directory-file-name directory)
-                                    :attributes t)
-                              60))
-                     (entries
-                      (mapcar (lambda (entry)
-                                (cons (plist-get entry :name)
-                                      (plist-put (copy-sequence entry)
-                                                 :exists t)))
-                              (scrutiny-agent-ops--list
-                               (plist-get result :entries)))))
-                (puthash key (cons (current-time) entries)
-                         scrutiny-agent-fs--dir-cache)
-                entries)
-            ;; Cache the failure as well. A directory the agent will
-            ;; not serve -- outside its roots, unreadable -- is asked
-            ;; about once, not once per file whose attributes are
-            ;; wanted. The TTL applies equally, so a root that becomes
-            ;; readable is picked up shortly.
-            (scrutiny-agent-rpc-error
-             (scrutiny-agent-fs--record-error host 'listing err)
-             (puthash key (cons (current-time) 'unavailable)
-                      scrutiny-agent-fs--dir-cache)
-             'unavailable)
-            (error
-             (scrutiny-agent-fs--record-error host 'listing err)
-             'unavailable))))))))
+          (dolist (dir (scrutiny-agent-fs--ancestors host directory))
+            (unless (string= (scrutiny-agent-fs--cache-key host dir) key)
+              (scrutiny-agent-fs--request-listing conn host dir)))
+          (when also
+            (scrutiny-agent-fs--request-listing conn host also))
+          (let ((future (scrutiny-agent-fs--request-listing
+                         conn host directory full))
+                (stale (gethash key scrutiny-agent-fs--dir-cache)))
+            (cond
+             ((and future
+                   (not (scrutiny-agent-fs--await conn host future)))
+              ;; Abandoned for a keystroke.  What we had is better than
+              ;; nothing; the fresh copy arrives on its own.
+              (if (and stale (not (and full (eq (cdr stale) 'too-large))))
+                  (cdr stale)
+                'unavailable))
+             (t
+              (let ((now (gethash key scrutiny-agent-fs--dir-cache)))
+                (if now (cdr now) 'unavailable)))))))))))
 
 (defun scrutiny-agent-fs--listing-ok (entries)
   "ENTRIES if the listing succeeded (possibly empty), else nil."
   (and (not (eq entries 'unavailable)) (or entries t)))
 
+(defvar scrutiny-agent-fs--expect-directory nil
+  "Non-nil while answering a question only asked about directories.")
+
 (defun scrutiny-agent-fs--stat (host localname)
-  "STAT plist for LOCALNAME on HOST, from the directory cache if possible."
-  (let* ((clean (directory-file-name localname))
+  "STAT plist for LOCALNAME on HOST, or nil if it does not exist.
+
+Answered from the listing of the directory LOCALNAME is in, which is
+fetched (together with the directories above it) if it is not held
+already.  A name that is not in a complete listing does not exist;
+no request is made to confirm it."
+  (let* ((clean (if (string-prefix-p "~" localname)
+                    localname
+                  (directory-file-name (expand-file-name localname "/"))))
          (dir (file-name-directory clean))
          (base (file-name-nondirectory clean)))
-    (or (and dir (> scrutiny-agent-fs-cache-ttl 0)
-             (not (string-empty-p base))
-             ;; Only via the parent's listing when the parent is
-             ;; somewhere the agent will actually look. The roots'
-             ;; own parents never are -- and stat'ing a root is
-             ;; exactly what `dired' does first.
-             (scrutiny-agent-fs--in-roots-p host dir)
-             (let ((entries (scrutiny-agent-fs--listing host dir)))
-               (and (listp entries) (cdr (assoc base entries)))))
-        (scrutiny-agent-fs--stat-uncached host clean))))
+    (cond
+     ;; A `~' the caller did not expand: only the agent can resolve it.
+     ((string-prefix-p "~" clean)
+      (scrutiny-agent-fs--stat-uncached host clean))
+     ;; A root, whose parent the agent will not list.  Its own listing
+     ;; describes it, and is about to be wanted anyway.
+     ((or (null dir) (string-empty-p base)
+          (not (scrutiny-agent-fs--in-roots-p host dir)))
+      (or (and (scrutiny-agent-fs--in-roots-p host clean)
+               (not (eq (scrutiny-agent-fs--listing host clean)
+                        'unavailable))
+               (gethash (scrutiny-agent-fs--cache-key host clean)
+                        scrutiny-agent-fs--self))
+          (scrutiny-agent-fs--stat-uncached host clean)))
+     (t
+      ;; A caller asking whether this is a directory is about to ask
+      ;; what is in it.  Fetch that listing in the same burst.
+      (let ((entries (scrutiny-agent-fs--listing
+                      host dir nil
+                      (and (or scrutiny-agent-fs--expect-directory
+                               (string-suffix-p "/" localname))
+                           clean))))
+        (cond
+         ((listp entries)
+          (let ((entry (cdr (assoc base entries)))
+                (key (scrutiny-agent-fs--cache-key host dir)))
+            ;; A symlink's attributes are its target's, and the target
+            ;; may live in a directory nobody is watching.  A watched
+            ;; listing is therefore only believed about a symlink for
+            ;; the ordinary cache window.
+            (when (and entry
+                       (scrutiny-agent-ops-bool (plist-get entry :isSymlink))
+                       (gethash key scrutiny-agent-fs--watched)
+                       (let ((hit (gethash key scrutiny-agent-fs--dir-cache)))
+                         (and hit (>= (float-time (time-since (car hit)))
+                                      scrutiny-agent-fs-cache-ttl))))
+              (remhash key scrutiny-agent-fs--dir-cache)
+              (setq entries (scrutiny-agent-fs--listing host dir)
+                    entry (and (listp entries) (cdr (assoc base entries)))))
+            entry))
+         ((eq entries 'too-large)
+          (scrutiny-agent-fs--stat-uncached host clean))
+         ;; The directory could not be listed.  If that is because it
+         ;; is not there, neither is anything in it.
+         ((scrutiny-agent-fs--known-absent-p host dir) nil)
+         (t (scrutiny-agent-fs--stat-uncached host clean))))))))
 
 (defun scrutiny-agent-fs--stat-uncached (host path)
   "One `fs.stat' for PATH on HOST, memoized for the cache window.
-Emacs asks about the same file several times inside a single command
--- `file-exists-p', then `file-attributes', then `file-readable-p' --
-and without this each one is its own round trip."
+The slow path: used only where the directory listing cannot answer --
+a directory too large to fetch, or one the agent will not list."
   (let* ((key (concat "\0stat\0" host "\0" path))
          (hit (gethash key scrutiny-agent-fs--dir-cache)))
     (cond
-     ;; Cache hit (fresh)
      ((and hit (> scrutiny-agent-fs-cache-ttl 0)
            (< (float-time (time-since (car hit)))
               scrutiny-agent-fs-cache-ttl))
       (cdr hit))
-     ;; Interactive context - use stale cache if available
-     ((scrutiny-agent-fs--interactive-p)
-      (if hit
-          (cdr hit)  ; Use stale data rather than blocking
-        (scrutiny-agent-fs--warn host "no cached stat for %s during completion" path)
-        nil))
-     ;; Fetch from agent
      (t
-      (let ((result
-             (let ((conn (scrutiny-agent-fs--conn host)))
-               (when conn
-                 (condition-case err
-                     (scrutiny-agent-request conn "fs.stat" (list :path path) 30)
-                   (scrutiny-agent-rpc-error
-                    (scrutiny-agent-fs--record-error host 'stat err)
-                    nil)
-                   (error
-                    (scrutiny-agent-fs--record-error host 'stat err)
-                    nil))))))
-        (when (> scrutiny-agent-fs-cache-ttl 0)
+      (let* ((conn (scrutiny-agent-fs--conn host))
+             (future (and conn
+                          (scrutiny-agent-send conn "fs.stat"
+                                               (list :path path))))
+             (result
+              (cond
+               ((null future) nil)
+               ((scrutiny-agent-fs--await conn host future)
+                (and (null (scrutiny-agent-future-error future))
+                     (scrutiny-agent-future-result future)))
+               ;; Abandoned for a keystroke: the old answer, if any.
+               (t (cdr hit)))))
+        (when (and future (scrutiny-agent-future-done-p future)
+                   (> scrutiny-agent-fs-cache-ttl 0))
           (puthash key (cons (current-time) result)
                    scrutiny-agent-fs--dir-cache))
         result)))))
@@ -606,6 +985,31 @@ and without this each one is its own round trip."
 ;; ---------------------------------------------------------------------
 ;; Handler helpers
 ;; ---------------------------------------------------------------------
+
+(defun scrutiny-agent-fs--home-relative (host localname)
+  "LOCALNAME with a leading `~' replaced by HOST's home directory.
+
+A remote name under the home directory is spelled with a tilde almost
+everywhere -- `abbreviate-file-name' sees to that -- and the tilde
+means the REMOTE home.  Nothing below this point may hand such a name
+to `expand-file-name', which would substitute the home directory of
+the machine Emacs is running on.  It is resolved here, once, for
+every operation."
+  (if (and (string-prefix-p "~" localname)
+           (or (= (length localname) 1) (eq (aref localname 1) ?/)))
+      (let ((home (scrutiny-agent-fs--home host)))
+        (if home
+            (concat home (substring localname 1))
+          localname))
+    localname))
+
+(defun scrutiny-agent-fs--resolve (filename)
+  "Like `scrutiny-agent-fs--parse', with the local name made absolute."
+  (let ((parsed (scrutiny-agent-fs--parse filename)))
+    (and parsed
+         (list (nth 0 parsed) (nth 1 parsed)
+               (scrutiny-agent-fs--home-relative (nth 0 parsed)
+                                                 (nth 2 parsed))))))
 
 (defun scrutiny-agent-fs--dispatch (filename operation args handler)
   "Route OPERATION on FILENAME to HANDLER, or hand it back to TRAMP.
@@ -626,13 +1030,21 @@ through it."
           (when scrutiny-agent-fs-verbose
             (message "dispatch[%s]: not parsed, delegating" operation))
           (scrutiny-agent-fs--delegate operation args))
-      (let ((host (nth 0 parsed))
-            (prefix (nth 1 parsed))
-            (localname (nth 2 parsed)))
+      (let* ((host (nth 0 parsed))
+             (prefix (nth 1 parsed))
+             (conn (scrutiny-agent-fs--conn host))
+             (localname (if conn
+                            (scrutiny-agent-fs--home-relative
+                             host (nth 2 parsed))
+                          (nth 2 parsed))))
         (cond
-         ((not (scrutiny-agent-fs--conn host))
+         ((not conn)
           (when scrutiny-agent-fs-verbose
             (message "dispatch[%s]: no conn for %s, delegating" operation host))
+          (scrutiny-agent-fs--delegate operation args))
+         ;; `~user', or a `~' with the remote home unknown: only the
+         ;; far end can say where that is.
+         ((string-prefix-p "~" localname)
           (scrutiny-agent-fs--delegate operation args))
          ((not (scrutiny-agent-fs--in-roots-p host localname))
           ;; Outside the roots. Either answer from structure (no
@@ -640,37 +1052,77 @@ through it."
           (when scrutiny-agent-fs-verbose
             (message "dispatch[%s]: %s outside roots" operation localname))
           (if scrutiny-agent-fs-roots-are-the-world
-              (scrutiny-agent-fs--outside-roots host localname operation)
+              (scrutiny-agent-fs--outside-roots host prefix localname
+                                                operation args)
             (scrutiny-agent-fs--delegate operation args)))
          (t (funcall handler host prefix localname)))))))
 
-(defun scrutiny-agent-fs--outside-roots (host localname operation)
-  "Answer OPERATION for LOCALNAME, which lies outside HOST's roots.
+(defun scrutiny-agent-fs--structural-names (host localname full match
+                                                 nosort count)
+  "What `directory-files' returns for LOCALNAME, an ancestor of a root.
+The entries are the children that lead down to roots, plus `.' and
+`..', shaped exactly as a real listing would be: no trailing slash,
+MATCH applied, FULL names, sorted unless NOSORT, at most COUNT.  A
+caller walking up the tree with a marker pattern -- project.el looking
+for `.git', `locate-dominating-file' in general -- must get nil when
+nothing matches, or it takes the answer for a hit."
+  (let ((names (append '("." "..")
+                       (scrutiny-agent-fs--root-children host localname))))
+    (when match
+      (setq names (cl-remove-if-not (lambda (n) (string-match-p match n))
+                                    names)))
+    (when full
+      (let ((dir (file-name-as-directory (expand-file-name localname "/"))))
+        (setq names (mapcar (lambda (n) (concat dir n)) names))))
+    (unless nosort (setq names (sort names #'string<)))
+    (if (and (natnump count) (< count (length names)))
+        (cl-subseq names 0 count)
+      names)))
+
+(defun scrutiny-agent-fs--outside-roots (host prefix localname operation args)
+  "Answer OPERATION, called with ARGS, for LOCALNAME outside HOST's roots.
 See `scrutiny-agent-fs-roots-are-the-world'."
-  (let ((ancestor (scrutiny-agent-fs--ancestor-of-root-p host localname)))
+  (let ((ancestor (scrutiny-agent-fs--ancestor-of-root-p host localname))
+        (dir-attributes (list t 1 0 0 nil nil nil 0 "dr-xr-xr-x" t 0 0)))
     (pcase operation
       ((or 'file-exists-p 'file-directory-p 'file-readable-p) ancestor)
       ('file-regular-p nil)
       ('file-symlink-p nil)
       ('file-writable-p nil)
       ('file-modes (and ancestor #o555))
-      ('file-truename (concat (or (file-remote-p localname) "")
-                              (expand-file-name localname "/")))
+      ('file-truename (concat prefix (expand-file-name localname "/")))
       ('file-attributes
+       ;; Enough for a caller to see a directory it may descend; the
+       ;; agent never reported its size or times, so neither do we.
+       (and ancestor dir-attributes))
+      ('directory-files
+       ;; (DIRECTORY &optional FULL MATCH NOSORT COUNT)
        (when ancestor
-         ;; Enough for a caller to see a directory it may descend; the
-         ;; agent never reported its size or times, so neither do we.
-         (list t 1 0 0 nil nil nil 0 "dr-xr-xr-x" t 0 0)))
-      ((or 'directory-files 'file-name-all-completions)
-       (when ancestor
-         (mapcar #'file-name-as-directory
-                 (scrutiny-agent-fs--root-children host localname))))
+         (mapcar (lambda (n) (if (nth 1 args) (concat prefix n) n))
+                 (scrutiny-agent-fs--structural-names
+                  host localname (nth 1 args) (nth 2 args) (nth 3 args)
+                  (nth 4 args)))))
       ('directory-files-and-attributes
+       ;; (DIRECTORY &optional FULL MATCH NOSORT ID-FORMAT COUNT)
        (when ancestor
-         (mapcar (lambda (name)
-                   (cons (file-name-as-directory name)
-                         (list t 1 0 0 nil nil nil 0 "dr-xr-xr-x" t 0 0)))
-                 (scrutiny-agent-fs--root-children host localname))))
+         (mapcar (lambda (n)
+                   (cons (if (nth 1 args) (concat prefix n) n)
+                         dir-attributes))
+                 (scrutiny-agent-fs--structural-names
+                  host localname (nth 1 args) (nth 2 args) (nth 3 args)
+                  (nth 5 args)))))
+      ('file-name-all-completions
+       ;; (FILE DIRECTORY): directories complete with a slash, as
+       ;; everywhere else.
+       (when ancestor
+         (let ((file (or (nth 0 args) "")) (out nil))
+           (dolist (n (scrutiny-agent-fs--root-children host localname))
+             (when (string-prefix-p file n)
+               (push (file-name-as-directory n) out)))
+           (when (string-prefix-p file ".")
+             (push "./" out)
+             (when (string-prefix-p file "..") (push "../" out)))
+           (nreverse out))))
       ('vc-registered nil)
       (_ nil))))
 
@@ -696,8 +1148,9 @@ See `scrutiny-agent-fs-roots-are-the-world'."
   (scrutiny-agent-fs--dispatch
    filename 'file-directory-p (list filename)
    (lambda (host _prefix localname)
-     (scrutiny-agent-ops-bool
-      (plist-get (scrutiny-agent-fs--stat host localname) :isDir)))))
+     (let ((scrutiny-agent-fs--expect-directory t))
+       (scrutiny-agent-ops-bool
+        (plist-get (scrutiny-agent-fs--stat host localname) :isDir))))))
 
 (defun scrutiny-agent-fs--handle-file-regular-p (filename)
   (scrutiny-agent-fs--dispatch
@@ -753,11 +1206,25 @@ See `scrutiny-agent-fs-roots-are-the-world'."
   (scrutiny-agent-fs--dispatch
    filename 'file-truename (list filename)
    (lambda (host prefix localname)
-     (let ((stat (scrutiny-agent-fs--stat host localname)))
-       (let ((real (plist-get stat :path)))
-	 (if real
-	     (concat prefix real)
-           (scrutiny-agent-fs--delegate 'file-truename (list filename))))))))
+     (let* ((stat (scrutiny-agent-fs--stat host localname))
+            (real (plist-get stat :path)))
+       (cond
+        (real (concat prefix real))
+        ;; Not there: nothing to resolve in the last component.  The
+        ;; directory it would be in may still be reached by a symlink.
+        ((not (string-prefix-p "~" localname))
+         (let* ((clean (directory-file-name (expand-file-name localname "/")))
+                (dir (file-name-directory clean))
+                (parent (and dir (not (string= clean "/"))
+                             (scrutiny-agent-fs--in-roots-p host dir)
+                             (plist-get (scrutiny-agent-fs--stat host dir)
+                                        :path))))
+           (concat prefix
+                   (if parent
+                       (concat (file-name-as-directory parent)
+                               (file-name-nondirectory clean))
+                     clean))))
+        (t (scrutiny-agent-fs--delegate 'file-truename (list filename))))))))
 
 ;; ---------------------------------------------------------------------
 ;; Names
@@ -799,7 +1266,7 @@ See `scrutiny-agent-fs-roots-are-the-world'."
 
 (defun scrutiny-agent-fs--names (host directory full match nosort)
   "Directory entry names, honoring `directory-files' arguments."
-  (let* ((entries (scrutiny-agent-fs--listing host directory))
+  (let* ((entries (scrutiny-agent-fs--listing host directory t))
          (names (append '("." "..")
                         (mapcar #'car (and (listp entries) entries)))))
     (when match
@@ -816,7 +1283,7 @@ See `scrutiny-agent-fs-roots-are-the-world'."
   (scrutiny-agent-fs--dispatch
    directory 'directory-files (append (list directory full match nosort) rest)
    (lambda (host prefix localname)
-     (let ((entries (scrutiny-agent-fs--listing host localname)))
+     (let ((entries (scrutiny-agent-fs--listing host localname t)))
        (cond
         ((scrutiny-agent-fs--listing-ok entries)
          (mapcar (lambda (name) (if (and full (not (file-remote-p name)))
@@ -833,7 +1300,7 @@ See `scrutiny-agent-fs-roots-are-the-world'."
   (scrutiny-agent-fs--dispatch
    directory 'directory-files-and-attributes (append (list directory full match nosort id-format) rest)
    (lambda (host prefix localname)
-     (let ((entries (scrutiny-agent-fs--listing host localname)))
+     (let ((entries (scrutiny-agent-fs--listing host localname t)))
        (cond
         ((scrutiny-agent-fs--listing-ok entries)
          (mapcar
@@ -859,7 +1326,7 @@ See `scrutiny-agent-fs-roots-are-the-world'."
   (scrutiny-agent-fs--dispatch
    directory 'file-name-all-completions (list file directory)
    (lambda (host _prefix localname)
-     (let ((entries (scrutiny-agent-fs--listing host localname)))
+     (let ((entries (scrutiny-agent-fs--listing host localname t)))
        (cond
         ;; Listing succeeded (possibly empty)
         ((scrutiny-agent-fs--listing-ok entries)
@@ -895,18 +1362,98 @@ See `scrutiny-agent-fs-roots-are-the-world'."
 ;; Reading
 ;; ---------------------------------------------------------------------
 
+(defun scrutiny-agent-fs--read-params (conn localname)
+  "Parameters for a `fs.readFile' of LOCALNAME on CONN."
+  (nconc (list :path localname :base64 t :stat t)
+         (and (scrutiny-agent-feature-p conn "fs.readFile.maxBytes")
+              (list :maxBytes scrutiny-agent-fs-max-inline-bytes))))
+
 (defun scrutiny-agent-fs--fetch (host localname)
-  "Raw bytes of LOCALNAME on HOST as a unibyte string, or nil."
-  (let ((conn (scrutiny-agent-fs--conn host)))
+  "Raw bytes of LOCALNAME on HOST as a unibyte string.
+Returns nil if it could not be read, and the symbol `too-large' if the
+agent declined to send more than `scrutiny-agent-fs-max-inline-bytes'.
+
+Uses the body `scrutiny-agent-fs--prefetch' asked for, if one is on
+its way.  The attributes that come back with the bytes are filed in
+the cache, so the modification time Emacs records for the buffer is
+that of the bytes it actually holds."
+  (let* ((conn (scrutiny-agent-fs--conn host))
+         (bkey (concat host "\0" localname))
+         (ahead (gethash bkey scrutiny-agent-fs--bodies)))
+    (remhash bkey scrutiny-agent-fs--bodies)
     (when conn
-      (condition-case nil
-          (let ((result (scrutiny-agent-request
-			 conn "fs.readFile"
-			 (list :path localname :base64 t :stat t)
-			 300)))
-            (base64-decode-string (or (plist-get result :contentBase64) "")))
-	(scrutiny-agent-rpc-error nil)
-	(error nil)))))
+      (condition-case err
+          (let ((result (scrutiny-agent-await
+                         conn
+                         (or (cdr ahead)
+                             (scrutiny-agent-send
+                              conn "fs.readFile"
+                              (scrutiny-agent-fs--read-params conn localname)))
+                         300)))
+            (if (eq (plist-get result :tooLarge) t)
+                'too-large
+              (scrutiny-agent-fs--note-attributes host localname result)
+              (base64-decode-string
+               (or (plist-get result :contentBase64) ""))))
+        (error
+         (scrutiny-agent-fs--record-error host 'read err)
+         nil)))))
+
+(defun scrutiny-agent-fs--note-attributes (host localname result)
+  "Update LOCALNAME's cached size and times from RESULT, if it is cached."
+  (let* ((clean (directory-file-name localname))
+         (hit (gethash (scrutiny-agent-fs--cache-key
+                        host (file-name-directory clean))
+                       scrutiny-agent-fs--dir-cache))
+         (cell (and hit (listp (cdr hit))
+                    (assoc (file-name-nondirectory clean) (cdr hit)))))
+    (when cell
+      (let ((stat (cdr cell)))
+        (dolist (key '(:size :mtime :mtimeNs))
+          (when (plist-get result key)
+            (setq stat (plist-put stat key (plist-get result key)))))
+        (setcdr cell stat)))))
+
+(defun scrutiny-agent-fs--prefetch (filename &rest _)
+  "Ask for everything opening FILENAME will need, without waiting.
+Advice before `find-file-noselect'.  The listings of FILENAME's
+directory and of every directory above it, and the file's contents,
+go out as one burst; by the time `find-file' asks its first question
+the answers to all of them are on their way back together."
+  (when (and scrutiny-agent-fs-prefetch (stringp filename))
+    (let ((parsed (scrutiny-agent-fs--resolve (expand-file-name filename))))
+      (when parsed
+        (let* ((host (nth 0 parsed))
+               (localname (nth 2 parsed))
+               (conn (scrutiny-agent-connection host))
+               (bkey (concat host "\0" localname)))
+          (when (and conn
+                     (not (string-prefix-p "~" localname))
+                     (not (string-suffix-p "/" localname))
+                     (scrutiny-agent-fs--in-roots-p host localname)
+                     (not (get-file-buffer (expand-file-name filename))))
+            (dolist (dir (scrutiny-agent-fs--ancestors
+                          host (file-name-directory localname)))
+              (scrutiny-agent-fs--request-listing conn host dir))
+            ;; Bodies nobody collected (the name turned out to be a
+            ;; directory, the open was abandoned) do not accumulate.
+            (maphash (lambda (key value)
+                       (when (> (float-time (time-since (car value))) 30)
+                         (remhash key scrutiny-agent-fs--bodies)))
+                     scrutiny-agent-fs--bodies)
+            (unless (or (gethash bkey scrutiny-agent-fs--bodies)
+                        ;; Known not to be a readable file: nothing to
+                        ;; fetch.  Unknown is the usual case, and the
+                        ;; agent answers an error for a miss.
+                        (scrutiny-agent-fs--known-absent-p
+                         host (file-name-directory localname)))
+              (puthash bkey
+                       (cons (current-time)
+                             (scrutiny-agent-send
+                              conn "fs.readFile"
+                              (scrutiny-agent-fs--read-params
+                               conn localname)))
+                       scrutiny-agent-fs--bodies))))))))
 
 (defun scrutiny-agent-fs--handle-file-local-copy (filename)
   (scrutiny-agent-fs--dispatch
@@ -914,27 +1461,29 @@ See `scrutiny-agent-fs-roots-are-the-world'."
    (lambda (host _prefix localname)
      (let ((stat (scrutiny-agent-fs--stat host localname)))
        (cond
-        ;; File doesn't exist
         ((not (scrutiny-agent-ops-bool (plist-get stat :exists)))
-         (scrutiny-agent-fs--warn host "file-local-copy: %s does not exist" localname)
+         (remhash (concat host "\0" localname) scrutiny-agent-fs--bodies)
          nil)
-        ;; File too large for inline transfer - must delegate
+        ;; Too large to hold in one reply: TRAMP can stream it.
         ((> (or (plist-get stat :size) 0) scrutiny-agent-fs-max-inline-bytes)
-         (scrutiny-agent-fs--warn host "file-local-copy: %s too large, delegating" localname)
+         (remhash (concat host "\0" localname) scrutiny-agent-fs--bodies)
          (scrutiny-agent-fs--delegate 'file-local-copy (list filename)))
-        ;; Normal case - fetch via agent
         (t
          (let ((bytes (scrutiny-agent-fs--fetch host localname)))
-           (if (null bytes)
-               (progn
-                 (scrutiny-agent-fs--warn host "file-local-copy: failed to fetch %s" localname)
-                 nil)
+           (cond
+            ((eq bytes 'too-large)
+             (scrutiny-agent-fs--delegate 'file-local-copy (list filename)))
+            ((null bytes)
+             (scrutiny-agent-fs--warn
+              host "file-local-copy: failed to fetch %s" localname)
+             nil)
+            (t
              (let ((tmp (make-temp-file "scrutiny-agent-fs")))
                (let ((coding-system-for-write 'binary))
                  (with-temp-file tmp
                    (set-buffer-multibyte nil)
                    (insert bytes)))
-               tmp)))))))))
+               tmp))))))))))
 
 (defun scrutiny-agent-fs--handle-insert-file-contents
     (filename &optional visit beg end replace)
@@ -943,16 +1492,18 @@ See `scrutiny-agent-fs-roots-are-the-world'."
 The bytes are fetched over the agent into a local temp file and then
 handed to the ordinary local `insert-file-contents'.  That is what
 gets coding-system detection, REPLACE and BEG/END right -- reproducing
-those here would be a large and subtle way to corrupt buffers."
+those here would be a large and subtle way to corrupt buffers.
+
+A file that is not there signals `file-missing', as it does locally.
+That is not a detail: it is how `find-file' learns it is creating a
+new file, and how every caller that probes for an optional file
+(`.gitmodules', `.dir-locals.el') learns there is none."
   (scrutiny-agent-fs--dispatch
    filename 'insert-file-contents (list filename visit beg end replace)
    (lambda (host _prefix localname)
      (let ((local (scrutiny-agent-fs--handle-file-local-copy filename)))
-       (if (null local)
-           ;; Failed to get file - signal error instead of delegating to TRAMP
-           (progn
-             (scrutiny-agent-fs--warn host "insert-file-contents: failed for %s" localname)
-             (error "Cannot read file %s via scrutiny-agent" filename))
+       (cond
+        (local
          (unwind-protect
              (let ((result (insert-file-contents local nil beg end replace)))
                (when visit
@@ -965,11 +1516,51 @@ those here would be a large and subtle way to corrupt buffers."
                   (or (nth 5 (file-attributes filename)) 0))
                  (set-buffer-modified-p nil))
                (list filename (cadr result)))
-           (delete-file local)))))))
+           (delete-file local)))
+        ((file-exists-p filename)
+         (scrutiny-agent-fs--warn
+          host "insert-file-contents: failed for %s" localname)
+         (signal 'file-error
+                 (list "Opening input file" "Could not read over scrutiny-agent"
+                       filename)))
+        (t
+         (when visit
+           (setq buffer-file-name filename)
+           (set-visited-file-modtime -1)
+           (set-buffer-modified-p nil))
+         (signal 'file-missing
+                 (list "Opening input file" "No such file or directory"
+                       filename))))))))
 
 ;; ---------------------------------------------------------------------
 ;; Writing
 ;; ---------------------------------------------------------------------
+
+(defun scrutiny-agent-fs--expected-mtime (conn host localname filename visit)
+  "The mtime FILENAME must still have for a save to go ahead, or nil.
+
+Non-nil only when the current buffer is saving the file it visits,
+has a modification time on record, and nothing we know says the file
+has changed since -- the case where Emacs is about to overwrite a
+file on the strength of what this client has cached.  The write is
+then made conditional on that time (`ifMtimeNs'), so the agent, which
+can look, is the one that decides; a change that has not reached us
+yet cannot be silently overwritten.
+
+When we already know the file changed, Emacs has asked the user and
+been told to go ahead, and the write is unconditional."
+  (and (eq visit t)
+       buffer-file-name
+       (scrutiny-agent-feature-p conn "fs.writeFile.ifMtimeNs")
+       (equal (expand-file-name filename) (expand-file-name buffer-file-name))
+       (let ((recorded (visited-file-modtime)))
+         (and (consp recorded)
+              (> (float-time recorded) 0)
+              (let* ((stat (scrutiny-agent-fs--stat host localname))
+                     (known (and stat (scrutiny-agent-fs--mtime stat))))
+                (and known
+                     (time-equal-p known recorded)
+                     (scrutiny-agent-fs--time-ns recorded)))))))
 
 (defun scrutiny-agent-fs--handle-write-region
     (start end filename &optional append visit lockname mustbenew)
@@ -977,19 +1568,27 @@ those here would be a large and subtle way to corrupt buffers."
 
 The region is encoded through a local temp file first, so the buffer's
 coding system applies exactly as it would locally; the resulting bytes
-are what get uploaded."
+are what get uploaded.
+
+A save costs one request.  The reply describes the file as it now is,
+and that goes straight into the cache, so nothing is re-read
+afterwards; and the check that the file has not changed underneath
+the buffer is made by the agent as part of the write rather than by a
+request of its own beforehand."
   (let ((args (list start end filename append visit lockname mustbenew)))
     (scrutiny-agent-fs--dispatch
      filename 'write-region args
      (lambda (host _prefix localname)
+       (run-hooks 'scrutiny-agent-fs-change-hook)
        (if (or append                            ; needs read-modify-write
                (not (scrutiny-agent-fs--writable-p host)))
            (scrutiny-agent-fs--delegate 'write-region args)
          (when (and mustbenew (file-exists-p filename)
                     (or (not (eq mustbenew 'excl))
-			(error "File exists: %s" filename)))
+                        (signal 'file-already-exists
+                                (list "File exists" filename))))
            (unless (y-or-n-p (format "File %s exists; overwrite? " filename))
-             (error "Canceled")))
+             (signal 'file-already-exists (list "File exists" filename))))
          (let ((tmp (make-temp-file "scrutiny-agent-fs-out"))
                (bytes nil))
            (unwind-protect
@@ -1004,40 +1603,91 @@ are what get uploaded."
                                  (insert-file-contents-literally tmp))
                                (buffer-string))))
              (delete-file tmp))
-           (let ((conn (scrutiny-agent-fs--conn host)))
+           (let* ((conn (scrutiny-agent-fs--conn host))
+                  (expected (scrutiny-agent-fs--expected-mtime
+                             conn host localname filename visit))
+                  (params (list :path localname
+                                :contentBase64
+                                (base64-encode-string bytes t))))
              (condition-case err
                  (let ((result (scrutiny-agent-request
-				conn "fs.writeFile"
-				(list :path localname
-                                      :contentBase64
-                                      (base64-encode-string bytes t))
-				300)))
-                   (scrutiny-agent-fs--invalidate host localname)
-                   (when visit
+                                conn "fs.writeFile"
+                                (if expected
+                                    (append params (list :ifMtimeNs expected))
+                                  params)
+                                300)))
+                   (when (eq (plist-get result :conflict) t)
+                     ;; The file moved on after we last heard about it.
+                     ;; Nothing was written.  This is the question Emacs
+                     ;; asks when it notices in time; ask it now.
+                     (scrutiny-agent-fs--invalidate host localname)
+                     (unless (yes-or-no-p
+                              (format "%s has changed since visited or \
+saved.  Save anyway? "
+                                      (file-name-nondirectory filename)))
+                       (user-error "Save not confirmed"))
+                     (setq result (scrutiny-agent-request
+                                   conn "fs.writeFile" params 300)))
+                   (unless (and (plist-get result :entry)
+                                (scrutiny-agent-fs--file-entry
+                                 host localname (plist-get result :entry)))
+                     (scrutiny-agent-fs--invalidate host localname))
+                   (cond
+                    ((eq visit t)
                      (setq buffer-file-name filename)
                      (set-visited-file-modtime
-                      (time-convert (or (plist-get result :mtime) 0) 'list))
+                      (or (scrutiny-agent-fs--mtime result) 0))
                      (set-buffer-modified-p nil))
-                   (unless (or (eq visit t) (null visit) (stringp visit))
+                    ((stringp visit)
+                     (setq buffer-file-name visit)
+                     (set-buffer-modified-p nil)))
+                   ;; As the built-in does: announced unless VISIT is
+                   ;; some other non-nil value, and never in batch.
+                   (when (and (not noninteractive)
+                              (or (eq visit t) (null visit) (stringp visit)))
                      (message "Wrote %s" filename))
                    nil)
                (scrutiny-agent-rpc-error
-		;; Never lose a save: if the agent refused, TRAMP still
-		;; knows how to write the file.
-		(scrutiny-agent--log conn "fs: write refused (%s), using TRAMP"
+                ;; Never lose a save: if the agent refused, TRAMP still
+                ;; knows how to write the file.
+                (scrutiny-agent--log conn "fs: write refused (%s), using TRAMP"
                                      (scrutiny-agent-ops-error-name
                                       (nth 1 err)))
-		(scrutiny-agent-fs--delegate 'write-region args))))))))))
+                (scrutiny-agent-fs--delegate 'write-region args))))))))))
 
-(defun scrutiny-agent-fs--write-op (operation args host localname thunk)
-  "Run THUNK for a mutating OPERATION, or delegate when unavailable."
+(defun scrutiny-agent-fs--write-op (operation args host localname thunk
+                                              &optional after)
+  "Run THUNK for a mutating OPERATION on LOCALNAME, or delegate.
+
+On success AFTER is called to bring the cache up to date; without one
+everything cached about LOCALNAME is dropped.
+
+Only a refusal on policy grounds is handed to TRAMP -- an agent
+without `--allow-write', a path outside its roots -- because there
+TRAMP may be allowed to do what the agent is not.  Any other failure
+is the operating system's answer and is reported as one: asking TRAMP
+to try again would open a second connection in order to fail the same
+way."
+  (run-hooks 'scrutiny-agent-fs-change-hook)
   (if (not (scrutiny-agent-fs--writable-p host))
       (scrutiny-agent-fs--delegate operation args)
-    (condition-case nil
+    (condition-case err
         (prog1 (funcall thunk)
-          (scrutiny-agent-fs--invalidate host localname))
+          (if after
+              (funcall after)
+            (scrutiny-agent-fs--invalidate host localname)))
       (scrutiny-agent-rpc-error
-       (scrutiny-agent-fs--delegate operation args)))))
+       (scrutiny-agent-fs--invalidate host localname)
+       (pcase (nth 1 err)
+         (1005 (scrutiny-agent-fs--delegate operation args))
+         (1001 (signal 'file-missing
+                       (list (symbol-name operation)
+                             "No such file or directory"
+                             (car args))))
+         (_ (signal 'file-error
+                    (list (symbol-name operation)
+                          (or (nth 2 err) "failed")
+                          (car args)))))))))
 
 (defun scrutiny-agent-fs--handle-make-directory (dir &optional parents)
   (let ((args (list dir parents)))
@@ -1059,12 +1709,20 @@ are what get uploaded."
     (scrutiny-agent-fs--dispatch
      filename 'delete-file args
      (lambda (host _prefix localname)
-       (scrutiny-agent-fs--write-op
-	'delete-file args host localname
-	(lambda ()
-          (scrutiny-agent-request (scrutiny-agent-fs--conn host) "fs.delete"
-                                  (list :path localname) 60)
-          nil))))))
+       ;; Deleting what is not there is not an error, and what is cached
+       ;; usually says so without asking.
+       (when (scrutiny-agent-fs--stat host localname)
+         (condition-case nil
+             (scrutiny-agent-fs--write-op
+              'delete-file args host localname
+              (lambda ()
+                (scrutiny-agent-request (scrutiny-agent-fs--conn host)
+                                        "fs.delete" (list :path localname) 60)
+                nil)
+              (lambda ()
+                (unless (scrutiny-agent-fs--file-entry host localname nil)
+                  (scrutiny-agent-fs--invalidate host localname))))
+           (file-missing nil)))))))
 
 (defun scrutiny-agent-fs--handle-delete-directory
     (directory &optional recursive trash)
@@ -1084,36 +1742,51 @@ are what get uploaded."
 
 (defun scrutiny-agent-fs--handle-rename-file (file newname &optional ok-if-exists)
   (let ((args (list file newname ok-if-exists))
-        (from (scrutiny-agent-fs--parse file))
-        (to (scrutiny-agent-fs--parse newname)))
+        (from (scrutiny-agent-fs--resolve file))
+        (to (scrutiny-agent-fs--resolve newname)))
     ;; Both ends must be on the same host for the agent to do it in one
     ;; operation; a cross-host rename is a copy plus a delete, which
     ;; TRAMP already implements.
     (if (not (and from to (equal (nth 0 from) (nth 0 to))))
         (scrutiny-agent-fs--delegate 'rename-file args)
-      (let ((host (nth 0 from)))
+      (let* ((host (nth 0 from))
+             (source (nth 2 from))
+             (target (nth 2 to))
+             (entry (scrutiny-agent-fs--stat host source)))
         (unless (or ok-if-exists (not (file-exists-p newname)))
-          (error "File exists: %s" newname))
+          (signal 'file-already-exists (list "File exists" newname)))
         (scrutiny-agent-fs--write-op
-         'rename-file args host (nth 2 from)
+         'rename-file args host source
          (lambda ()
            (scrutiny-agent-request (scrutiny-agent-fs--conn host) "fs.rename"
-                                   (list :from (nth 2 from) :to (nth 2 to))
+                                   (list :from source :to target)
                                    120)
-           (scrutiny-agent-fs--invalidate host (nth 2 to))
-           nil))))))
+           nil)
+         (lambda ()
+           ;; The entry moves; what it says about the file is unchanged.
+           (unless (scrutiny-agent-fs--file-entry host source nil)
+             (scrutiny-agent-fs--invalidate host source))
+           (unless (and entry
+                        (scrutiny-agent-fs--file-entry
+                         host target
+                         (plist-put
+                          (plist-put (copy-sequence entry)
+                                     :name (file-name-nondirectory
+                                            (directory-file-name target)))
+                          :path (directory-file-name target))))
+             (scrutiny-agent-fs--invalidate host target))))))))
 
 (defun scrutiny-agent-fs--handle-copy-file
     (file newname &optional ok-if-exists keep-time preserve-uid preserve-perms)
   (let ((args (list file newname ok-if-exists keep-time preserve-uid
                     preserve-perms))
-        (from (scrutiny-agent-fs--parse file))
-        (to (scrutiny-agent-fs--parse newname)))
+        (from (scrutiny-agent-fs--resolve file))
+        (to (scrutiny-agent-fs--resolve newname)))
     (if (not (and from to (equal (nth 0 from) (nth 0 to))))
         (scrutiny-agent-fs--delegate 'copy-file args)
       (let ((host (nth 0 from)))
         (unless (or ok-if-exists (not (file-exists-p newname)))
-          (error "File exists: %s" newname))
+          (signal 'file-already-exists (list "File exists" newname)))
         (scrutiny-agent-fs--write-op
          'copy-file args host (nth 2 to)
          (lambda ()
@@ -1130,13 +1803,25 @@ are what get uploaded."
     (scrutiny-agent-fs--dispatch
      filename 'set-file-modes args
      (lambda (host _prefix localname)
-       (scrutiny-agent-fs--write-op
-	'set-file-modes args host localname
-	(lambda ()
-          (scrutiny-agent-request (scrutiny-agent-fs--conn host) "fs.chmod"
-                                  (list :path localname :mode mode)
-                                  60)
-          nil))))))
+       (if (eql mode (plist-get (scrutiny-agent-fs--stat host localname)
+                                :mode))
+           ;; Already so.  `save-buffer' restores the mode after every
+           ;; write, and the agent's write preserved it.
+           nil
+         (scrutiny-agent-fs--write-op
+          'set-file-modes args host localname
+          (lambda ()
+            (scrutiny-agent-request (scrutiny-agent-fs--conn host) "fs.chmod"
+                                    (list :path localname :mode mode)
+                                    60)
+            nil)
+          (lambda ()
+            (let ((entry (scrutiny-agent-fs--stat host localname)))
+              (unless (and entry
+                           (scrutiny-agent-fs--file-entry
+                            host localname
+                            (plist-put (copy-sequence entry) :mode mode)))
+                (scrutiny-agent-fs--invalidate host localname))))))))))
 
 ;; ---------------------------------------------------------------------
 ;; Buffer bookkeeping
@@ -1271,6 +1956,163 @@ precisely the connection this whole file exists to avoid needing."
     (_filename &optional _group)
   t)
 
+;; The next group is the difference between "accelerated" and "fast".
+;; Each of these used to be handed to TRAMP, and the first one to run
+;; made TRAMP open its own connection to the host -- on a Teleport link
+;; that is seconds, spent on the first keystroke in a buffer
+;; (`lock-file') or the first Dired (`file-system-info'), and then every
+;; later call was a round trip on that second connection.  None of them
+;; needs the remote at all, or needs more than what is already cached.
+
+(defun scrutiny-agent-fs--handle-lock-file (file)
+  "Do what locking is for, without the lock file.
+
+Emacs locks a file on the first change to its buffer for two reasons:
+to warn that the file changed on disk since it was read, and to warn
+that someone else is editing it.  The first is answered here, from
+attributes the agent keeps current, at no cost.  The second needs a
+`.#name' file created on the remote and removed at every save -- two
+round trips per save for a warning that only fires if the other
+editor is also an Emacs, on a host reached through an agent that is
+by construction one user's.  It is not done."
+  (when (and buffer-file-truename
+             (equal (expand-file-name file)
+                    (expand-file-name (or buffer-file-name "")))
+             (not (verify-visited-file-modtime))
+             (file-exists-p file))
+    (ask-user-about-supersession-threat file))
+  nil)
+
+(defun scrutiny-agent-fs--handle-file-accessible-directory-p (filename)
+  (and (file-directory-p filename)
+       (file-readable-p filename)
+       (file-executable-p filename)))
+
+(defun scrutiny-agent-fs--handle-exec-path ()
+  "The remote search path for executables: nothing.
+
+`executable-find' with its REMOTE argument asks for this when
+`default-directory' is on a host of ours -- magit does so before
+reporting that a directory is not a repository -- and TRAMP would
+answer it by opening a connection and running a shell to read $PATH.
+Nothing on that path is inside the roots, so no entry of it could be
+examined anyway; the honest answer is an empty one, and it costs no
+round trip.  Programs are run through `process-file', which does not
+consult this."
+  nil)
+
+(defun scrutiny-agent-fs--handle-file-executable-p (filename)
+  (scrutiny-agent-fs--dispatch
+   filename 'file-executable-p (list filename)
+   (lambda (host _prefix localname)
+     (let* ((stat (scrutiny-agent-fs--stat host localname))
+            (mode (plist-get stat :mode)))
+       ;; The agent reports whether it can read and write; execute
+       ;; permission is read off the mode bits, any of which will do
+       ;; for the only user the agent runs as.
+       (and (scrutiny-agent-ops-bool (plist-get stat :exists))
+            (integerp mode)
+            (/= 0 (logand mode #o111)))))))
+
+(defun scrutiny-agent-fs--handle-file-equal-p (file1 file2)
+  (let ((true1 (file-truename file1))
+        (true2 (file-truename file2)))
+    (and true1 true2
+         (string= (directory-file-name true1) (directory-file-name true2)))))
+
+(defun scrutiny-agent-fs--handle-file-in-directory-p (file dir)
+  (let ((file (file-name-as-directory (file-truename file)))
+        (dir (file-name-as-directory (file-truename dir))))
+    (string-prefix-p dir file)))
+
+(defun scrutiny-agent-fs--handle-file-name-sans-versions
+    (name &optional keep-backup-version)
+  "String surgery: run the built-in on the bare name."
+  (let ((file-name-handler-alist nil))
+    (file-name-sans-versions name keep-backup-version)))
+
+(defun scrutiny-agent-fs--handle-file-notify-add-watch (&rest _)
+  "Decline, so the caller polls instead -- which here costs nothing.
+`auto-revert-mode' falls back to checking the file's modification
+time on a timer, and that is answered from attributes the agent
+already keeps current.  TRAMP's implementation would start a watcher
+process on the remote over a connection of its own."
+  (signal 'file-notify-error
+          '("Not needed" "scrutiny-agent keeps file attributes current")))
+
+(defvar scrutiny-agent-fs-change-hook nil
+  "Hook run just before this client changes anything on a configured host.
+That is: before a file is written, renamed, deleted or has its mode
+changed through this handler, and before any process is started in a
+directory there.  Whatever a layer has worked out from the state of
+the remote filesystem -- answers to git commands it ran early, say --
+is about to stop being true.")
+
+(defun scrutiny-agent-fs--after-foreign-change (conn host)
+  "Catch the cache up after something else changed files on HOST.
+A git command that ran over CONN, for instance.  Directories the agent
+watches need nothing: the changes were pushed, and a current agent
+delivers them ahead of the reply to the command that made them.  The
+rest are only held on a timer, so they are dropped."
+  (let ((prefix (concat host "\0"))
+        (ordered (scrutiny-agent-feature-p conn "fs.changed.ordered")))
+    (maphash (lambda (key _value)
+               (cond
+                ((string-prefix-p (concat "\0stat\0" prefix) key)
+                 (remhash key scrutiny-agent-fs--dir-cache))
+                ((and (string-prefix-p prefix key)
+                      (not (and ordered
+                                (gethash key scrutiny-agent-fs--watched))))
+                 (scrutiny-agent-fs--forget-key key))))
+             scrutiny-agent-fs--dir-cache)))
+
+(defvar scrutiny-agent-fs-start-process-function nil
+  "Function starting an asynchronous process in a directory on a host.
+Called with a `make-process' argument plist (`:name', `:buffer',
+`:command', `:filter', `:sentinel', ...) and `default-directory'
+remote.  Returns a process object, or the symbol `decline' to have
+TRAMP start it.  Set by `scrutiny-agent-magit-mode', which runs git
+this way.")
+
+(defun scrutiny-agent-fs--start-process (operation args plist)
+  "Start a process described by PLIST, or hand OPERATION ARGS to TRAMP."
+  (run-hooks 'scrutiny-agent-fs-change-hook)
+  (let ((process (if scrutiny-agent-fs-start-process-function
+                     (funcall scrutiny-agent-fs-start-process-function plist)
+                   'decline)))
+    (if (eq process 'decline)
+        (scrutiny-agent-fs--delegate operation args)
+      process)))
+
+(defun scrutiny-agent-fs--handle-start-file-process
+    (name buffer program &rest program-args)
+  (scrutiny-agent-fs--start-process
+   'start-file-process (append (list name buffer program) program-args)
+   (list :name name :buffer buffer
+         :command (and program (cons program program-args)))))
+
+(defun scrutiny-agent-fs--handle-make-process (&rest args)
+  (scrutiny-agent-fs--start-process 'make-process args args))
+
+(defvar scrutiny-agent-fs-process-file-function nil
+  "Function serving `process-file' in a directory on a configured host.
+Called with (PROGRAM INFILE BUFFER DISPLAY ARGS) and `default-directory'
+remote.  Returns the exit status, or the symbol `decline' to have the
+call handed to TRAMP.  Set by `scrutiny-agent-magit-mode', which
+routes git through the agent; this is the one place every package
+that runs git on a remote file reaches, whichever package it is.")
+
+(defun scrutiny-agent-fs--handle-process-file
+    (program &optional infile buffer display &rest args)
+  (let ((status (if scrutiny-agent-fs-process-file-function
+                    (funcall scrutiny-agent-fs-process-file-function
+                             program infile buffer display args)
+                  'decline)))
+    (if (eq status 'decline)
+        (scrutiny-agent-fs--delegate
+         'process-file (append (list program infile buffer display) args))
+      status)))
+
 (defun scrutiny-agent-fs--handle-insert-directory
     (file switches &optional wildcard full-directory-p)
   "Render a dired listing from the agent's attributes.
@@ -1290,7 +2132,7 @@ made, instead of TRAMP shelling out to `ls' on the far end."
         ;; Listing unavailable - show empty rather than falling back to TRAMP
         ((not (scrutiny-agent-fs--listing-ok
                (scrutiny-agent-fs--listing
-                host (directory-file-name localname))))
+                host (directory-file-name localname) t)))
          (scrutiny-agent-fs--warn host "insert-directory: listing unavailable for %s" localname)
          ;; Insert a minimal "empty" listing so dired doesn't error
          (insert "  total 0\n"))
@@ -1359,9 +2201,32 @@ made, instead of TRAMP shelling out to `ls' on the far end."
     (file-acl . scrutiny-agent-fs--handle-file-acl)
     (file-selinux-context . scrutiny-agent-fs--handle-file-selinux-context)
     (file-ownership-preserved-p
-     . scrutiny-agent-fs--handle-file-ownership-preserved-p))
+     . scrutiny-agent-fs--handle-file-ownership-preserved-p)
+    (lock-file . scrutiny-agent-fs--handle-lock-file)
+    (unlock-file . ignore)
+    (file-locked-p . ignore)
+    (make-lock-file-name . ignore)
+    (set-file-acl . ignore)
+    (set-file-selinux-context . ignore)
+    (file-system-info . ignore)
+    (file-accessible-directory-p
+     . scrutiny-agent-fs--handle-file-accessible-directory-p)
+    (file-executable-p . scrutiny-agent-fs--handle-file-executable-p)
+    (file-equal-p . scrutiny-agent-fs--handle-file-equal-p)
+    (file-in-directory-p . scrutiny-agent-fs--handle-file-in-directory-p)
+    (file-name-sans-versions
+     . scrutiny-agent-fs--handle-file-name-sans-versions)
+    (file-notify-add-watch . scrutiny-agent-fs--handle-file-notify-add-watch)
+    (process-file . scrutiny-agent-fs--handle-process-file)
+    (start-file-process . scrutiny-agent-fs--handle-start-file-process)
+    (make-process . scrutiny-agent-fs--handle-make-process)
+    (exec-path . scrutiny-agent-fs--handle-exec-path))
   "Operations this handler serves over the agent.
-Anything absent is delegated, so the set can grow without risk.")
+Anything absent is delegated to TRAMP.  That keeps every corner
+working, but it is not free: TRAMP answers over a connection of its
+own, which it opens the first time it is asked anything that needs
+the remote.  `scrutiny-agent-fs-delegations' shows what has gone that
+way in this session.")
 
 ;;;###autoload
 (defun scrutiny-agent-fs-handler (operation &rest args)
@@ -1378,20 +2243,34 @@ handed back to the next handler -- TRAMP -- unchanged."
   "Regexp matching remote names on configured hosts, and nothing else.
 Deliberately narrow: anything it does not match never reaches this
 handler at all, so an unconfigured host cannot be affected by a bug
-in here."
+in here.
+
+A user name and a port are part of how TRAMP spells a host, not a
+different host: `/ssh:me@devbox:' and `/ssh:devbox#2222:' are served
+exactly as `/ssh:devbox:' is."
   (if (null scrutiny-agent-hosts)
       "\\`\\'"                          ; matches nothing
-    (concat "\\`/[^:/|]+:"
+    (concat "\\`/[^:/|]+:\\(?:[^@:/|]+@\\)?"
             (regexp-opt (append (mapcar #'car scrutiny-agent-hosts)
                                 (mapcar #'car scrutiny-agent-fs-host-alist)))
-            ":")))
+            "\\(?:#[0-9]+\\)?:")))
 
 (defvar scrutiny-agent-fs-mode)  ; defined by define-minor-mode below
 
 (defun scrutiny-agent-fs--on-connect (host)
-  "Hook function to warm the cache after connecting to HOST."
+  "Start filling the cache for HOST the moment it connects.
+Sends a listing request for each root and returns at once; nothing
+here waits, so connecting is not slowed by it."
   (when scrutiny-agent-fs-mode
-    (scrutiny-agent-fs-warm-cache host)))
+    (scrutiny-agent-fs--forget-host host)
+    (let ((conn (scrutiny-agent-connection host)))
+      (when (and conn (scrutiny-agent--conn-facts conn))
+        ;; The canonical roots only: an alias spelling names the same
+        ;; directory, and listing it twice is a wasted round trip.
+        (dolist (root (scrutiny-agent-ops--list
+                       (plist-get (scrutiny-agent--conn-facts conn)
+                                  :allowedRoots)))
+          (scrutiny-agent-fs--request-listing conn host root))))))
 
 ;;;###autoload
 (define-minor-mode scrutiny-agent-fs-mode
@@ -1410,8 +2289,14 @@ off restores stock behavior completely."
   (scrutiny-agent-fs-flush-cache)
   (scrutiny-agent-fs-forget-connections)
   (clrhash scrutiny-agent-fs--connect-hints)
-  ;; Remove our hook first (idempotent)
+  (clrhash scrutiny-agent-fs--inflight)
+  ;; Remove our hooks first (idempotent)
   (remove-hook 'scrutiny-agent-after-connect-hook #'scrutiny-agent-fs--on-connect)
+  (remove-hook 'scrutiny-agent-disconnect-functions
+               #'scrutiny-agent-fs--forget-host)
+  (setq scrutiny-agent-notification-handlers
+        (assoc-delete-all "fs.changed" scrutiny-agent-notification-handlers))
+  (advice-remove 'find-file-noselect #'scrutiny-agent-fs--prefetch)
   (if scrutiny-agent-fs-mode
       (progn
         ;; Load TRAMP FIRST. It registers its handler with `add-to-list',
@@ -1423,12 +2308,20 @@ off restores stock behavior completely."
         (push (cons (scrutiny-agent-fs--file-name-regexp)
                     'scrutiny-agent-fs-handler)
               file-name-handler-alist)
-        ;; Auto-warm cache on connect
         (add-hook 'scrutiny-agent-after-connect-hook #'scrutiny-agent-fs--on-connect)
+        ;; A dropped connection takes its watches with it; what they
+        ;; vouched for must go at the same moment.
+        (add-hook 'scrutiny-agent-disconnect-functions
+                  #'scrutiny-agent-fs--forget-host)
+        (push (cons "fs.changed" #'scrutiny-agent-fs--on-changed)
+              scrutiny-agent-notification-handlers)
+        ;; The one piece of advice in this file.  It sends requests and
+        ;; does nothing else; see `scrutiny-agent-fs-prefetch'.
+        (advice-add 'find-file-noselect :before #'scrutiny-agent-fs--prefetch)
         (unless (scrutiny-agent-fs-active-p)
           (message "scrutiny-agent-fs: another handler precedes ours; \
 run M-x scrutiny-agent-fs-refresh after loading it")))
-    (message "scrutiny-agent-fs-mode disabled")))
+    nil))
 
 (defun scrutiny-agent-fs-active-p ()
   "Non-nil when our handler would actually be reached for our hosts.
@@ -1539,48 +2432,24 @@ the ratio.  Read-only: it lists, stats and reads, and never writes."
 
 ;;;###autoload
 (defun scrutiny-agent-fs-warm-cache (host)
-  "Pre-populate the cache for HOST by fetching roots and listing them.
-Run this after connecting to make subsequent completions fast.
-Subdirectories are cached incrementally on demand via background fetches."
+  "List HOST's roots now, so the first completion there is immediate.
+This happens by itself on connect; the command is for doing it again
+after `scrutiny-agent-fs-flush-cache'."
   (interactive (list (completing-read "Host: "
                                        (mapcar #'car scrutiny-agent-hosts))))
   (let ((conn (scrutiny-agent-connection host)))
     (unless conn
       (user-error "Not connected to %s (use C-c s c first)" host))
-    (message "Warming cache for %s..." host)
-    (condition-case err
-        (let* ((caps (scrutiny-agent-ops-capabilities conn))
-               (fsa (plist-get caps :fileSystemAccess))
-               (roots (scrutiny-agent-ops--list (plist-get fsa :allowedRoots)))
-               (home (plist-get fsa :home)))
-          ;; Store facts in cache
-          (puthash host
-                   (cons roots (and (stringp home)
-                                    (not (string-empty-p home))
-                                    (directory-file-name home)))
-                   scrutiny-agent-fs--roots-cache)
-          ;; List the root directories
-          (let ((count 0))
-            (dolist (root roots)
-              (message "Listing %s..." root)
-              (condition-case nil
-                  (let* ((result (scrutiny-agent-request
-                                  conn "fs.listDirectory"
-                                  (list :path (directory-file-name root) :attributes t)
-                                  60))
-                         (entries (mapcar (lambda (entry)
-                                            (cons (plist-get entry :name)
-                                                  (plist-put (copy-sequence entry) :exists t)))
-                                          (scrutiny-agent-ops--list
-                                           (plist-get result :entries)))))
-                    (puthash (scrutiny-agent-fs--cache-key host root)
-                             (cons (current-time) entries)
-                             scrutiny-agent-fs--dir-cache)
-                    (cl-incf count))
-                (error nil)))
-            (message "Cache warmed for %s: %d directories, roots=%S" host count roots)))
-      (error
-       (message "Failed to warm cache for %s: %S" host err)))))
+    (let ((roots (scrutiny-agent-fs--roots host))
+          (count 0))
+      (dolist (root roots)
+        (when (listp (scrutiny-agent-fs--listing host root t))
+          (cl-incf count)))
+      (message "scrutiny-agent-fs[%s]: %d of %d roots listed%s"
+               host count (length roots)
+               (if (and scrutiny-agent-fs-watch
+                        (scrutiny-agent-feature-p conn "fs.watch"))
+                   ", kept current by the agent" "")))))
 
 ;; ---------------------------------------------------------------------
 ;; Diagnostics
@@ -1624,6 +2493,14 @@ Displays connection state, roots, home directory, and any recent errors."
                 (insert (format "  Roots: %S\n" (car facts)))
                 (insert (format "  Home: %s\n" (or (cdr facts) "(none)")))))
             (insert "\n"))))
+      (insert "Handed to TRAMP (operation . count) -- every one of these\n"
+              "was slow; a busy list is a configuration problem:\n")
+      (if (null scrutiny-agent-fs-delegations)
+          (insert "  (none)\n\n")
+        (dolist (cell (sort (copy-sequence scrutiny-agent-fs-delegations)
+                            (lambda (x y) (> (cdr x) (cdr y)))))
+          (insert (format "  %6d  %s\n" (cdr cell) (car cell))))
+        (insert "\n"))
       (when scrutiny-agent-fs--last-error
         (insert (make-string 60 ?-) "\n")
         (insert "Last error:\n")

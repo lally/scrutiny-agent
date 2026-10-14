@@ -459,6 +459,7 @@
       (scrutiny-agent-verify--fs-write conn repo nil)
       (scrutiny-agent-verify--git-read conn repo)
       (scrutiny-agent-verify--git-exec conn repo)
+      (scrutiny-agent-verify--git-spawn conn repo)
       (scrutiny-agent-verify--diffcache conn "scrutiny-cache/verify-test")
       (scrutiny-agent-verify--cred conn)
       (scrutiny-agent-verify--lsp conn repo (or language 2))

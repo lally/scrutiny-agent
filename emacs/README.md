@@ -29,7 +29,7 @@ Then the four lines below. Or load from a checkout:
 (require 'scrutiny-agent-remote)
 
 (scrutiny-agent-remote-setup
- '(("devbox" :transport "tsh ssh devbox"
+ '(("devbox" :transport "tsh ssh devbox sh"
              :roots ("src" "work"))))
 
 (global-set-key (kbd "C-c s") scrutiny-agent-command-map)
@@ -52,7 +52,7 @@ If you would rather wire the pieces up yourself:
 
 ```elisp
 (setq scrutiny-agent-hosts
-      '(("devbox" :transport "tsh ssh devbox"
+      '(("devbox" :transport "tsh ssh devbox sh"
                   :agent-args ("--allow-root" "src" "--allow-write"
                                "--git-exec-preset" "magit"
                                "--log" "agent.log" "--log-level" "info"))))
@@ -64,8 +64,15 @@ If you would rather wire the pieces up yourself:
 ```
 
 `:transport` is any shell command whose stdin/stdout reach a POSIX
-shell on the target: `ssh host`, `ssh -J jump host`, `tsh ssh host`,
+shell on the target: `ssh host`, `ssh -J jump host`, `tsh ssh host sh`,
 `kubectl exec -i pod -- sh`, or plain `sh` for the local machine.
+
+The shell must be on plain pipes, not a terminal. Teleport nodes run a
+plain `tsh ssh host` session in a PTY whatever the client asked for
+(`--no-tty` included), and so does OpenSSH through `tsh proxy ssh`;
+an explicit remote command (`tsh ssh host sh`) is an exec request and
+gets pipes. The client notices a terminal from the echo of its first
+probe and fails at once, naming the transport that works.
 
 ### Getting the agent onto the remote
 
@@ -159,37 +166,50 @@ minibuffer completion and the rest over the agent; anything it does
 not implement is handed straight back to TRAMP, so an unimplemented
 corner behaves exactly as it does today.
 
-What `C-x C-f` costs, measured in agent round trips:
+What things cost, in agent round trips — which, on a slow link, is
+the only cost there is:
 
 | operation | round trips |
 | --- | --- |
-| `C-x C-f`, first file in a directory | 2 |
-| `C-x C-f`, another file beside it | 1 |
+| `C-x C-f` (file, its directory and its ancestors are asked for at once) | 1 |
+| `C-x C-f`, another file in a directory already seen | 1 |
+| first keystroke in a buffer (lock check) | 0 |
 | `C-x C-s` | 1 |
-| `dired` | 3 |
-| minibuffer completion | 1 |
-| `file-attributes` on 40 files | 1 |
+| `C-x C-s`, first save of a session with backups on | 2 |
+| `dired` of a directory already seen | 0 |
+| minibuffer completion in a directory already seen | 0 |
+| `file-exists-p` / `file-attributes` in a directory already seen | 0 |
 
-Four things get it there:
+How it gets there:
 
-- **One request per directory.** `fs.listDirectory` with attributes
-  answers every question Emacs is about to ask about the files in it,
-  instead of a stat apiece. `dired` is drawn from that one reply, via
-  `ls-lisp`.
-- **`vc-registered` answers `nil` without asking.** `vc` probes every
-  file it opens, walking up the tree — dozens of round trips per
-  `find-file` over TRAMP, for information magit does not use.
-- **A short attributes cache** (`scrutiny-agent-fs-cache-ttl`, 2s by
-  default) covers the burst of repeated questions a single command
-  produces. It is dropped whenever this client writes, so your own
-  edits are never stale.
-- **Nothing is asked about paths the agent cannot serve.** This is the
-  one that mattered most for `C-x C-f`: eglot's `find-file-hook` calls
-  `project-current`, which walks *up* the tree with
-  `locate-dominating-file` looking for `.git`. That walk leaves your
-  roots and climbs to `/`, and every level of it would otherwise be a
-  TRAMP round trip on the critical path of opening a file. See
-  `scrutiny-agent-fs-roots-are-the-world`.
+- **Requests are pipelined.** Everything a command is known to need
+  is sent before the first reply is awaited, so N questions cost one
+  round trip, not N. Opening a file sends the read, the listing of
+  its directory, and the listings of the directories above it
+  together.
+- **A listing is a proof.** One attributed `fs.listDirectory` answers
+  every later question about names in that directory — including "it
+  does not exist", which is most of what Emacs asks (`.dir-locals.el`,
+  `.git`, `.editorconfig`, backup and lock names, at every level).
+- **The agent keeps the listing true.** With
+  `scrutiny-agent-fs-watch` (default on) the agent watches each
+  directory it has listed and pushes changes, so a cached listing
+  never expires and is never wrong: a file someone else creates shows
+  up without a round trip being spent to look. Where the agent cannot
+  watch (network filesystems, macOS hosts, very busy directories)
+  listings fall back to `scrutiny-agent-fs-cache-ttl`.
+- **Saving is one conditional write.** "Has this file changed on disk
+  since I read it?" travels *with* the write (`ifMtimeNs`) rather
+  than as a stat before it, and the reply carries the file's new
+  attributes. If the file did change, nothing is written and you get
+  the usual "changed on disk; really edit?" question.
+- **Replies are compressed** (`scrutiny-agent-compress`).
+- **`vc-registered` answers `nil` without asking**, and nothing is
+  asked about paths outside the agent's roots (below).
+- **Nothing falls back silently.** An operation the agent cannot
+  serve goes to TRAMP and is counted;
+  `M-x scrutiny-agent-fs-status` shows the counts. An ordinary editing
+  session should show none that open a TRAMP connection.
 
 `scrutiny-agent-fs-roots-are-the-world` (on by default) says the
 agent's roots are everything visible on that host: directories on the
@@ -199,9 +219,11 @@ configured roots becomes invisible rather than merely slow — the fix
 is to add it to `:roots`, or set the option to nil to have such paths
 answered by TRAMP, truthfully and slowly.
 
-Saving needs the agent started with `--allow-write`. Without it,
-reads stay fast and writes quietly fall back to TRAMP — so a
-read-only agent costs speed, never function.
+Saving needs the agent started with `--allow-write` (the generated
+config has it). Without it writes fall back to TRAMP, and
+`scrutiny-agent` warns at connect time if the agent came up without
+the configuration this client sent it — that used to happen silently
+and made everything slow.
 
 Worth checking once: `M-x scrutiny-agent-remote-status` will tell you
 if the handler ended up *behind* TRAMP's, which leaves everything
@@ -220,20 +242,41 @@ unconfigured hosts fall through to your normal `eglot-server-programs`.
 
 ### git — magit, unchanged
 
-`scrutiny-agent-magit-mode` routes magit's **synchronous** git calls
-through the agent's `git.exec`. A single `magit-status` refresh runs
-dozens of git commands; over TRAMP each is a round trip through a
-remote shell.
+`scrutiny-agent-magit-mode` runs magit's git on the agent. It does not
+advise or redefine anything in magit: git reaches the agent through
+the same `process-file` / `start-file-process` file-name-handler
+operations that TRAMP itself implements, so it applies equally to
+`vc`, `project.el`, `diff-hl` and anything else that runs git in a
+remote directory, and a magit upgrade has nothing to break.
+
+- **Synchronous git** (everything a status refresh runs) goes through
+  `git.exec`, with stdin and the environment (`GIT_INDEX_FILE` …)
+  carried over.
+- **A refresh is one round trip, not fifty.** magit asks its
+  questions one at a time and waits for each answer. The read-only
+  ones are almost always the same ones as last time, so when a
+  command starts, the batch it ran before is sent again at once, and
+  magit's own sequential calls are then answered from replies already
+  on their way. Nothing is ever *shown* from the previous run — only
+  the questions are predicted, never the answers — and a mutating
+  command is never speculated. The first refresh of a repository in a
+  brand-new Emacs has nothing to go on; the batch is remembered in
+  `scrutiny-agent-magit-history-file` for the next session.
+  `scrutiny-agent-magit-speculate` turns this off.
+- **Asynchronous git** — staging a hunk, commit, rebase, push, pull,
+  fetch — runs on the agent through `git.spawn`. Emacs gets a real
+  process object, so magit's process buffer, sentinels and
+  `with-editor` work unchanged: `c c` opens `COMMIT_EDITMSG` over the
+  agent and `C-c C-c` finishes the commit, with no TRAMP connection
+  involved. `scrutiny-agent-magit-async` turns this off (async git
+  then goes through TRAMP as before).
 
 Requires the remote agent to be started with an allowlist
-(`--git-exec-preset magit`, or `--git-exec <subcommand>` repeated).
-`M-x scrutiny-agent-magit-check` reports what a given host will and
-will not run.
+(`--git-exec-preset magit`, or `--git-exec <subcommand>` repeated);
+`scrutiny-agent-remote-setup` does that. `M-x
+scrutiny-agent-magit-check` reports what a given host will and will
+not run.
 
-- Asynchronous git — the commands magit shows in its process buffer,
-  and anything needing an interactive editor (commit, interactive
-  rebase) — still goes through TRAMP. Those need a live process object
-  and `with-editor`, which `git.exec` does not provide.
 - A command the allowlist refuses **falls back to TRAMP**, so a narrow
   allowlist costs speed, never function. Set
   `scrutiny-agent-magit-fallback` to nil while tuning one, to see what
@@ -313,7 +356,7 @@ This is the answer to "I just set up a new host; does it work?"
 | `scrutiny-agent-fs.el` | the file-name handler: find-file, save, dired, completion |
 | `scrutiny-agent-remote.el` | one-call setup, status and benchmarking |
 | `scrutiny-agent-eglot.el` | eglot over the raw-LSP tunnel |
-| `scrutiny-agent-magit.el` | magit's synchronous git over `git.exec` |
+| `scrutiny-agent-magit.el` | git (magit, vc, project.el) over `git.exec` / `git.spawn` |
 | `scrutiny-agent-xref.el` | xref / eldoc / imenu backends |
 | `scrutiny-agent-ui.el` | interactive commands |
 | `scrutiny-agent-menu.el` | the transient menu, loaded on demand |
@@ -394,15 +437,23 @@ declarative lines leaves the 1600 lines of `scrutiny-agent-ui.el` and
 
 ## Current limits
 
-- Asynchronous and editor-driven git (commit, interactive rebase) uses
-  TRAMP; see the magit section above.
 - Shell commands in a remote directory (`M-x shell-command`,
-  `compile`) still go through TRAMP: the agent has no general process
-  surface, only the allowlisted `git.exec`.
-- The attributes cache means a change made by someone *else* on the
-  remote can be up to `scrutiny-agent-fs-cache-ttl` seconds stale.
-  Reverting a buffer or `M-x scrutiny-agent-fs-flush-cache` clears it;
-  set the TTL to 0 to disable it entirely.
+  `compile`, `grep`) still go through TRAMP: the agent has no general
+  process surface, only allowlisted git.
+- `executable-find` with its REMOTE argument finds nothing on an agent
+  host: the `exec-path` it asks for is answered empty (nothing on the
+  remote `$PATH` is inside the roots, and TRAMP's answer would open a
+  connection). Programs run through `process-file` are unaffected.
+- Directory watches are Linux-only (inotify) and are not used on
+  network filesystems. There, a change made by someone *else* can be
+  up to `scrutiny-agent-fs-cache-ttl` seconds stale; reverting a
+  buffer or `M-x scrutiny-agent-fs-flush-cache` clears it.
+- A file's *contents* are never cached beyond the prefetch that opens
+  it; `auto-revert` sees changes through the watched listing.
+- Asynchronous git needs `sh`, `cat` and `mkfifo` on the machine
+  running Emacs (any Unix; not native Windows).
+- The very first magit refresh of a repository, in an Emacs that has
+  never seen it, is still sequential.
 - Files larger than `scrutiny-agent-fs-max-inline-bytes` (8 MiB) are
   handed to TRAMP, which can stream them rather than holding the whole
   thing in a base64 payload.

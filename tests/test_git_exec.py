@@ -292,13 +292,32 @@ def test_safe_global_options_are_allowed(readonly_agent, repo):
     assert result["exitCode"] == 0
 
 
-def test_denied_option_after_the_subcommand_is_still_refused(readonly_agent,
-                                                             repo):
-    """The scan covers every argument, not just the leading ones."""
-    assert readonly_agent.call_expect_error(
+def test_config_cannot_be_injected_after_the_subcommand(readonly_agent, repo,
+                                                        tmp_path):
+    """`-c` sets configuration only BEFORE the subcommand. After it, it
+    is the subcommand's own option (`log -c`: combined diffs), so the
+    would-be setting is just an argument git does not understand --
+    and the program it names is never run."""
+    marker = tmp_path / "ran"
+    result = readonly_agent.call(
         "git.exec", {"repoPath": repo.path,
-                     "args": ["log", "-c", "core.pager=id"]}).code == \
-        PERMISSION_DENIED
+                     "args": ["--paginate", "log", "-c",
+                              "core.pager=touch %s" % marker]})
+    assert result["exitCode"] != 0
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("args", [
+    ["log", "-c", "-1"],                 # combined diff format
+    ["diff", "-C", "HEAD"],              # copy detection
+    ["grep", "-c", "e"],                 # count matches
+    ["blame", "-C", "file.txt"],
+])
+def test_subcommand_options_spelled_like_globals_are_served(readonly_agent,
+                                                            repo, args):
+    result = readonly_agent.call("git.exec",
+                                 {"repoPath": repo.path, "args": args})
+    assert result["exitCode"] in (0, 1), result["stderr"]
 
 
 def test_gpg_sign_program_is_refused(magit_agent, repo):
@@ -472,12 +491,15 @@ def test_execution_capable_config_keys_are_refused(readonly_agent, repo,
     assert error.code == PERMISSION_DENIED, "%s was allowed" % setting
 
 
-def test_config_after_the_subcommand_is_refused(readonly_agent, repo):
-    """`-c` is meaningful only before the subcommand, so only allowed there."""
-    assert readonly_agent.call_expect_error(
+def test_config_after_the_subcommand_is_not_configuration(readonly_agent, repo):
+    """`-c` is meaningful only before the subcommand. After it, git reads
+    the would-be setting as an ordinary argument and says so; nothing
+    was configured."""
+    result = readonly_agent.call(
         "git.exec", {"repoPath": repo.path,
-                     "args": ["log", "-c", "color.ui=false"]}).code == \
-        PERMISSION_DENIED
+                     "args": ["log", "-c", "color.ui=false"]})
+    assert result["exitCode"] != 0
+    assert "color.ui=false" in result["stderr"]
 
 
 def test_dangling_config_flag(readonly_agent, repo):
@@ -497,14 +519,18 @@ def test_config_without_a_key(readonly_agent, repo):
 def test_operator_can_extend_the_config_allowlist(agent_factory, tmp_path,
                                                   repo):
     """--git-exec-config adds a key the built-in set does not carry."""
-    baseline = agent_factory(["--allow-root", "/tmp",
+    # The root is the repository itself, not /tmp: pytest's tmp tree is
+    # not under /tmp everywhere (macOS: /private/var/folders/...), and
+    # a repository outside the roots is refused for that reason alone,
+    # which would make the baseline assertion below pass vacuously.
+    baseline = agent_factory(["--allow-root", repo.path,
                               "--git-exec-preset", "read-only"])
     assert baseline.call_expect_error(
         "git.exec", {"repoPath": repo.path,
                      "args": ["-c", "push.default=simple", "status"]}).code \
         == PERMISSION_DENIED
 
-    extended = agent_factory(["--allow-root", "/tmp",
+    extended = agent_factory(["--allow-root", repo.path,
                               "--git-exec-preset", "read-only",
                               "--git-exec-config", "push.default"])
     assert extended.call("git.exec",
@@ -514,10 +540,453 @@ def test_operator_can_extend_the_config_allowlist(agent_factory, tmp_path,
 
 
 def test_extending_the_allowlist_does_not_widen_the_rest(agent_factory, repo):
-    extended = agent_factory(["--allow-root", "/tmp",
+    extended = agent_factory(["--allow-root", repo.path,
                               "--git-exec-preset", "read-only",
                               "--git-exec-config", "push.default"])
     assert extended.call_expect_error(
         "git.exec", {"repoPath": repo.path,
                      "args": ["-c", "core.pager=id", "status"]}).code == \
         PERMISSION_DENIED
+
+
+# ---------------------------------------------------------------------
+# what a git UI asks on every refresh
+# ---------------------------------------------------------------------
+# Each of these used to be refused, which did not stop magit -- the
+# client fell back to its slow path -- it only made every refresh pay
+# for a refusal plus a fallback, several times over.
+def test_rev_parse_git_dir_is_a_query(readonly_agent, repo):
+    result = readonly_agent.call("git.exec",
+                                 {"repoPath": repo.path,
+                                  "args": ["rev-parse", "--git-dir"]})
+    assert result["exitCode"] == 0
+    assert result["stdout"].strip() == ".git"
+
+
+def test_git_dir_as_a_global_option_is_still_refused(readonly_agent, repo):
+    for args in (["--git-dir", "/tmp", "status"],
+                 ["--git-dir=/tmp", "status"],
+                 ["rev-parse", "--git-dir=/tmp"],
+                 ["status", "--git-dir"]):
+        assert readonly_agent.call_expect_error(
+            "git.exec", {"repoPath": repo.path, "args": args}).code == \
+            PERMISSION_DENIED, args
+
+
+@pytest.mark.parametrize("args", [
+    ["config", "--list", "-z"],
+    ["config", "--local", "-z", "--get-all", "--include",
+     "status.showUntrackedFiles"],
+    ["config", "--get", "user.name"],
+    ["config", "--get-regexp", "^remote\\."],
+])
+def test_read_only_preset_answers_config_queries(readonly_agent, repo, args):
+    result = readonly_agent.call("git.exec",
+                                 {"repoPath": repo.path, "args": args})
+    # 1 is git's "no such key", which is an answer.
+    assert result["exitCode"] in (0, 1)
+
+
+@pytest.mark.parametrize("args", [
+    ["config", "user.name", "mallory"],            # bare set
+    ["config", "user.name"],                       # ambiguous by arity
+    ["config", "--unset", "user.name"],
+    ["config", "--add", "alias.x", "!id"],
+    ["config", "--get", "--file", "/etc/passwd", "a.b"],
+    ["config", "--list", "--blob", "HEAD:x"],
+    ["config", "--edit"],
+    ["config", "--replace-all", "core.pager", "id"],
+])
+def test_read_only_preset_refuses_config_writes(readonly_agent, repo, args):
+    assert readonly_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": args}).code == \
+        PERMISSION_DENIED
+    listed = readonly_agent.call("git.exec",
+                                 {"repoPath": repo.path,
+                                  "args": ["config", "--list"]})["stdout"]
+    assert "mallory" not in listed and "alias.x" not in listed
+
+
+def test_magit_preset_can_write_config(magit_agent, repo):
+    assert magit_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["config", "--local", "branch.work.description",
+                              "x"]})["exitCode"] == 0
+    assert magit_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["config", "--get",
+                              "branch.work.description"]})["stdout"].strip() \
+        == "x"
+
+
+def test_config_is_not_served_without_a_preset(agent_factory, tmp_path, repo):
+    """An explicit allowlist means exactly what it lists."""
+    agent = agent_factory(["--allow-root", str(tmp_path), "--allow-root",
+                           "/tmp", "--git-exec", "status"])
+    assert agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["config", "--list"]}).code == PERMISSION_DENIED
+
+
+# ---------------------------------------------------------------------
+# stdin
+# ---------------------------------------------------------------------
+import base64
+
+
+@pytest.fixture
+def stdin_agent(agent_factory, tmp_path):
+    return agent_factory(["--allow-root", str(tmp_path), "--allow-root", "/tmp",
+                          "--git-exec-preset", "magit",
+                          "--git-exec", "hash-object"])
+
+
+def test_a_command_that_reads_stdin_does_not_eat_the_channel(stdin_agent, repo):
+    """The agent's own stdin IS the protocol. A child that inherited it
+    and read from it would swallow the client's next request; here the
+    child must see end-of-file at once, and the session must go on."""
+    result = stdin_agent.call("git.exec",
+                              {"repoPath": repo.path,
+                               "args": ["hash-object", "--stdin"]},
+                              timeout=10)
+    assert result["exitCode"] == 0
+    # The hash of the empty blob: it read nothing, not our frames.
+    assert result["stdout"].strip() == \
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+    assert stdin_agent.call("git.exec",
+                            {"repoPath": repo.path,
+                             "args": ["rev-parse", "HEAD"]})["exitCode"] == 0
+
+
+def test_stdin_is_delivered(stdin_agent, repo):
+    data = b"hello\n"
+    result = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["hash-object", "--stdin"],
+                     "stdinBase64": base64.b64encode(data).decode()})
+    assert result["stdout"].strip() == \
+        "ce013625030ba8dba906f756967f9e9ca394464a"
+
+
+def test_large_stdin_does_not_deadlock(stdin_agent, repo):
+    """More than a pipe holds, to a command that also writes."""
+    data = os.urandom(3 * 1024 * 1024)
+    result = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["hash-object", "--stdin"],
+                     "stdinBase64": base64.b64encode(data).decode()},
+        timeout=60)
+    assert result["exitCode"] == 0 and len(result["stdout"].strip()) == 40
+
+
+def test_staging_a_hunk_through_stdin(stdin_agent, repo):
+    """What the parameter is for: `git apply --cached` reading a patch."""
+    target = os.path.join(repo.path, "staged-by-patch.txt")
+    with open(target, "w") as handle:
+        handle.write("new file\n")
+    git(repo.path, "add", "-N", "staged-by-patch.txt")
+    patch = stdin_agent.call("git.exec",
+                             {"repoPath": repo.path,
+                              "args": ["diff", "--", "staged-by-patch.txt"]}
+                             )["stdout"]
+    assert "+new file" in patch
+    applied = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["apply", "--cached", "-"],
+                     "stdinBase64": base64.b64encode(patch.encode()).decode()})
+    assert applied["exitCode"] == 0, applied["stderr"]
+    staged = stdin_agent.call("git.exec",
+                              {"repoPath": repo.path,
+                               "args": ["diff", "--cached", "--name-only"]}
+                              )["stdout"]
+    assert "staged-by-patch.txt" in staged
+
+
+def test_invalid_stdin_is_refused(stdin_agent, repo):
+    assert stdin_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": ["hash-object", "--stdin"],
+                     "stdinBase64": "!!! not base64 !!!"}).code == \
+        INVALID_REQUEST
+
+
+# ---------------------------------------------------------------------
+# environment
+# ---------------------------------------------------------------------
+def test_index_file_redirects_the_index(stdin_agent, repo):
+    """The case that matters: a UI staging into a SCRATCH index must not
+    find its commands applied to the real one."""
+    with open(os.path.join(repo.path, "scratch.txt"), "w") as handle:
+        handle.write("x\n")
+    scratch = os.path.join(repo.path, ".git", "index.scratch")
+    for args in (["read-tree", "HEAD"],
+                 ["update-index", "--add", "--", "scratch.txt"]):
+        result = stdin_agent.call("git.exec",
+                                  {"repoPath": repo.path, "args": args,
+                                   "env": {"GIT_INDEX_FILE": scratch}})
+        assert result["exitCode"] == 0, result["stderr"]
+    in_scratch = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path, "args": ["ls-files"],
+                     "env": {"GIT_INDEX_FILE": scratch}})["stdout"]
+    in_real = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path, "args": ["ls-files"]})["stdout"]
+    assert "scratch.txt" in in_scratch
+    assert "scratch.txt" not in in_real, \
+        "a command aimed at a scratch index modified the real one"
+
+
+def test_index_file_must_stay_in_the_sandbox(stdin_agent, repo):
+    assert stdin_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": ["ls-files"],
+                     "env": {"GIT_INDEX_FILE": "/etc/scrutiny-index"}}).code == \
+        PERMISSION_DENIED
+
+
+def test_editor_is_for_the_magit_preset_only(readonly_agent, stdin_agent,
+                                             repo, tmp_path):
+    """Naming git's editor is naming a program to run. The magit preset
+    already serves `rebase --exec`, so it loses nothing by allowing it;
+    the read-only preset would lose its meaning."""
+    marker = tmp_path / "ran"
+    env = {"GIT_EDITOR": "touch %s" % marker}
+    assert readonly_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": ["log", "-1"],
+                     "env": env}).code == PERMISSION_DENIED
+    assert not marker.exists()
+    assert stdin_agent.call("git.exec",
+                            {"repoPath": repo.path, "args": ["log", "-1"],
+                             "env": env})["exitCode"] == 0
+
+
+@pytest.mark.parametrize("key", ["GIT_SSH_COMMAND", "GIT_DIR",
+                                 "GIT_WORK_TREE", "GIT_EXTERNAL_DIFF",
+                                 "GIT_ASKPASS", "GIT_PAGER", "GIT_EXEC_PATH",
+                                 "GIT_CONFIG_GLOBAL", "PATH", "LD_PRELOAD"])
+def test_program_running_environment_is_refused(stdin_agent, repo, tmp_path,
+                                                key):
+    marker = tmp_path / "ran"
+    assert stdin_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": ["log", "-1"],
+                     "env": {key: "touch %s" % marker}}).code == \
+        PERMISSION_DENIED
+    assert not marker.exists()
+
+
+def test_author_date_is_honored(stdin_agent, repo):
+    with open(os.path.join(repo.path, "dated.txt"), "w") as handle:
+        handle.write("x\n")
+    stdin_agent.call("git.exec", {"repoPath": repo.path,
+                                  "args": ["add", "dated.txt"]})
+    done = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["commit", "-q", "-m", "dated"],
+                     "env": {"GIT_AUTHOR_DATE": "2001-02-03T04:05:06Z",
+                             "GIT_AUTHOR_NAME": "A", "GIT_AUTHOR_EMAIL": "a@x",
+                             "GIT_COMMITTER_NAME": "A",
+                             "GIT_COMMITTER_EMAIL": "a@x"}})
+    assert done["exitCode"] == 0, done["stderr"]
+    shown = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path,
+                     "args": ["log", "-1", "--format=%aI"]})["stdout"]
+    assert shown.startswith("2001-02-03")
+
+
+def test_null_unsets_a_variable(stdin_agent, repo):
+    result = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path, "args": ["rev-parse", "HEAD"],
+                     "env": {"LC_ALL": None}})
+    assert result["exitCode"] == 0
+
+
+# ---------------------------------------------------------------------
+# the read-only preset is read-only, and stays in the sandbox
+# ---------------------------------------------------------------------
+def test_repo_path_must_be_inside_the_roots(agent_factory, tmp_path, repo):
+    agent = agent_factory(["--allow-root", str(tmp_path),
+                           "--git-exec-preset", "read-only"])
+    assert agent.call_expect_error(
+        "git.exec", {"repoPath": "/etc", "args": ["status"]}).code == \
+        PERMISSION_DENIED
+
+
+@pytest.mark.parametrize("args,what", [
+    (["diff", "--no-index", "/dev/null", "/etc/hostname"],
+     "reads any file"),
+    (["grep", "--no-index", "-e", "root", "/etc/passwd"], "reads any file"),
+    (["blame", "--contents", "/etc/hostname", "file.txt"], "reads any file"),
+    (["blame", "--contents=/etc/hostname", "file.txt"], "reads any file"),
+])
+def test_reads_outside_the_repository_are_refused(readonly_agent, repo,
+                                                  args, what):
+    error = readonly_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": args})
+    assert error.code == PERMISSION_DENIED, what
+
+
+@pytest.mark.parametrize("make_args", [
+    lambda m: ["grep", "-Otouch %s;true" % m, "e"],
+    lambda m: ["grep", "--open-files-in-pager=touch %s;true" % m, "e"],
+    lambda m: ["ls-remote", "--exec=touch %s; git-upload-pack" % m, "."],
+    lambda m: ["ls-remote", "--upload-pack=touch %s; git-upload-pack" % m,
+               "."],
+])
+def test_read_only_commands_cannot_run_programs(readonly_agent, repo,
+                                                tmp_path, make_args):
+    marker = tmp_path / "ran"
+    assert readonly_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path,
+                     "args": make_args(marker)}).code == PERMISSION_DENIED
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("args", [
+    ["branch"], ["branch", "--list"], ["branch", "-a", "-vv"],
+    ["branch", "--list", "wo*"], ["branch", "--show-current"],
+    ["tag"], ["tag", "--list", "v*"], ["tag", "-l"],
+    ["symbolic-ref", "--short", "HEAD"], ["symbolic-ref", "HEAD"],
+])
+def test_read_only_preset_serves_listing_forms(readonly_agent, repo, args):
+    result = readonly_agent.call("git.exec",
+                                 {"repoPath": repo.path, "args": args})
+    assert result["exitCode"] == 0, result["stderr"]
+
+
+@pytest.mark.parametrize("args", [
+    ["branch", "sneaky"], ["branch", "-D", "work"], ["branch", "-m", "x"],
+    ["branch", "-a", "sneaky"], ["branch", "-f", "work", "HEAD~1"],
+    ["tag", "sneaky"], ["tag", "-d", "v1"], ["tag", "-f", "v1"],
+    ["tag", "-a", "v2", "-m", "x"],
+    ["symbolic-ref", "HEAD", "refs/heads/sneaky"],
+    ["symbolic-ref", "-d", "HEAD"],
+])
+def test_read_only_preset_refuses_writing_forms(readonly_agent, repo, args):
+    before = git(repo.path, "for-each-ref", capture=True)
+    head = git(repo.path, "symbolic-ref", "HEAD", capture=True)
+    assert readonly_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": args}).code == \
+        PERMISSION_DENIED
+    assert git(repo.path, "for-each-ref", capture=True) == before
+    assert git(repo.path, "symbolic-ref", "HEAD", capture=True) == head
+
+
+def test_magit_preset_still_creates_branches_and_tags(magit_agent, repo):
+    for args in (["branch", "made-here"], ["tag", "made-here-tag"],
+                 ["update-ref", "refs/wip/x", "HEAD"],
+                 ["write-tree"]):
+        assert magit_agent.call("git.exec", {"repoPath": repo.path,
+                                             "args": args})["exitCode"] == 0
+
+
+def test_unsetting_a_git_variable_is_always_allowed(stdin_agent, repo):
+    """project.el clears GIT_DIR before listing files; that must not be
+    what sends the command down the slow path."""
+    result = stdin_agent.call(
+        "git.exec", {"repoPath": repo.path, "args": ["ls-files"],
+                     "env": {"GIT_DIR": None, "GIT_WORK_TREE": None}})
+    assert result["exitCode"] == 0
+
+
+def test_unsetting_other_variables_is_not(stdin_agent, repo):
+    assert stdin_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": ["ls-files"],
+                     "env": {"PATH": None}}).code == PERMISSION_DENIED
+
+
+# ---------------------------------------------------------------------
+# every spelling of a refused option
+#
+# git's option parser accepts any unambiguous abbreviation of a long
+# option, a value either attached with `=` or as the next argument, and
+# single-letter options bundled together. A policy that compares whole
+# strings refuses `--upload-pack=x` and runs `--upload-pa=x`.
+# ---------------------------------------------------------------------
+def _refused_and_inert(agent, repo, args, marker):
+    error = agent.call_expect_error("git.exec",
+                                    {"repoPath": repo.path, "args": args})
+    assert error.code == PERMISSION_DENIED, "%r: %s" % (args, error)
+    assert not os.path.exists(marker), "%r ran its payload" % (args,)
+
+
+@pytest.mark.parametrize("make_args", [
+    lambda cmd: ["grep", "--open-files-in-pager=" + cmd, "hello"],
+    lambda cmd: ["grep", "--open-files-in-pa=" + cmd, "hello"],
+    lambda cmd: ["grep", "--open=" + cmd, "hello"],
+    lambda cmd: ["grep", "--open", cmd, "hello"],
+    lambda cmd: ["grep", "-O" + cmd, "hello"],
+    lambda cmd: ["grep", "-lO" + cmd, "hello"],
+    lambda cmd: ["ls-remote", "--upload-pack=" + cmd, "."],
+    lambda cmd: ["ls-remote", "--upload-pa=" + cmd, "."],
+    lambda cmd: ["ls-remote", "--upload-pack", cmd, "."],
+    lambda cmd: ["ls-remote", "--exec=" + cmd, "."],
+    lambda cmd: ["ls-remote", "--exe=" + cmd, "."],
+    lambda cmd: ["ls-remote", "--exec", cmd, "."],
+])
+def test_command_execution_is_refused_in_every_spelling(readonly_agent, repo,
+                                                        tmp_path, make_args):
+    marker = str(tmp_path / "pwned")
+    script = tmp_path / "payload.sh"
+    script.write_text("#!/bin/sh\ntouch %s\n" % marker)
+    script.chmod(0o755)
+    _refused_and_inert(readonly_agent, repo, make_args(str(script)), marker)
+
+
+@pytest.mark.parametrize("args", [
+    ["log", "--output", "{out}", "-1"],
+    ["log", "--output={out}", "-1"],
+    ["log", "--outp={out}", "-1"],
+    ["diff", "--output", "{out}"],
+    ["show", "--out", "{out}"],
+])
+def test_a_read_only_agent_writes_no_file(readonly_agent, repo, tmp_path, args):
+    out = str(tmp_path / "written-by-git")
+    _refused_and_inert(readonly_agent, repo,
+                       [a.format(out=out) for a in args], out)
+
+
+@pytest.mark.parametrize("args", [
+    ["diff", "/etc/hostname", "/etc/passwd"],
+    ["diff", "--", "/etc/hostname", "/etc/passwd"],
+    ["diff", "../../../../../../etc/hostname", "/dev/null"],
+    ["diff", "--no-index", "a", "b"],
+    ["diff", "--no-ind", "a", "b"],
+    ["blame", "--contents", "/etc/passwd", "hello.txt"],
+    ["blame", "--cont", "/etc/passwd", "hello.txt"],
+    ["blame", "--contents=/etc/passwd", "hello.txt"],
+    ["blame", "--ignore-revs-file", "/etc/passwd", "hello.txt"],
+    ["blame", "-S", "/etc/passwd", "hello.txt"],
+    ["grep", "-f", "/etc/passwd"],
+    ["grep", "--file=/etc/passwd"],
+    ["grep", "--no-index", "root", "/etc/passwd"],
+    ["ls-files", "-X", "/etc/passwd"],
+    ["ls-files", "--exclude-from=/etc/passwd"],
+    ["diff", "-O/etc/passwd"],
+    ["status", "--pathspec-from-file=/etc/passwd"],
+])
+def test_files_outside_the_roots_are_not_read(readonly_agent, repo, args):
+    error = readonly_agent.call_expect_error(
+        "git.exec", {"repoPath": repo.path, "args": args})
+    assert error.code == PERMISSION_DENIED, "%r: %s" % (args, error)
+
+
+@pytest.mark.parametrize("args", [
+    ["diff", "--text", "HEAD"],
+    ["diff", "HEAD~0..HEAD", "--", "hello.txt"],
+    ["diff", "--stat", "--no-ext-diff", "HEAD"],
+    ["log", "--oneline", "-1", "--name-only"],
+    ["config", "--get", "--path", "core.hookspath"],
+    ["grep", "-n", "-F", "-e", "x"],
+    ["blame", "-s", "HEAD", "--", "hello.txt"],
+    ["ls-files", "--exclude-standard", "--others"],
+])
+def test_ordinary_options_are_not_caught_with_them(readonly_agent, repo, args):
+    """The refusals above are by prefix; these are the near misses."""
+    result = readonly_agent.call("git.exec",
+                                 {"repoPath": repo.path, "args": args})
+    assert "exitCode" in result
+
+
+def test_mandatory_environment_cannot_be_unset(readonly_agent, repo):
+    """`GIT_PAGER=cat` is what keeps a request from hanging on a pager."""
+    result = readonly_agent.call(
+        "git.exec", {"repoPath": repo.path, "args": ["var", "GIT_PAGER"],
+                     "env": {"GIT_PAGER": None}})
+    assert result["stdout"].strip() == "cat"
