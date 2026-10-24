@@ -13,7 +13,13 @@ namespace db {
 // ============================================================================
 
 Database::Database(const std::string& path) {
-    int rc = sqlite3_open(path.c_str(), &db_);
+    // FULLMUTEX asks SQLite to serialize this connection itself even
+    // where the library defaults to multi-thread mode (the Mac's
+    // libsqlite3 does, and aborts on unserialized sharing). LSPCache
+    // holds the real lock; this is the second line of defense.
+    int rc = sqlite3_open_v2(path.c_str(), &db_,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                             nullptr);
     if (rc != SQLITE_OK) {
         std::cerr << "Failed to open database: " << sqlite3_errmsg(db_) << std::endl;
         sqlite3_close(db_);
@@ -151,6 +157,10 @@ bool Statement::bindNull(int index) {
 bool Statement::step() {
     if (!stmt_) return false;
     int rc = sqlite3_step(stmt_);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        std::cerr << "SQL step error (" << rc << "): "
+                  << sqlite3_errmsg(sqlite3_db_handle(stmt_)) << std::endl;
+    }
     return rc == SQLITE_ROW;
 }
 

@@ -51,3 +51,18 @@ target_include_directories(declaration_search_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 add_test(NAME DeclarationSearchTests COMMAND declaration_search_tests)
+
+add_executable(lsp_cache_tests lsp_cache_tests.cpp)
+target_link_libraries(lsp_cache_tests
+    PRIVATE
+        GitReviewCore
+        nlohmann_json::nlohmann_json
+        fmt::fmt
+        spdlog::spdlog
+        SQLite::SQLite3
+)
+target_include_directories(lsp_cache_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+add_test(NAME LSPCacheTests COMMAND lsp_cache_tests)

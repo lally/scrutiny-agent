@@ -119,7 +119,7 @@ server needs a *Linux* binary locally. Two ways:
   `--arch amd64` for just one; it checks Docker and the qemu
   registration first rather than failing partway through a long build.
 
-- **Cut a release**. `git tag v0.2.0 && git push origin v0.2.0` builds
+- **Cut a release**. `git tag v0.2.1 && git push origin v0.2.1` builds
   and publishes both; the client downloads the right one on first
   connect and caches it in the same directory.
   `scrutiny-agent-binary-version` selects which release to fetch, and
@@ -129,8 +129,8 @@ server needs a *Linux* binary locally. Two ways:
   host, or an alist to pick by architecture:
 
   ```elisp
-  :local-binary '(("x86_64"  . "~/agents/scrutiny-agent-0.2.0-x86_64")
-                  ("aarch64" . "~/agents/scrutiny-agent-0.2.0-aarch64"))
+  :local-binary '(("x86_64"  . "~/agents/scrutiny-agent-0.2.1-x86_64")
+                  ("aarch64" . "~/agents/scrutiny-agent-0.2.1-aarch64"))
   ```
 
 `M-x eval-expression (scrutiny-agent-installed-binaries)` lists what

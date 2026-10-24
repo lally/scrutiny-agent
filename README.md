@@ -184,7 +184,7 @@ The binaries are built inside a debian:11 image with clang-17/libc++
   the binaries attached.
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0   # cut a release
+git tag v0.2.1 && git push origin v0.2.1   # cut a release
 ```
 
 A release carries both of the ways this gets used:
@@ -210,6 +210,9 @@ scripts/package-emacs.sh               # -> dist/scrutiny-agent-<version>.tar
 
 The version the agent reports in `meta.hello` (and `--version`) is
 injected at build time via `-DSCRUTINY_AGENT_VERSION`; release builds
-carry the git tag. Dev builds default to the CMake project version.
+carry the git tag. Dev builds default to the CMake project version,
+re-read on every configure (a build directory configured before
+0.2.1 cached the old number; `cmake -U SCRUTINY_AGENT_VERSION build`
+clears it once).
 The protocol version (currently 1) is negotiated separately in the
 handshake and only changes on breaking wire changes.

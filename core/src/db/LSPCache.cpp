@@ -202,7 +202,13 @@ void LSPCache::initializeSchema() {
 }
 
 void LSPCache::setCurrentGitSha(const std::string& sha) {
+    std::lock_guard<std::mutex> lock(mutex_);
     currentGitSha_ = sha;
+}
+
+std::string LSPCache::currentGitSha() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return currentGitSha_;
 }
 
 std::string LSPCache::normalizeFilePath(const std::string& path) const {
@@ -214,6 +220,7 @@ std::string LSPCache::normalizeFilePath(const std::string& path) const {
 }
 
 bool LSPCache::isCacheValid(const std::string& filePath) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return false;
 
     auto stmt = db_->prepare(
@@ -228,26 +235,40 @@ bool LSPCache::isCacheValid(const std::string& filePath) const {
 }
 
 void LSPCache::invalidateFile(const std::string& filePath) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen()) return;
 
     std::string normalized = normalizeFilePath(filePath);
 
     db_->beginTransaction();
 
-    // Delete from all tables
-    auto tables = {"definitions", "references_", "hovers", "document_symbols"};
-    for (const char* table : tables) {
-        std::string sql = "DELETE FROM " + std::string(table) +
-                          " WHERE source_file = ? OR target_file = ? OR file_path = ? OR symbol_file = ? OR reference_file = ?";
-        auto stmt = db_->prepare(sql);
-        if (stmt) {
-            stmt->bindText(1, normalized);
-            stmt->bindText(2, normalized);
-            stmt->bindText(3, normalized);
-            stmt->bindText(4, normalized);
-            stmt->bindText(5, normalized);
-            stmt->step();
-        }
+    // Every on-demand table names its file columns differently; a
+    // predicate must only mention columns the table has, or the
+    // statement fails to prepare and nothing is deleted (which is what
+    // this method silently did for every data table before). A
+    // cached answer (all rows for one source position, or one query) is
+    // dropped as a unit when it was asked from the file or when any row
+    // of it points into the file: an answer missing one file's rows
+    // would otherwise look complete until the SHA changes.
+    struct TableDelete { const char* sql; int binds; };
+    const TableDelete deletes[] = {
+        {"DELETE FROM definitions WHERE source_file = ? OR "
+         "(source_file, source_line, source_character) IN "
+         "(SELECT source_file, source_line, source_character FROM definitions WHERE target_file = ?)", 2},
+        {"DELETE FROM references_ WHERE symbol_file = ? OR "
+         "(symbol_file, symbol_line, symbol_character) IN "
+         "(SELECT symbol_file, symbol_line, symbol_character FROM references_ WHERE reference_file = ?)", 2},
+        {"DELETE FROM hovers WHERE file_path = ?", 1},
+        {"DELETE FROM document_symbols WHERE file_path = ?", 1},
+        {"DELETE FROM folding_ranges WHERE file_path = ?", 1},
+        {"DELETE FROM workspace_symbols WHERE query IN "
+         "(SELECT DISTINCT query FROM workspace_symbols WHERE file_path = ?)", 1},
+    };
+    for (const auto& d : deletes) {
+        auto stmt = db_->prepare(d.sql);
+        if (!stmt) continue;
+        for (int b = 1; b <= d.binds; ++b) stmt->bindText(b, normalized);
+        stmt->step();
     }
 
     // Remove from cache status
@@ -261,6 +282,7 @@ void LSPCache::invalidateFile(const std::string& filePath) {
 }
 
 void LSPCache::invalidateAllForSha(const std::string& sha) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen()) return;
 
     db_->beginTransaction();
@@ -291,6 +313,7 @@ void LSPCache::invalidateAllForSha(const std::string& sha) {
 void LSPCache::cacheDefinition(const std::string& sourceFile,
                                int sourceLine, int sourceChar,
                                const lsp::LSPLocation& target) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     auto stmt = db_->prepare(
@@ -317,6 +340,7 @@ void LSPCache::cacheDefinition(const std::string& sourceFile,
 std::optional<std::vector<lsp::LSPLocation>>
 LSPCache::getCachedDefinitions(const std::string& sourceFile,
                                int sourceLine, int sourceChar) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return std::nullopt;
 
     auto stmt = db_->prepare(
@@ -354,6 +378,7 @@ LSPCache::getCachedDefinitions(const std::string& sourceFile,
 void LSPCache::cacheReferences(const std::string& symbolFile,
                                int symbolLine, int symbolChar,
                                const std::vector<lsp::LSPLocation>& references) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     db_->beginTransaction();
@@ -386,6 +411,7 @@ void LSPCache::cacheReferences(const std::string& symbolFile,
 std::optional<std::vector<lsp::LSPLocation>>
 LSPCache::getCachedReferences(const std::string& symbolFile,
                               int symbolLine, int symbolChar) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return std::nullopt;
 
     auto stmt = db_->prepare(
@@ -423,6 +449,7 @@ LSPCache::getCachedReferences(const std::string& symbolFile,
 void LSPCache::cacheHover(const std::string& filePath,
                           int line, int character,
                           const std::string& contents) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     auto stmt = db_->prepare(
@@ -443,6 +470,7 @@ void LSPCache::cacheHover(const std::string& filePath,
 std::optional<std::string>
 LSPCache::getCachedHover(const std::string& filePath,
                          int line, int character) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return std::nullopt;
 
     auto stmt = db_->prepare(
@@ -469,6 +497,7 @@ LSPCache::getCachedHover(const std::string& filePath,
 
 void LSPCache::cacheDocumentSymbols(const std::string& filePath,
                                     const std::vector<CachedDocumentSymbol>& symbols) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     std::string normalized = normalizeFilePath(filePath);
@@ -527,6 +556,7 @@ void LSPCache::cacheDocumentSymbols(const std::string& filePath,
 
 std::optional<std::vector<CachedDocumentSymbol>>
 LSPCache::getCachedDocumentSymbols(const std::string& filePath) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return std::nullopt;
 
     auto stmt = db_->prepare(
@@ -567,6 +597,7 @@ LSPCache::getCachedDocumentSymbols(const std::string& filePath) {
 
 void LSPCache::cacheWorkspaceSymbols(const std::string& query,
                                      const std::vector<CachedSymbol>& symbols) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     db_->beginTransaction();
@@ -608,6 +639,7 @@ void LSPCache::cacheWorkspaceSymbols(const std::string& query,
 
 std::optional<std::vector<CachedSymbol>>
 LSPCache::getCachedWorkspaceSymbols(const std::string& query) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return std::nullopt;
 
     auto stmt = db_->prepare(
@@ -645,6 +677,7 @@ LSPCache::getCachedWorkspaceSymbols(const std::string& query) {
 
 void LSPCache::cacheFoldingRanges(const std::string& filePath,
                                     const std::vector<CachedFoldingRange>& ranges) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     std::string normalizedPath = normalizeFilePath(filePath);
@@ -679,6 +712,7 @@ void LSPCache::cacheFoldingRanges(const std::string& filePath,
 
 std::optional<std::vector<CachedFoldingRange>>
 LSPCache::getCachedFoldingRanges(const std::string& filePath) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return std::nullopt;
 
     std::string normalizedPath = normalizeFilePath(filePath);
@@ -714,6 +748,7 @@ LSPCache::getCachedFoldingRanges(const std::string& filePath) {
 // ============================================================================
 
 LSPCache::CacheStats LSPCache::getStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     CacheStats stats;
     if (!isOpen()) return stats;
 
@@ -749,11 +784,13 @@ LSPCache::CacheStats LSPCache::getStats() const {
 }
 
 void LSPCache::vacuum() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen()) return;
     db_->execute("VACUUM");
 }
 
 void LSPCache::clearAll() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen()) return;
 
     db_->beginTransaction();
@@ -768,18 +805,20 @@ void LSPCache::clearAll() {
     db_->execute("DELETE FROM indexed_files");
     db_->commit();
 
-    vacuum();
+    // Not vacuum(): that is a public method and takes mutex_ too.
+    db_->execute("VACUUM");
 }
 
 int64_t LSPCache::pruneOlderThan(int days) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen()) return 0;
 
     // Cutoff in SQLite's own clock so it is byte-consistent with how
     // created_at is generated (strftime('%s','now'), UTC unix secs).
-    // days<=0 -> offset<=0 -> cutoff = now + |offset| (future) ->
-    // every on-demand row (created_at <= now) is deleted == force
-    // evict, matching DiffCache.pruneOlderThan(-1) semantics.
-    const long long offset = static_cast<long long>(days) * 86400LL;
+    // days <= 0 must evict rows created this very second too, so the
+    // cutoff moves one second into the future instead of sitting on
+    // "now" (created_at < now would keep them).
+    const long long offset = days <= 0 ? -1LL : static_cast<long long>(days) * 86400LL;
 
     // On-demand query cache ONLY. The durable index tables
     // (index_definitions/index_references/indexed_files) are
@@ -818,6 +857,7 @@ int64_t LSPCache::pruneOlderThan(int days) {
 // ============================================================================
 
 void LSPCache::storeIndexDefinition(const IndexedDefinition& def) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     auto stmt = db_->prepare(
@@ -841,6 +881,7 @@ void LSPCache::storeIndexDefinition(const IndexedDefinition& def) {
 }
 
 void LSPCache::storeIndexReference(const IndexedReference& ref) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     auto stmt = db_->prepare(
@@ -868,6 +909,7 @@ void LSPCache::storeIndexReference(const IndexedReference& ref) {
 }
 
 void LSPCache::markFileIndexed(const std::string& fileUri) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return;
 
     auto stmt = db_->prepare(
@@ -881,6 +923,7 @@ void LSPCache::markFileIndexed(const std::string& fileUri) {
 }
 
 bool LSPCache::isFileIndexed(const std::string& fileUri) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen() || currentGitSha_.empty()) return false;
 
     auto stmt = db_->prepare(
@@ -895,6 +938,7 @@ bool LSPCache::isFileIndexed(const std::string& fileUri) const {
 }
 
 std::vector<LSPCache::IndexedDefinition> LSPCache::getAllIndexDefinitions() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<IndexedDefinition> results;
     if (!isOpen() || currentGitSha_.empty()) return results;
 
@@ -925,6 +969,7 @@ std::vector<LSPCache::IndexedDefinition> LSPCache::getAllIndexDefinitions() cons
 }
 
 std::vector<LSPCache::IndexedReference> LSPCache::getAllIndexReferences() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<IndexedReference> results;
     if (!isOpen() || currentGitSha_.empty()) return results;
 
@@ -959,6 +1004,7 @@ std::vector<LSPCache::IndexedReference> LSPCache::getAllIndexReferences() const 
 }
 
 std::vector<LSPCache::IndexedDefinition> LSPCache::getIndexDefinitionsForFile(const std::string& fileUri) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<IndexedDefinition> results;
     if (!isOpen() || currentGitSha_.empty()) return results;
 
@@ -990,6 +1036,7 @@ std::vector<LSPCache::IndexedDefinition> LSPCache::getIndexDefinitionsForFile(co
 }
 
 std::vector<LSPCache::IndexedReference> LSPCache::getIndexReferencesFromFile(const std::string& fileUri) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<IndexedReference> results;
     if (!isOpen() || currentGitSha_.empty()) return results;
 
@@ -1025,6 +1072,7 @@ std::vector<LSPCache::IndexedReference> LSPCache::getIndexReferencesFromFile(con
 }
 
 std::vector<LSPCache::IndexedReference> LSPCache::getIndexReferencesToFile(const std::string& fileUri) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<IndexedReference> results;
     if (!isOpen() || currentGitSha_.empty()) return results;
 
@@ -1060,6 +1108,7 @@ std::vector<LSPCache::IndexedReference> LSPCache::getIndexReferencesToFile(const
 }
 
 void LSPCache::clearIndex() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!isOpen()) return;
 
     db_->beginTransaction();
@@ -1070,6 +1119,7 @@ void LSPCache::clearIndex() {
 }
 
 LSPCache::IndexStats LSPCache::getIndexStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     IndexStats stats;
     if (!isOpen() || currentGitSha_.empty()) return stats;
 

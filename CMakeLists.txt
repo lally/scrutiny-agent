@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(scrutiny-agent VERSION 0.2.0 LANGUAGES CXX)
+project(scrutiny-agent VERSION 0.2.1 LANGUAGES CXX)
 
 # gitmanip requires C++23; the whole tree builds with one standard so
 # every target and every Conan dependency share a single ABI.
@@ -17,9 +17,19 @@ option(SCRUTINY_BUILD_EXAMPLES "Build gitmanip example programs" OFF)
 
 # The version the agent reports in meta.hello and that names release
 # artifacts (scrutiny-agent-<version>-<arch>). Release builds pass the
-# git tag; dev builds default to the project version.
-set(SCRUTINY_AGENT_VERSION "${PROJECT_VERSION}" CACHE STRING
-    "Version reported by meta.hello and used in artifact names")
+# git tag (-DSCRUTINY_AGENT_VERSION=...); everything else follows the
+# project version above. The cache entry defaults to empty rather than
+# to the project version on purpose: a cache entry keeps its first value
+# across reconfigures, so a build directory configured before a version
+# bump kept reporting the old release (0.2.0 after the bump to 0.2.1)
+# and only a fresh build directory or `cmake -U SCRUTINY_AGENT_VERSION`
+# showed the new one. With an empty default the normal variable below is
+# re-derived from PROJECT_VERSION on every configure.
+set(SCRUTINY_AGENT_VERSION "" CACHE STRING
+    "Version reported by meta.hello and used in artifact names (empty = the project version)")
+if(NOT SCRUTINY_AGENT_VERSION)
+    set(SCRUTINY_AGENT_VERSION "${PROJECT_VERSION}")
+endif()
 
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")

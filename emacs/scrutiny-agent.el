@@ -2,7 +2,7 @@
 
 ;; Author: Lally Singh
 ;; URL: https://github.com/five-rivers/scrutiny-agent
-;; Version: 0.2.0
+;; Version: 0.2.1
 ;; Package-Requires: ((emacs "29.1"))
 ;;
 ;; 29.1 is the PACKAGE's floor, because scrutiny-agent-ui.el uses
@@ -76,7 +76,7 @@ integration).  PLIST keys:
                  sends none."
   :type '(alist :key-type string :value-type plist))
 
-(defcustom scrutiny-agent-binary-version "0.2.0"
+(defcustom scrutiny-agent-binary-version "0.2.1"
   "Release version of the agent binary to bootstrap onto remotes."
   :type 'string)
 

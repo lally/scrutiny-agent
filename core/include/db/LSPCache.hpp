@@ -11,6 +11,7 @@
 #include <vector>
 #include <optional>
 #include <memory>
+#include <mutex>
 
 namespace gitreview {
 namespace db {
@@ -106,7 +107,7 @@ public:
 
     // Git SHA management
     void setCurrentGitSha(const std::string& sha);
-    std::string currentGitSha() const { return currentGitSha_; }
+    std::string currentGitSha() const;
 
     // Check if cache is valid for a file at current SHA
     bool isCacheValid(const std::string& filePath) const;
@@ -263,6 +264,16 @@ private:
     void initializeSchema();
     std::string normalizeFilePath(const std::string& path) const;
 
+    // One LSPCache (one SQLite connection) per repository is shared by
+    // every language client, the indexer and each async wrapper, so
+    // calls arrive from arbitrary threads. SQLite connections are not
+    // shareable between threads without serialization -- the Mac's
+    // libsqlite3 aborts on it -- and a shared connection would also let
+    // a reader observe another thread's half-written transaction. Every
+    // public method takes this lock; private helpers run under it and
+    // must never take it themselves. Public methods must not call each
+    // other (isOpen() is the one exception and stays lock-free).
+    mutable std::mutex mutex_;
     std::unique_ptr<Database> db_;
     std::string currentGitSha_;
 };

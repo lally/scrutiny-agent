@@ -24,20 +24,34 @@ DIST="${DIST:-${SCRIPT_DIR}/dist}"
 rm -rf "${OUT}"
 mkdir -p "${DIST}"
 
-# One buildx invocation; --target export is the scratch stage holding
-# just the binary, written per-platform under ${OUT}.
-docker buildx build \
-    --platform "${PLATFORMS}" \
-    --build-arg "AGENT_VERSION=${AGENT_VERSION}" \
-    -f "${SCRIPT_DIR}/Dockerfile" \
-    --target export \
-    --output "type=local,dest=${OUT}" \
-    "${CTX}"
+# One buildx invocation PER platform, each writing into its own
+# ${OUT}/linux_<arch>/. A single multi-platform invocation is refused by
+# Docker Desktop's default `docker` driver ("Multi-platform build is
+# not supported for the docker driver. Switch to a different driver, or
+# turn on the containerd image store") and would otherwise require
+# every developer to reconfigure their engine; single-platform builds
+# work on every driver, and the layer cache is shared between the two
+# runs. --target export is the scratch stage holding just the binary.
+# NB: no bash-4 `declare -A` -- macOS's stock /bin/bash is 3.2.
+for pair in linux/amd64:linux_amd64:x86_64 linux/arm64:linux_arm64:aarch64; do
+    plat="${pair%%:*}"
+    rest="${pair#*:}"
+    subdir="${rest%%:*}"
+    case ",${PLATFORMS}," in
+        *",${plat},"*) ;;
+        *) continue ;;
+    esac
+    echo "building scrutiny-agent ${AGENT_VERSION} for ${plat}"
+    docker buildx build \
+        --platform "${plat}" \
+        --build-arg "AGENT_VERSION=${AGENT_VERSION}" \
+        -f "${SCRIPT_DIR}/Dockerfile" \
+        --target export \
+        --output "type=local,dest=${OUT}/${subdir}" \
+        "${CTX}"
+done
 
-# buildx writes ${OUT}/linux_<arch>/scrutiny-agent for multi-platform
-# builds, or ${OUT}/scrutiny-agent for a single-platform one. Rename to
-# the bootstrap convention and emit sha256 sidecars. NB: no bash-4
-# `declare -A` -- macOS's stock /bin/bash is 3.2.
+# Rename to the bootstrap convention and emit sha256 sidecars.
 for pair in linux/amd64:linux_amd64:x86_64 linux/arm64:linux_arm64:aarch64; do
     plat="${pair%%:*}"
     rest="${pair#*:}"
@@ -48,7 +62,6 @@ for pair in linux/amd64:linux_amd64:x86_64 linux/arm64:linux_arm64:aarch64; do
         *) continue ;;
     esac
     src="${OUT}/${subdir}/scrutiny-agent"
-    [ -f "${src}" ] || src="${OUT}/scrutiny-agent"
     [ -f "${src}" ] || { echo "error: missing build output for ${plat}" >&2; exit 1; }
     dst="${DIST}/scrutiny-agent-${AGENT_VERSION}-${arch}"
     cp "${src}" "${dst}"
