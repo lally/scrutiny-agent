@@ -34,6 +34,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Absolute paths from here on: the hashing step below runs inside OUT,
+# and a relative --out (CI passes `--out dist`) made it write the
+# sidecar to dist/dist/..., which does not exist. The v0.2.2 release
+# job died there after both binaries had passed the gate.
+mkdir -p "${OUT}"
+OUT="$(cd "${OUT}" && pwd)"
+[ -z "${BINDIR}" ] || BINDIR="$(cd "${BINDIR}" && pwd)"
+
 NAME="scrutiny-agent"
 STAGE="$(mktemp -d)"
 PKG="${STAGE}/${NAME}-${VERSION}"
@@ -47,7 +55,7 @@ echo "==> Packaging ${NAME} ${VERSION}"
 # using it, and they pull in magit and a built agent.
 for f in "${ROOT}"/emacs/*.el; do
     case "$(basename "${f}")" in
-        *-tests.el) continue ;;
+        *-tests.el|*-test.el) continue ;;   # scrutiny-agent-fs-test.el is one
     esac
     cp "${f}" "${PKG}/"
 done
