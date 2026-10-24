@@ -184,7 +184,7 @@ The binaries are built inside a debian:11 image with clang-17/libc++
   the binaries attached.
 
 ```sh
-git tag v0.2.1 && git push origin v0.2.1   # cut a release
+git tag v0.2.2 && git push origin v0.2.2   # cut a release
 ```
 
 A release carries both of the ways this gets used:
