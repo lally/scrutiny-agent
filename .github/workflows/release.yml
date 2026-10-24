@@ -64,6 +64,21 @@ jobs:
           PLATFORMS: ${{ matrix.platform }}
         run: bash docker/build-agent.sh
 
+      # The conformance suite's raw-LSP round trip talks to whichever
+      # language server the host has. The runner image ships rustup,
+      # whose rust-analyzer is a proxy that exits with an error until
+      # the component is installed (the suite copes, but then nothing
+      # real is exercised), so provision the same servers ci.yml uses.
+      - name: Provision language servers
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.com"
+          sudo apt-get install -y --no-install-recommends clangd python3-pylsp
+          if command -v rustup >/dev/null 2>&1; then
+            rustup component add rust-analyzer || true
+          fi
+          command -v clangd && command -v pylsp
+
       # First-class release gate: the binary built inside the debian:11
       # (glibc 2.31) image must run on this newer-glibc runner and pass
       # the full wire conformance suite, including the version check
@@ -111,7 +126,12 @@ jobs:
 
       # Prove the package actually installs and finds its binaries
       # before publishing it. A release that installs but cannot
-      # connect is worse than no release.
+      # connect is worse than no release. The runner image has no
+      # Emacs (the v0.2.3 release job died here with "emacs: command
+      # not found"); emacs-nox is what ci.yml installs too.
+      - name: Install Emacs
+        run: sudo apt-get install -y --no-install-recommends emacs-nox
+
       - name: Verify the package installs
         run: |
           V="${GITHUB_REF_NAME#v}"
