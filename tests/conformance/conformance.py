@@ -1002,9 +1002,19 @@ def _tunnel_stream(ctx, tid):
     return out
 
 
+def _tunnel_closed(ctx, tid):
+    """The lsp.tunnelClosed params for `tid`, or None while it is open."""
+    for m, p in ctx.a.notifications:
+        if m == "lsp.tunnelClosed" and p.get("tunnelId") == tid:
+            return p
+    return None
+
+
 def _tunnel_wait_response(ctx, tid, want_id, timeout=45):
     """Parse LSP frames out of the tunnel stream until a response with
-    id `want_id` appears (or the deadline passes -> None)."""
+    id `want_id` appears. None when the deadline passes -- or as soon as
+    the server exits (lsp.tunnelClosed), since nothing can answer then;
+    the caller tells the two apart with _tunnel_closed()."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         buf = _tunnel_stream(ctx, tid)
@@ -1026,6 +1036,8 @@ def _tunnel_wait_response(ctx, tid, want_id, timeout=45):
                 continue
             if msg.get("id") == want_id and "method" not in msg:
                 return msg
+        if _tunnel_closed(ctx, tid) is not None:
+            return None
         time.sleep(0.1)
     return None
 
@@ -1060,48 +1072,75 @@ def t_lsp_tunnel(ctx):
     # Full raw-LSP round trip against whichever real server this host
     # has (python/swift/rust/cpp); with none installed, every open must
     # fail with a clean LSP_FAILED -- never a hang or a crash.
+    #
+    # "Installed" is judged by the round trip, not by the spawn: a
+    # rustup proxy named rust-analyzer is an executable that exits with
+    # an error when the component is missing (GitHub's Ubuntu runners
+    # ship exactly that), and the agent's job on such a server is to
+    # report the exit promptly as lsp.tunnelClosed -- after which the
+    # next candidate gets its turn. Only a server that stays alive and
+    # still does not answer initialize is a failure.
+    init = _lsp_frame({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"processId": None,
+                                  "rootUri": "file://" + ws,
+                                  "capabilities": {}}})
     opened = None
     for lang in (2, 8, 1, 6):
         try:
             r = ctx.a.call("lsp.tunnelOpen",
                            {"workspacePath": ws, "language": lang},
                            timeout=30)
-            opened = (lang, r)
-            break
         except AgentError as e:
             check(e.code == LSP_FAILED,
                   "tunnelOpen without server (lang %d) -> LSP_FAILED "
                   "(got %s)" % (lang, e.code))
+            continue
+
+        tid = r.get("tunnelId")
+        check(isinstance(tid, str) and tid, "tunnelOpen returns a tunnelId")
+        check(isinstance(r.get("serverPath"), str) and
+              r["serverPath"].startswith("/"),
+              "tunnelOpen reports the spawned server's absolute path")
+
+        # Split the frame at an arbitrary byte boundary: chunk
+        # boundaries are explicitly NOT message boundaries, and order
+        # must hold.
+        cut = len(init) // 2
+        for part in (init[:cut], init[cut:]):
+            ctx.a.notify("lsp.tunnelSend",
+                         {"tunnelId": tid,
+                          "data": base64.b64encode(part).decode()})
+        rsp = _tunnel_wait_response(ctx, tid, 1, timeout=45)
+        if rsp is None:
+            closed = _tunnel_closed(ctx, tid)
+            if closed is not None:
+                # Not a server after all; the agent must have said so
+                # (a tunnelClosed with the exit status) and must still
+                # be fine. A client should not need to know anything
+                # else about such a binary.
+                check("exitCode" in closed,
+                      "a server that dies before answering reports its "
+                      "exit (lang %d, %s: exit %s)"
+                      % (lang, r["serverPath"], closed.get("exitCode")))
+                check(ctx.a.call("lsp.tunnelClose",
+                                 {"tunnelId": tid}).get("ok") is True,
+                      "tunnelClose after an early exit -> ok")
+                continue
+        check(rsp is not None,
+              "raw LSP initialize round-trips through the tunnel (lang %d)"
+              % lang)
+        if rsp is not None:
+            check(isinstance(rsp.get("result", {}).get("capabilities"),
+                             dict),
+                  "initialize response carries server capabilities")
+        opened = (lang, tid)
+        break
+
     if opened is None:
-        print("  [PASS] no language server on this host; "
+        print("  [PASS] no working language server on this host; "
               "clean-failure path verified")
         return
-
-    lang, r = opened
-    tid = r.get("tunnelId")
-    check(isinstance(tid, str) and tid, "tunnelOpen returns a tunnelId")
-    check(isinstance(r.get("serverPath"), str) and
-          r["serverPath"].startswith("/"),
-          "tunnelOpen reports the spawned server's absolute path")
-
-    init = _lsp_frame({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                       "params": {"processId": None,
-                                  "rootUri": "file://" + ws,
-                                  "capabilities": {}}})
-    # Split the frame at an arbitrary byte boundary: chunk boundaries
-    # are explicitly NOT message boundaries, and order must hold.
-    cut = len(init) // 2
-    for part in (init[:cut], init[cut:]):
-        ctx.a.notify("lsp.tunnelSend",
-                     {"tunnelId": tid,
-                      "data": base64.b64encode(part).decode()})
-    rsp = _tunnel_wait_response(ctx, tid, 1, timeout=45)
-    check(rsp is not None,
-          "raw LSP initialize round-trips through the tunnel (lang %d)"
-          % lang)
-    if rsp is not None:
-        check(isinstance(rsp.get("result", {}).get("capabilities"), dict),
-              "initialize response carries server capabilities")
+    lang, tid = opened
 
     st = ctx.a.call("meta.stat", {})
     check(st.get("lspTunnels", 0) >= 1, "meta.stat counts the open tunnel")
