@@ -190,14 +190,23 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
                        "${f}" "${ELSA_TIMEOUT}"
                 continue
             fi
-            # Any other failure (Elsa or Emacs crashed, a missing
-            # dependency, a command not found) is not a clean file
-            # either: say so, keep whatever the baseline had, and fail.
+            # Any other failure is not a clean file either. Elsa's
+            # analysis worker dies on some dependency graphs (eglot,
+            # xref: its reader cannot get through what they require --
+            # see the note at the bottom); such a file is recorded as
+            # `crash' and stays non-fatal while the baseline says so.
+            # A file that analysed before and crashes now is reported
+            # and fails, as is a crash from a missing tool.
             if [ "${rc}" -ne 0 ]; then
-                printf '%s %s\n' "${f}" "${was}" >> "${BASELINE}.new"
-                printf '    %-34s not analysed (exit %s)\n' "${f}" "${rc}"
+                printf '%s crash\n' "${f}" >> "${BASELINE}.new"
+                if [ "${was}" = "crash" ]; then
+                    printf '    %-34s not analysed (Elsa exits %s; as in baseline)\n' \
+                           "${f}" "${rc}"
+                    continue
+                fi
+                printf '    %-34s not analysed (exit %s) NEW\n' "${f}" "${rc}"
                 printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g' | tail -5 \
-                    | sed 's/^/        /'
+                    | cut -c1-200 | sed 's/^/        /'
                 STATUS=1
                 continue
             fi
@@ -207,11 +216,12 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
             printf '%s %s\n' "${f}" "${n}" >> "${BASELINE}.new"
             # A file recorded as never analysed has no count to regress
             # against; report it and leave the baseline to be updated.
-            if [ "${was}" = "timeout" ]; then
-                printf '    %-34s %s findings (was not analysed)\n' \
-                       "${f}" "${n}"
-                continue
-            fi
+            case "${was}" in
+                timeout|crash)
+                    printf '    %-34s %s findings (was not analysed)\n' \
+                           "${f}" "${n}"
+                    continue ;;
+            esac
             if [ "${n}" -gt "${was}" ]; then
                 printf '    %-34s %s findings (baseline %s) NEW\n' \
                        "${f}" "${n}" "${was}"
@@ -280,7 +290,11 @@ exit "${STATUS}"
 #   * a real `require' rather than `declare-function' where the
 #     dependency tree is small enough to analyse -- ls-lisp yes, tramp
 #     no: Elsa's reader crashes on ansi-color.el, and a crashed
-#     analyser reports nothing at all about the file;
+#     analyser reports nothing at all about the file. The eglot, xref
+#     and remote files are in that state today (the worker dies in
+#     their dependency graph; baseline `crash'); before the exit code
+#     was checked they scored 0 and looked like the cleanest files in
+#     the package;
 #   * the transient menu in a file of its own, because `(require
 #     \'transient)' alone exceeds five minutes and takes every file
 #     that requires it out of the analysis with it (measured: a file

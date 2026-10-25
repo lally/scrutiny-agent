@@ -1,10 +1,10 @@
-scrutiny-agent-eglot.el 0
+scrutiny-agent-eglot.el crash
 scrutiny-agent-fs.el 305
 scrutiny-agent-magit.el 260
 scrutiny-agent-menu.el 4
 scrutiny-agent-ops.el 0
-scrutiny-agent-remote.el 0
+scrutiny-agent-remote.el crash
 scrutiny-agent-ui.el 40
 scrutiny-agent-verify.el 18
-scrutiny-agent-xref.el 0
+scrutiny-agent-xref.el crash
 scrutiny-agent.el 65
