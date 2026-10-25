@@ -1,10 +1,12 @@
 """`lsp.*` request-level queries.
 
-Two layers are tested. Parameter validation and the clean-failure path
-run everywhere: a missing language server must produce `LSP_FAILED`,
-never a hang or a crash. The semantic assertions (a definition really
-points at the definition) run only where a real server is installed,
-and skip cleanly otherwise.
+Two layers are tested. Parameter validation and the no-server path run
+everywhere: with no language server, gotoDefinition and findReferences
+answer from the text-search fallback (`source: "text"` plus a `note`
+naming the missing server) and every other query produces
+`LSP_FAILED`; never a hang or a crash. The semantic assertions (a
+definition really points at the definition) run only where a real
+server is installed, and skip cleanly otherwise.
 """
 import pytest
 
@@ -55,7 +57,11 @@ def test_unknown_language_fails_cleanly(agent, workspace):
     assert error.code in (LSP_FAILED, INVALID_REQUEST)
 
 
-@pytest.mark.parametrize("method", POSITIONAL + WHOLE_FILE)
+TEXT_FALLBACK = ["lsp.gotoDefinition", "lsp.findReferences"]
+NO_FALLBACK = [m for m in POSITIONAL + WHOLE_FILE if m not in TEXT_FALLBACK]
+
+
+@pytest.mark.parametrize("method", NO_FALLBACK)
 def test_missing_server_is_lsp_failed_not_a_hang(agent, method, workspace,
                                                  available_languages):
     """With no server for the language, the call fails fast and cleanly."""
@@ -66,6 +72,26 @@ def test_missing_server_is_lsp_failed_not_a_hang(agent, method, workspace,
     params.update({"line": 0, "character": 4})
     error = agent.call_expect_error(method, params, timeout=60)
     assert error.code == LSP_FAILED
+
+
+@pytest.mark.parametrize("method", TEXT_FALLBACK)
+def test_missing_server_falls_back_to_text_search(agent, method, workspace,
+                                                  available_languages):
+    """With no server, definitions and references come from the
+    workspace text scan, labelled as such, with the reason in the
+    note (the client shows it; it is never hidden). Fast, not a hang."""
+    if SWIFT in available_languages:
+        pytest.skip("sourcekit-lsp is installed; cannot test the absent path")
+    path = workspace.write("t.swift", "let x = 1\n")
+    params = base_params(workspace.path, SWIFT, path, "let x = 1\n")
+    params.update({"line": 0, "character": 4})
+    result = agent.call(method, params, timeout=60)
+    assert result["source"] == "text"
+    assert result["note"].startswith("no language server")
+    assert "sourcekit-lsp" in result["note"]
+    locs = result["locations"]
+    assert locs and locs[0]["uri"].endswith("/t.swift")
+    assert locs[0]["range"]["start"] == {"line": 0, "character": 4}
 
 
 def test_agent_survives_repeated_lsp_failures(agent, workspace,
