@@ -23,6 +23,13 @@
 #                  the standing count is not zero and never will be --
 #                  see the note at the bottom of this file. A file that
 #                  goes UP is fatal; that is the signal worth having.
+#                  The baseline holds CI's counts (ubuntu's Emacs 29):
+#                  Elsa reads Emacs' own core files, so Emacs 30 on a
+#                  Mac reports about three times as many for the same
+#                  source, and four files it analyses fine under 29
+#                  crash its reader under 30. Compare locally for a
+#                  file's delta; refresh the baseline from a CI log or
+#                  with --elsa-update on an ubuntu runner.
 #
 # The collision check lives in the ERT suite
 # (scrutiny-agent-no-duplicate-definitions), because byte-compile only
@@ -56,10 +63,32 @@ for arg in "$@"; do
     esac
 done
 
+# Bound a command's run time. GNU `timeout` on Linux (and as
+# `gtimeout` from coreutils on a Mac); otherwise perl's alarm, which
+# every Mac has. Exit 124 on expiry either way. The lint once scored
+# every file 0 on a Mac because `timeout` was not found: exit 127, no
+# output, "clean".
+with_timeout() {
+    local secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${secs}" "$@"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        gtimeout "${secs}" "$@"
+    else
+        perl -e 'alarm shift; exec @ARGV' "${secs}" "$@"
+        local rc=$?
+        # perl reports a SIGALRM death as 142; map it to timeout's 124.
+        [ "${rc}" -eq 142 ] && return 124
+        return "${rc}"
+    fi
+}
+
 cd "${ROOT}/emacs"
 FILES=()
 for f in *.el; do
-    case "${f}" in *-tests.el) continue ;; esac
+    # Test files, by the same rule scripts/package-emacs.sh uses to
+    # leave them out of the package (scrutiny-agent-fs-test.el is one).
+    case "${f}" in *-tests.el|*-test.el) continue ;; esac
     FILES+=("${f}")
 done
 
@@ -144,7 +173,7 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
     if have elsa; then
         : > "${BASELINE}.new"
         for f in "${FILES[@]}"; do
-            raw="$(timeout "${ELSA_TIMEOUT}" \
+            raw="$(with_timeout "${ELSA_TIMEOUT}" \
                     "${EMACS}" -Q --batch "${LOADS[@]}" -L . -l elsa \
                     -f elsa-run "${f}" 2>&1)"
             rc=$?
@@ -159,6 +188,17 @@ if [ "${WITH_ELSA}" -eq 1 ]; then
                 printf '%s timeout\n' "${f}" >> "${BASELINE}.new"
                 printf '    %-34s not analysed (timed out after %ss)\n' \
                        "${f}" "${ELSA_TIMEOUT}"
+                continue
+            fi
+            # Any other failure (Elsa or Emacs crashed, a missing
+            # dependency, a command not found) is not a clean file
+            # either: say so, keep whatever the baseline had, and fail.
+            if [ "${rc}" -ne 0 ]; then
+                printf '%s %s\n' "${f}" "${was}" >> "${BASELINE}.new"
+                printf '    %-34s not analysed (exit %s)\n' "${f}" "${rc}"
+                printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g' | tail -5 \
+                    | sed 's/^/        /'
+                STATUS=1
                 continue
             fi
             out="$(printf '%s\n' "${raw}" | sed 's/\x1b\[[0-9;]*m//g' \

@@ -522,6 +522,7 @@ seconds later at the handshake."
 
 (defun scrutiny-agent--parse-verify (line expected-version)
   "Interpret a `__SCRA_VERIFY__' LINE; nil when the binary is good.
+The binary is good when it ran and reported EXPECTED-VERSION.
 Returns a human-readable reason when it is not."
   (let* ((parts (split-string (string-trim line) " " t))
          (status (string-to-number (or (car parts) "1")))
