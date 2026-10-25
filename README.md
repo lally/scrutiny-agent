@@ -185,7 +185,16 @@ The binaries are built inside a debian:11 image with clang-17/libc++
 
 ```sh
 git tag v0.2.3 && git push origin v0.2.3   # cut a release
+gh workflow run release.yml -f tag=v0.2.3  # re-run it for an existing tag
 ```
+
+Pushed tags are never moved. When a release run fails for a reason in
+the workflow itself, fix `release.yml` on `main` and dispatch it with
+the tag: the source is checked out at the tag while the workflow file
+comes from the branch the run was dispatched on, and an existing
+release's assets are replaced rather than failing on the duplicate. A
+dispatch with an empty tag builds `0.0.0-test` and uploads workflow
+artifacts without publishing.
 
 A release carries both of the ways this gets used:
 

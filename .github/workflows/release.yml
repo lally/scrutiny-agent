@@ -15,8 +15,14 @@
 # Emacs wants one file they can `package-install-file' and have work,
 # including on the first connect, without a second download.
 #
-# workflow_dispatch runs the same build for a chosen version and
-# uploads workflow artifacts, but does not publish a release.
+# workflow_dispatch re-runs the release for a tag that already exists
+# (`gh workflow run release.yml -f tag=v0.2.3`): the source is checked
+# out at that tag while the workflow file comes from the branch the run
+# was dispatched on, so a fix to this file can be applied to an existing
+# tag without moving the tag or spending another version number. The
+# release is created if missing, or its assets replaced if it exists.
+# Dispatched with an empty tag it builds 0.0.0-test from the dispatched
+# branch and uploads workflow artifacts only.
 name: release
 
 on:
@@ -24,9 +30,14 @@ on:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
-      agent_version:
-        description: "Agent version (drives scrutiny-agent-<ver>-<arch>)"
-        default: "0.0.0-test"
+      tag:
+        description: "Existing tag to (re)publish, e.g. v0.2.3; empty = test build only"
+        default: ""
+
+# The tag being released: the pushed tag, or the dispatched one.
+# Empty for a tagless dispatch (test build, no release job).
+env:
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
 
 jobs:
   build:
@@ -43,17 +54,27 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG || github.ref }}
 
       - name: Resolve version
         id: ver
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            V="${GITHUB_REF_NAME#v}"
+          if [ -n "$RELEASE_TAG" ]; then
+            case "$RELEASE_TAG" in
+              v[0-9]*) ;;
+              *) echo "tag '$RELEASE_TAG' is not of the form v<version>" >&2; exit 1 ;;
+            esac
+            git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null \
+              || git fetch --depth 1 origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")" \
+              || { echo "checkout is not at $RELEASE_TAG" >&2; exit 1; }
+            V="${RELEASE_TAG#v}"
           else
-            V="${{ github.event.inputs.agent_version }}"
+            V="0.0.0-test"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "building agent version $V for ${{ matrix.arch }}"
+          echo "building agent version $V for ${{ matrix.arch }} (tag: ${RELEASE_TAG:-none})"
 
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
@@ -101,13 +122,15 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || inputs.tag != ''
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Download binaries
         uses: actions/download-artifact@v4
@@ -120,7 +143,7 @@ jobs:
       # artifacts.
       - name: Build the Emacs package
         run: |
-          V="${GITHUB_REF_NAME#v}"
+          V="${RELEASE_TAG#v}"
           bash scripts/package-emacs.sh --binaries dist --version "$V" \
             --out dist
 
@@ -134,7 +157,7 @@ jobs:
 
       - name: Verify the package installs
         run: |
-          V="${GITHUB_REF_NAME#v}"
+          V="${RELEASE_TAG#v}"
           PKGDIR="$(mktemp -d)"
           emacs -Q --batch --eval "
             (progn
@@ -158,7 +181,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          V="${GITHUB_REF_NAME#v}"
+          V="${RELEASE_TAG#v}"
           ls -l dist
 
           # Quoted heredoc: the backticks below are markdown, and an
@@ -191,8 +214,15 @@ jobs:
           sed -i "s/__V__/$V/g" /tmp/notes.md
 
           # --generate-notes appends the auto-generated changelog after
-          # the notes file, so both are kept.
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "scrutiny-agent $GITHUB_REF_NAME" \
-            --notes-file /tmp/notes.md \
-            --generate-notes
+          # the notes file, so both are kept. A dispatched re-run for a
+          # tag whose release already exists replaces the assets
+          # instead of failing on the duplicate.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG exists; replacing its assets"
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "scrutiny-agent $RELEASE_TAG" \
+              --notes-file /tmp/notes.md \
+              --generate-notes
+          fi
