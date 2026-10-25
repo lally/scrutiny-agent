@@ -94,6 +94,7 @@ jobs:
         run: |
           git config --global user.name "CI"
           git config --global user.email "ci@example.com"
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends clangd python3-pylsp
           if command -v rustup >/dev/null 2>&1; then
             rustup component add rust-analyzer || true
@@ -153,7 +154,9 @@ jobs:
       # Emacs (the v0.2.3 release job died here with "emacs: command
       # not found"); emacs-nox is what ci.yml installs too.
       - name: Install Emacs
-        run: sudo apt-get install -y --no-install-recommends emacs-nox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends emacs-nox
 
       - name: Verify the package installs
         run: |
