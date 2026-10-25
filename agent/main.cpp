@@ -1100,10 +1100,11 @@ static json serializeFileDiffs(GMFileDiff* diffs, size_t count) {
 
 // git.checkoutBranch { path, branch } -> empty result on success;
 // JSON-RPC error envelope (kInternal + libgit2 reason) on failure.
-// The same SAFE strategy as on Mac — if the working tree has changes
-// that conflict with the target branch, libgit2 refuses rather than
-// overwriting. The error string is bubbled verbatim so the user
-// sees what's blocking the switch.
+// The same SAFE strategy as on Mac — the branch's tree is checked out
+// against the current HEAD as baseline, then HEAD moves; if the
+// working tree has edits that conflict with the target branch,
+// libgit2 refuses and nothing moves. The error string is bubbled
+// verbatim so the user sees what's blocking the switch.
 void handleCheckoutBranch(const Responder& rsp, const json& params) {
     auto bIt = params.find("branch");
     if (bIt == params.end() || !bIt->is_string()) {

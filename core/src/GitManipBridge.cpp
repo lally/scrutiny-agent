@@ -445,13 +445,23 @@ bool gm_repository_checkout_branch(GMRepository* repo, const char* branch) {
     try {
         std::string refname = "refs/heads/";
         refname += branch;
-        // Set HEAD to the branch ref, then materialize the working
-        // tree. gitmanip's checkout_head defaults to a SAFE strategy
-        // (force = false), which refuses to overwrite uncommitted
-        // changes. The caller surfaces that as an error rather than
-        // letting libgit2 silently destroy work.
+        // Materialize the branch's tree FIRST, then move HEAD. The
+        // SAFE strategy (force = false) measures "modified" against
+        // the checkout baseline, which is the current HEAD: files
+        // that still match the old commit are updated, files the user
+        // edited make libgit2 refuse (GIT_ECONFLICT, surfaced to the
+        // caller) and nothing moves. Doing it the other way round --
+        // set_head, then checkout_head -- was the 0.2.3 bug: with
+        // HEAD already on the new branch every file that differed
+        // between the two commits looked like a local modification,
+        // SAFE left all of them alone, and the clone ended up with
+        // HEAD on pr-N and the working tree and index still on main
+        // (an added file simply did not exist on disk).
+        const gitmanip::Oid target = repo->repo->resolve_ref(refname);
+        const gitmanip::Commit commit = repo->repo->lookup_commit(target);
+        const gitmanip::Tree tree = commit.tree();
+        repo->repo->checkout_tree(tree, /*force=*/false);
         repo->repo->set_head(refname);
-        repo->repo->checkout_head(/*force=*/false);
         return true;
     } catch (const std::exception& e) {
         set_error(e.what());

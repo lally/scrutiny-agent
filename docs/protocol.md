@@ -309,7 +309,7 @@ lines: [{ origin (1-char), content, oldLineNo, newLineNo }] }] }`.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `git.checkoutBranch` | `path`, `branch` | `{}` on success; `INTERNAL` with the libgit2 reason on refusal (SAFE checkout) |
+| `git.checkoutBranch` | `path`, `branch` | `{}` on success; `INTERNAL` with the libgit2 reason on refusal (SAFE checkout of the branch's tree against the current HEAD, then HEAD moves; a refusal moves nothing) |
 | `git.clone` | `fullName`, `cloneURL`, `installDir`, `authOpId` | `{ localPath, cloneURL, lastFetched }` — clones to `<installDir>/<fullName with / -> _>` |
 | `git.fetch` | `repoPath`, `authOpId` | `{ ok, lastFetched }` (`git fetch --all --prune`) |
 | `git.ensureRepository` | `fullName`, `cloneURL`, `installDir`, `authOpId` | `{ localPath, cloneURL, lastFetched }` — fetch if present else clone |

@@ -1,6 +1,6 @@
 .\" Manual page for scrutiny-agent(1).
 .\" Format with:  man ./scrutiny-agent.1  (macOS)   or   man -l scrutiny-agent.1  (Linux)
-.TH SCRUTINY-AGENT 1 "2026-10-24" "scrutiny-agent 0.2.3" "User Commands"
+.TH SCRUTINY-AGENT 1 "2026-10-25" "scrutiny-agent 0.2.4" "User Commands"
 .SH NAME
 scrutiny-agent \- remote git, filesystem and LSP backend for Scrutiny
 .SH SYNOPSIS
@@ -434,9 +434,11 @@ broker (see
 .B git.checkoutBranch
 .RI { path ", " branch }
 \(-> {}.
-A safe checkout; a refusal answers
+A safe checkout: the branch's tree is checked out against the current
+HEAD, then HEAD moves; a refusal (a local edit the switch would
+overwrite) answers
 .B INTERNAL
-with libgit2's reason.
+with libgit2's reason and moves nothing.
 .TP
 .B git.clone
 .RI { fullName ", " cloneURL ", " installDir ", " authOpId }
@@ -1083,7 +1085,7 @@ Check a freshly installed binary:
 .nf
 .RS
 $ scrutiny-agent \-\-version
-0.2.3 proto 1
+0.2.4 proto 1
 .RE
 .fi
 .PP

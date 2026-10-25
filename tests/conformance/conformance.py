@@ -463,12 +463,42 @@ def t_ahead_behind(ctx):
 
 @conformance("git.checkoutBranch")
 def t_checkout_branch(ctx):
-    repo, _, _ = ctx.fx.repo()
-    git(repo, "branch", "feature")
+    repo, _, parent = ctx.fx.repo()
+    path = os.path.join(repo, "file.txt")
+    # 'feature' sits at the parent commit, so its tree differs from
+    # 'work': the checkout has to change the working tree, not only
+    # HEAD. 0.2.3 moved HEAD first and then ran a SAFE checkout of
+    # HEAD, which saw every differing file as a local modification
+    # and left all of them alone -- a branch with the same tree (the
+    # old fixture) could not tell.
+    git(repo, "branch", "feature", parent)
     r = ctx.a.call("git.checkoutBranch", {"path": repo, "branch": "feature"})
     check(r == {}, "checkout success -> empty result object")
     m = ctx.a.call("git.repoMetadata", {"path": repo})
     check(m.get("currentBranch") == "feature", "HEAD moved to 'feature'")
+    with open(path) as f:
+        body = f.read()
+    check(body == "line1\nline2\n", "working tree holds feature's content")
+    check(git(repo, "status", "--porcelain", out=True) == "",
+          "index and working tree match the new HEAD")
+
+    r = ctx.a.call("git.checkoutBranch", {"path": repo, "branch": "work"})
+    check(r == {}, "and back")
+    with open(path) as f:
+        check(f.read() == "line1\nCHANGED\nline3\n", "work's content restored")
+
+    # A local edit that the switch would overwrite: SAFE refuses, and
+    # a refused checkout moves nothing (HEAD stays, the edit stays).
+    with open(path, "w") as f:
+        f.write("local edit\n")
+    e = ctx.a.call_error("git.checkoutBranch", {"path": repo, "branch": "feature"})
+    check(e.code == INTERNAL and str(e),
+          "conflicting edit -> INTERNAL 1000 with libgit2 reason")
+    m = ctx.a.call("git.repoMetadata", {"path": repo})
+    check(m.get("currentBranch") == "work", "refused checkout leaves HEAD alone")
+    with open(path) as f:
+        check(f.read() == "local edit\n", "refused checkout leaves the edit alone")
+
     e = ctx.a.call_error("git.checkoutBranch",
                          {"path": repo, "branch": "no-such-branch"})
     check(e.code == INTERNAL and str(e),

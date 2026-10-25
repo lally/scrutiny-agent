@@ -2,7 +2,7 @@
 
 ;; Author: Lally Singh
 ;; URL: https://github.com/five-rivers/scrutiny-agent
-;; Version: 0.2.3
+;; Version: 0.2.4
 ;; (The package's requirements are declared in scrutiny-agent.el;
 ;; a Package-Requires header outside the main file has no effect.)
 ;; Keywords: tools, languages
