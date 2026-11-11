@@ -42,12 +42,17 @@ for pair in linux/amd64:linux_amd64:x86_64 linux/arm64:linux_arm64:aarch64; do
         *) continue ;;
     esac
     echo "building scrutiny-agent ${AGENT_VERSION} for ${plat}"
+    # BUILDX_EXTRA_ARGS: extra flags for buildx, word-split on purpose
+    # (CI passes --cache-from/--cache-to type=gha so the apt and LLVM
+    # layers are fetched only when the Dockerfile changes).
+    # shellcheck disable=SC2086
     docker buildx build \
         --platform "${plat}" \
         --build-arg "AGENT_VERSION=${AGENT_VERSION}" \
         -f "${SCRIPT_DIR}/Dockerfile" \
         --target export \
         --output "type=local,dest=${OUT}/${subdir}" \
+        ${BUILDX_EXTRA_ARGS:-} \
         "${CTX}"
 done
 

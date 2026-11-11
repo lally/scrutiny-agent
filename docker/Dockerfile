@@ -40,7 +40,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 # stale Release date, and retry (snapshot rate-limits). All of this
 # exists to keep the glibc 2.31 floor; when the base moves to a
 # supported release, delete this block.
-RUN sed -i -e 's|^# deb http://snapshot|deb http://snapshot|' \
+# Every apt call in this image (llvm.sh's included) retries a failed
+# fetch and gives up on a dead connection, instead of failing the layer
+# on one DNS blip or hanging on a mirror that stops answering.
+RUN printf 'Acquire::Retries "3";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-scrutiny-retries \
+    && sed -i -e 's|^# deb http://snapshot|deb http://snapshot|' \
            -e 's|^deb http://deb.debian.org|# deb http://deb.debian.org|' /etc/apt/sources.list \
     && grep -q '^deb http://snapshot' /etc/apt/sources.list \
     && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' > /etc/apt/apt.conf.d/99-eol-suite
@@ -56,7 +61,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev 
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 3: Add LLVM apt repo (downloads GPG key and updates sources)
-RUN wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+RUN wget -q --tries=3 --waitretry=5 --timeout=30 -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && chmod +x /tmp/llvm.sh && /tmp/llvm.sh 17 all
 
 # Layer 4: LLVM toolchain (the big download, ~160MB)

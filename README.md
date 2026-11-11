@@ -179,7 +179,11 @@ The binaries are built inside a debian:11 image with clang-17/libc++
 
 - **ci.yml** — every push/PR builds natively on `ubuntu-24.04`
   (x86_64) and `ubuntu-24.04-arm` (aarch64), runs the unit tests and
-  the wire conformance suite.
+  the wire conformance suite. The toolchain is the runner image's own
+  (Clang, CMake, Python, Rust) plus Conan from PyPI; the one apt
+  transaction (clangd, Emacs) runs with the Azure mirror dropped from
+  the image's mirror list, retries and a transfer timeout, and the job
+  has a timeout, after runner DNS failures stalled a job for 85 minutes.
 - **release.yml** — pushing a tag `v<version>` builds the portable
   binaries per architecture, re-runs the conformance suite against the
   exact release artifacts (including the `.sha256` hash-gate and the
