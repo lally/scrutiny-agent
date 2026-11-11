@@ -66,3 +66,14 @@ target_include_directories(lsp_cache_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 add_test(NAME LSPCacheTests COMMAND lsp_cache_tests)
+
+add_executable(tree_watcher_tests tree_watcher_tests.cpp)
+target_link_libraries(tree_watcher_tests
+    PRIVATE
+        GitReviewCore
+)
+target_include_directories(tree_watcher_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+add_test(NAME TreeWatcherTests COMMAND tree_watcher_tests)

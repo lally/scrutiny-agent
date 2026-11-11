@@ -2,7 +2,7 @@
 
 ;; Author: Lally Singh
 ;; URL: https://github.com/five-rivers/scrutiny-agent
-;; Version: 0.2.4
+;; Version: 0.2.5
 ;; (The package's requirements are declared in scrutiny-agent.el;
 ;; a Package-Requires header outside the main file has no effect.)
 ;; Keywords: tools, vc, processes
@@ -411,8 +411,17 @@ on a plain commit, which moves the branch ref rather than HEAD."
   (plist-get (scrutiny-agent-request conn "watch.head" (list :path path))
              :watchId))
 
+(defun scrutiny-agent-ops-watch-tree (conn path)
+  "Watch the working tree under PATH; return the watchId.
+Fires `watch.treeChanged' with the root-relative `:paths' an external
+edit touched (coalesced; never anything under .git or anything the
+repository's ignore rules cover), or `:reset' t when the agent could
+not name the change and the whole tree should be re-read."
+  (plist-get (scrutiny-agent-request conn "watch.tree" (list :path path))
+             :watchId))
+
 (defun scrutiny-agent-ops-watch-stop (conn watch-id)
-  "Stop watch WATCH-ID (notification; no reply)."
+  "Stop watch WATCH-ID, of either kind (notification; no reply)."
   (scrutiny-agent-notify conn "watch.stop" (list :watchId watch-id)))
 
 ;; ---------------------------------------------------------------------

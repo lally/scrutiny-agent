@@ -1260,6 +1260,49 @@ def t_watch_head(ctx):
           "watch.head on a non-repo -> NOT_FOUND 1001")
 
 
+@conformance("watch.tree")
+def t_watch_tree(ctx):
+    repo, _, _ = ctx.fx.repo()
+    with open(os.path.join(repo, ".gitignore"), "w") as f:
+        f.write("build/\n")
+    os.mkdir(os.path.join(repo, "build"))
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-q", "-m", "ignore")
+    r = ctx.a.call("watch.tree", {"path": repo})
+    wid = r.get("watchId")
+    check(isinstance(wid, str) and wid, "watch.tree returns a watchId")
+    time.sleep(0.4)   # let the platform watch arm
+    # One burst: an ordinary edit, a .git write, an ignored write.
+    with open(os.path.join(repo, "file.txt"), "a") as f:
+        f.write("edited\n")
+    with open(os.path.join(repo, ".git", "conf-scratch"), "w") as f:
+        f.write("x\n")
+    with open(os.path.join(repo, "build", "out.o"), "w") as f:
+        f.write("obj\n")
+    note = ctx.a.wait_notification(
+        "watch.treeChanged",
+        lambda p: p.get("watchId") == wid and "file.txt" in p.get("paths", []),
+        timeout=15)
+    check(note is not None,
+          "an edit under the tree fires watch.treeChanged naming the file")
+    if note is not None:
+        check(note.get("reset") is False, "a small burst is named, not reset")
+        check(note["paths"] == sorted(set(note["paths"])),
+              "paths are sorted and de-duplicated")
+        check(not any(p.startswith(".git") for p in note["paths"]),
+              ".git contents are not reported")
+        check("build/out.o" not in note["paths"] and "build" not in note["paths"],
+              "git-ignored paths are not reported")
+    ctx.a.notify("watch.stop", {"watchId": wid})
+    check(ctx.a.call("meta.debug", {"padBytes": 4}).get("pad") == "xxxx",
+          "agent healthy after watch.stop on a tree watch")
+    nofile = os.path.join(repo, "file.txt")
+    check(ctx.a.call_error("watch.tree", {"path": nofile}).code == NOT_FOUND,
+          "watch.tree on a file -> NOT_FOUND 1001")
+    check(ctx.a.call_error("watch.tree", {}).code == INVALID_REQUEST,
+          "watch.tree without path -> INVALID_REQUEST 1002")
+
+
 # ---- cred.* ----------------------------------------------------------
 @conformance("cred.provide")
 def t_cred_roundtrip(ctx):
@@ -1501,6 +1544,9 @@ def protocol_fs_sandbox(agent_path):
         check(scoped.call_error(
             "fs.listDirectory", {"path": sb_secret}).code == PERMISSION_DENIED,
             "sibling-tree listDirectory -> PERMISSION_DENIED 1005")
+        check(scoped.call_error(
+            "watch.tree", {"path": sb_secret}).code == PERMISSION_DENIED,
+            "sibling-tree watch.tree -> PERMISSION_DENIED 1005")
     finally:
         scoped.close()
 
@@ -1513,12 +1559,17 @@ def protocol_fs_sandbox(agent_path):
     cfg_path = os.path.join(cfg_dir, "scrutiny-agent.conf")
     with open(cfg_path, "w") as f:
         f.write("# written by the conformance suite\n"
-                "allow-root = %s   # trailing comment\n" % sb_allowed)
+                "allow-root = %s   # trailing comment\n"
+                "scrutiny-managed = true\n" % sb_allowed)
     from_file = Agent(agent_path, extra_args=["--config", cfg_path])
     try:
         check(from_file.call("fs.readFile",
                              {"path": ok_file}).get("content") == "inside\n",
               "root from the config file admits an inside read")
+        hello = from_file.call("meta.hello", {"clientVersion": "conformance",
+                                              "supportedProtocolVersions": [1]})
+        check(hello.get("config", {}).get("scrutinyManaged") is True,
+              "hello reports scrutiny-managed = true from the config file")
         check(from_file.call_error(
             "fs.readFile", {"path": secret_file}).code == PERMISSION_DENIED,
             "config-file sandbox still denies a sibling tree")
@@ -1539,6 +1590,10 @@ def protocol_fs_sandbox(agent_path):
             "fileSystemAccess", {}).get("allowedRoots")
         check(bool(roots), "missing config file -> agent runs with the "
                            "default $HOME floor")
+        hello = missing.call("meta.hello", {"clientVersion": "conformance",
+                                            "supportedProtocolVersions": [1]})
+        check(hello.get("config", {}).get("scrutinyManaged") is False,
+              "no config file -> scrutinyManaged defaults to false")
     finally:
         missing.close()
         shutil.rmtree(cfg_dir, ignore_errors=True)

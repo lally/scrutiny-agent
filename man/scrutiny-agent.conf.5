@@ -227,6 +227,19 @@ A relative
 is anchored under
 .BR $HOME .
 There is no cycle detection; do not include a file from itself.
+.TP
+.BI scrutiny\-managed " = true|false"
+Who owns this file.
+.B true
+means the Scrutiny client wrote it and rewrites it from its own
+settings on every connection; absent or
+.B false
+(the default) means the file is the host's and Scrutiny only reads it
+(see
+.BR "CLIENTS THAT WRITE THIS FILE" ).
+The agent reports the value in the hello facts as
+.B config.scrutinyManaged
+and does nothing else with it.
 .SH PRESETS
 .TP
 .B read\-only
@@ -320,15 +333,17 @@ on every invocation, so refusing
 .B \-c
 outright would mean refusing magit.
 .SH CLIENTS THAT WRITE THIS FILE
-The file is normally generated, and its comments say by whom.
+The file is normally generated, and the
+.B scrutiny\-managed
+key says by whom.
 .TP
 .B Scrutiny
 (Settings > Remote Hosts) renders the host's saved settings into
 .IB installDir /scrutiny-agent.conf
-on every connection, hash-gated like the binary, and starts the agent
-with
+and starts the agent with
 .BR "\-\-config " "that file."
 It writes
+.BR "scrutiny\-managed = true" ,
 .B allow\-root
 lines (the host's Allowed directories), a
 .B git\-exec\-preset
@@ -337,9 +352,14 @@ line when git commands via the agent are enabled, and
 /
 .B log\-level
 when logging is on.
-The Mac is the source of truth: hand edits to a Scrutiny-managed file
-are overwritten at the next connection.
-Change the host in Scrutiny instead.
+It rewrites the file on every connection only while the file says
+.BR "scrutiny\-managed = true" ;
+the Mac is then the source of truth and hand edits are overwritten.
+A file without that key, or with it false, is the host's: Scrutiny
+never writes it, starts the agent with it as is, and reports in its
+host settings which of them the file does not cover and the exact
+line that would.
+Set the key to false, or delete it, to take a file over.
 .TP
 .B Emacs
 .RB ( scrutiny-agent-remote-setup )

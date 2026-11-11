@@ -649,6 +649,14 @@ struct Responder {
 // any worker starts, read-only thereafter.
 bool g_allowWrite = false;
 
+// `scrutiny-managed = true` in the config file: the Scrutiny client
+// wrote it and rewrites it from its settings on every connection. Absent
+// or false (the default) the file belongs to the host and that client
+// only reads it. The agent does nothing with it but report it in the
+// hello facts; the key exists so a config file can say who owns it in
+// the format the agent reads, rather than in a comment.
+bool g_scrutinyManaged = false;
+
 // The git subcommands `git.exec` will run, from --git-exec /
 // --git-exec-preset. Empty (the default) means git.exec is disabled and
 // is not advertised in meta.hello. Written once in main() before any
@@ -759,6 +767,7 @@ void handleHello(const Responder& rsp, const json& params) {
                                                   "index.cancel",
                                                   "index.destroy",
                                                   "watch.head",
+                                                  "watch.tree",
                                                   "watch.stop",
                                                   "git.clone",
                                                   "git.fetch",
@@ -4205,7 +4214,8 @@ void handleIndexDestroy(const Responder& rsp, const json& p) {
 // thread -> g_writer.enqueue is thread-safe (single writer drains).
 
 struct WatchEntry {
-    GRCWatch* w = nullptr;
+    GRCWatch* w = nullptr;        // watch.head
+    GRCTreeWatch* tw = nullptr;   // watch.tree
     std::string watchId;
 };
 std::mutex g_watchMu;
@@ -4249,6 +4259,66 @@ void handleWatchHead(const Responder& rsp, const json& p) {
     rsp.result(json{{"watchId", id}});
 }
 
+// ---- Working-tree watch (grc_watch_tree_*) ----------------------------
+//
+// watch.tree { path } -> { watchId }: every external edit under `path`
+// (an editor on the host, a build, a checkout) streams a coalesced
+// watch.treeChanged { watchId, paths, reset } naming the root-relative
+// paths that changed, so the client refreshes the one file it shows
+// and the directory it lists rather than everything it holds. Core
+// drops `.git` and git-ignored paths before they get here. `reset`
+// means "too much to name; re-read what you hold". Same registry and
+// watch.stop as the HEAD watch. The path goes through the fs sandbox
+// like fs.listDirectory: a tree's names are a listing.
+void watchTreeCb(void* ctxv, const char* const* paths, int count, int reset) {
+    auto* e = static_cast<WatchEntry*>(ctxv);
+    json list = json::array();
+    for (int i = 0; i < count; ++i) list.push_back(paths[i]);
+    json note = {{"jsonrpc", "2.0"},
+                 {"method", "watch.treeChanged"},
+                 {"params", {{"watchId", e->watchId},
+                             {"paths", std::move(list)},
+                             {"reset", reset != 0}}}};
+    g_writer.enqueue(Lane::Interactive, dumpSafe(note));
+    if (logOn(LogLevel::Debug))
+        logWrite(LogLevel::Debug, "watch.treeChanged id=" + e->watchId +
+                                      " paths=" + std::to_string(count) +
+                                      (reset ? " reset" : ""));
+}
+
+void handleWatchTree(const Responder& rsp, const json& p) {
+    std::string path;
+    if (!reqStr(rsp, p, "path", "watch.tree", path)) return;
+    int code = 0;
+    std::string err;
+    auto canon = resolveAndAuthorize(path, code, err);
+    if (!canon) {
+        rsp.error(code, err);
+        return;
+    }
+    const std::string id = "w-" + std::to_string(g_watchSeq.fetch_add(1) + 1);
+    auto e = std::make_unique<WatchEntry>();
+    e->watchId = id;
+    WatchEntry* ptr = e.get();
+    {
+        std::lock_guard<std::mutex> g(g_watchMu);
+        g_watches.emplace(id, std::move(e));
+    }
+    GRCTreeWatch* w = grc_watch_tree_create(canon->c_str(), watchTreeCb, ptr);
+    if (w == nullptr) {
+        std::lock_guard<std::mutex> g(g_watchMu);
+        g_watches.erase(id);
+        rsp.error(kNotFound,
+                  "could not watch the tree at '" + *canon +
+                      "' (not a directory)");
+        return;
+    }
+    ptr->tw = w;
+    if (logOn(LogLevel::Info))
+        logWrite(LogLevel::Info, "watch.tree id=" + id + " path='" + *canon + "'");
+    rsp.result(json{{"watchId", id}});
+}
+
 // Stop+destroy a watch by id (joins the Core watcher thread; prompt via
 // its self-pipe). Shared by the watch.stop notification and shutdown.
 void stopWatch(const std::string& id) {
@@ -4260,7 +4330,9 @@ void stopWatch(const std::string& id) {
         e = std::move(it->second);
         g_watches.erase(it);
     }
-    grc_watch_destroy(e->w);  // outside the registry lock (it joins)
+    // Outside the registry lock (both join their watcher thread).
+    if (e->w != nullptr) grc_watch_destroy(e->w);
+    if (e->tw != nullptr) grc_watch_tree_destroy(e->tw);
     if (logOn(LogLevel::Info))
         logWrite(LogLevel::Info, "watch.stop id=" + id);
 }
@@ -5043,7 +5115,8 @@ void addHelloFacts(json& hello) {
                                      {"writable", g_allowWrite},
                                      {"home", remoteHome()}};
     hello["config"] = json{{"loaded", g_configLoaded},
-                           {"unreadable", g_configUnreadable}};
+                           {"unreadable", g_configUnreadable},
+                           {"scrutinyManaged", g_scrutinyManaged}};
     json features = json::array();
     for (const char* f : kFeatures) features.push_back(f);
     hello["features"] = features;
@@ -5284,6 +5357,8 @@ void dispatch(const std::string& method, const Responder& rsp, const json& param
         handleIndexDestroy(rsp, params);
     } else if (method == "watch.head") {
         handleWatchHead(rsp, params);
+    } else if (method == "watch.tree") {
+        handleWatchTree(rsp, params);
     } else if (method == "git.clone") {
         handleGitClone(rsp, params);
     } else if (method == "git.fetch") {
@@ -5534,7 +5609,8 @@ struct StartupOptions {
 };
 
 bool optionIsBoolean(const std::string& key) {
-    return key == "allow-write" || key == "git-exec-editor";
+    return key == "allow-write" || key == "git-exec-editor" ||
+           key == "scrutiny-managed";
 }
 
 // Apply one setting. Returns false with a reason for anything unknown;
@@ -5547,6 +5623,10 @@ bool applyOption(const std::string& key, const std::string& value,
     if (key == "allow-root") { opts.allowedRoots.push_back(value); return true; }
     if (key == "allow-write") {
         g_allowWrite = !(value == "false" || value == "no" || value == "0");
+        return true;
+    }
+    if (key == "scrutiny-managed") {
+        g_scrutinyManaged = !(value == "false" || value == "no" || value == "0");
         return true;
     }
     if (key == "git-exec") { g_gitExecAllowed.push_back(value); return true; }
@@ -5683,6 +5763,10 @@ int main(int argc, char** argv) {
                 "                           git.exec; repeatable\n"
                 "  --git-exec-preset <name> read-only | magit\n"
                 "  --git-exec-config <key>  extra `-c' key git.exec may set\n"
+                "  --scrutiny-managed       config-file key: Scrutiny wrote the file\n"
+                "                           and rewrites it from its settings; absent\n"
+                "                           or false, the file is the host's and\n"
+                "                           Scrutiny only reads it\n"
                 "  --log <path>             write a log file\n"
                 "  --log-level <level>      off|error|warn|info|debug|trace\n"
                 "  --version                print '<version> proto <n>'\n"
@@ -5870,8 +5954,9 @@ int main(int argc, char** argv) {
                  "draining workers");
     g_queue.stop();
     for (auto& t : pool) t.join();
-    // Stop all HEAD watches (joins their Core threads) BEFORE the writer
-    // exits, so no watcher thread can enqueue onto a stopped writer.
+    // Stop all HEAD and tree watches (joins their Core threads) BEFORE
+    // the writer exits, so no watcher thread can enqueue onto a stopped
+    // writer.
     {
         std::vector<std::string> ids;
         {

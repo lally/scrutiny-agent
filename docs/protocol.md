@@ -20,7 +20,8 @@ scrutiny-agent --rpc-stdio [--config <path>] [--log <path>] [--log-level <lvl>]
 `--config <path>` reads settings from a file: one `key = value` per
 line, `#` to end of line for comments, a bare `key` meaning true.
 Every flag above has a config key with the same name minus the
-leading dashes (`allow-root`, `allow-write`, `git-exec-preset`, …),
+leading dashes (`allow-root`, `allow-write`, `git-exec-preset`,
+`scrutiny-managed`, …),
 and repeatable flags accumulate. Flags and file feed the same table,
 so neither can gain an option the other lacks; both apply, in the
 order they are read. Relative config paths anchor under `$HOME`. An
@@ -181,7 +182,7 @@ first round trips discovering:
 ```
   features: [...],                       // see below
   fileSystemAccess: { allowedRoots, allowedRootsAsGiven, writable, home },
-  config: { loaded, unreadable },        // was a --config file read?
+  config: { loaded, unreadable, scrutinyManaged },  // was a --config file read?
   encoding?: "deflate"                   // only when negotiated
 ```
 
@@ -201,6 +202,13 @@ before relying on it; an agent without `features` has none of them.
 | `git.exec.stdin`, `git.exec.env` | `stdinBase64` and `env` on `git.exec` |
 | `rpc.deflate` | the agent can compress (see *Compression*) |
 | `lsp.tunnelSend.eof` | `eof: true` half-closes a tunnel's stdin |
+
+`config.scrutinyManaged` echoes the file's `scrutiny-managed` key
+(default false): true means the Scrutiny client wrote the file and
+rewrites it from its settings on every connection; absent or false,
+the file belongs to the host and that client only reads it (and
+reports what its settings would need). The agent does nothing else
+with the key.
 
 `config.loaded: false` with a client that believes it sent a config is
 the single most consequential misconfiguration there is: the agent is
@@ -603,13 +611,31 @@ is the convention).
 | Method | Params | Result |
 | --- | --- | --- |
 | `watch.head` | `path` | `{ watchId }` |
+| `watch.tree` | `path` | `{ watchId }` |
 | `watch.stop` | notification: `watchId` | — |
 
-The watcher observes the clone's **resolved `.git/HEAD` file**
+The HEAD watcher observes the clone's **resolved `.git/HEAD` file**
 (worktree `gitdir:` pointers followed): it fires a debounced
 `watch.headChanged { watchId }` notification on checkout / branch
 switch / rebase / clone-level HEAD rewrites. A plain commit moves the
 branch ref, not the HEAD file, and does not fire.
+
+The tree watcher observes **every file under `path`** (recursively)
+and streams `watch.treeChanged { watchId, paths, reset }`: `paths` are
+the root-relative, `/`-separated, sorted, de-duplicated paths an
+external edit touched, coalesced over a ~250 ms quiet window and held
+at most ~1 s. Paths under `.git` (at any depth) and paths the
+repository's ignore rules cover are never reported: an index rewrite
+or a build-tree write is not an edit. `reset: true` (with `paths`
+empty) means the change could not be named -- kernel event overflow,
+more than 256 paths in one burst, the root replaced -- and the client
+re-reads whatever it holds. `path` goes through the fs sandbox like
+`fs.listDirectory` (a tree's names are a listing); a path outside the
+allowed roots is `PERMISSION_DENIED`, a non-directory `NOT_FOUND`.
+Linux watches one inotify descriptor per directory (ignored and
+`.git` directories are not watched; past 32768 directories the rest
+of the tree is not watched either); Darwin uses FSEvents. One
+`watch.stop` ends either kind.
 
 ### cred.*
 
@@ -636,6 +662,7 @@ immutable so there is no invalidation, only mtime-based pruning.
 | `rpc.chunk` | `{ id, seq, last, data }` | response body exceeds the frame cap |
 | `index.progress` | `{ indexerId, filePath, current, total }` | during `index.run` (coalesced ≈ per percent) |
 | `watch.headChanged` | `{ watchId }` | watched HEAD file changed |
+| `watch.treeChanged` | `{ watchId, paths, reset }` | files under a watched tree changed (see `watch.tree`) |
 | `cred.request` | `{ authOpId, credId, prompt }` | git prompts during a brokered op |
 | `lsp.tunnelRecv` | `{ tunnelId, data, z? }` | server → client bytes on an open tunnel (LSP server or `git.spawn` command) |
 | `fs.changed` | see *Directory watches* | a watched directory changed |

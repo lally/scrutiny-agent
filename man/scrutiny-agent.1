@@ -1,6 +1,6 @@
 .\" Manual page for scrutiny-agent(1).
 .\" Format with:  man ./scrutiny-agent.1  (macOS)   or   man -l scrutiny-agent.1  (Linux)
-.TH SCRUTINY-AGENT 1 "2026-10-25" "scrutiny-agent 0.2.4" "User Commands"
+.TH SCRUTINY-AGENT 1 "2026-11-05" "scrutiny-agent 0.2.5" "User Commands"
 .SH NAME
 scrutiny-agent \- remote git, filesystem and LSP backend for Scrutiny
 .SH SYNOPSIS
@@ -272,6 +272,11 @@ at bootstrap and start the agent with
 .B \-\-config
 pointing at it, so the policy lives on the host and every client using
 that install directory agrees on it.
+Scrutiny writes
+.B scrutiny\-managed = true
+into the files it generates and never rewrites a file that does not
+say so; the agent reports the key in the hello facts and does nothing
+else with it.
 .SH OPERATIONS
 Requests are JSON-RPC 2.0 objects whose
 .B method
@@ -777,9 +782,38 @@ pointers followed) and emits a debounced
 on checkout, branch switch, rebase or any other rewrite of HEAD.
 A plain commit moves the branch ref, not HEAD, and does not fire.
 .TP
+.B watch.tree
+.RI { path }
+\(->
+.RI { watchId }.
+Observes every file under
+.I path
+(recursively) and emits a coalesced
+.B watch.treeChanged
+.RI { watchId ", " paths ", " reset }
+naming the root-relative paths an external edit touched (sorted,
+de-duplicated, held for a ~250 ms quiet window and at most ~1 s).
+Paths under
+.I .git
+and paths the repository's ignore rules cover are never reported.
+.I reset
+true (with
+.I paths
+empty) means the change could not be named -- kernel event overflow,
+more than 256 paths in one burst, the root replaced -- and the client
+re-reads what it holds.
+.I path
+goes through the fs sandbox like
+.BR fs.listDirectory .
+Linux watches one inotify descriptor per directory (ignored and
+.I .git
+directories are not watched; past 32768 directories the rest of the
+tree is not watched either); Darwin uses FSEvents.
+.TP
 .B watch.stop
 (notification)
 .RI { watchId }.
+Ends a HEAD or tree watch.
 .SS Credentials
 .TP
 .B cred.provide
@@ -830,6 +864,10 @@ during
 .TP
 .B watch.headChanged
 when a watched HEAD changes.
+.TP
+.B watch.treeChanged
+.RI { watchId ", " paths ", " reset }
+when files under a watched tree change.
 .TP
 .B cred.request
 .RI { authOpId ", " credId ", " prompt }
@@ -1085,7 +1123,7 @@ Check a freshly installed binary:
 .nf
 .RS
 $ scrutiny-agent \-\-version
-0.2.4 proto 1
+0.2.5 proto 1
 .RE
 .fi
 .PP

@@ -135,6 +135,9 @@ The agent takes its settings from flags and/or a config file
 allow-root = src          # filesystem sandbox; relative anchors under $HOME
 allow-write               # enable the fs write surface (off by default)
 git-exec-preset = magit   # allowlist for git.exec (off by default)
+scrutiny-managed = true   # Scrutiny wrote this file and rewrites it from
+                          # its settings; absent or false: the host's file,
+                          # which Scrutiny only reads
 log-level = info
 ```
 

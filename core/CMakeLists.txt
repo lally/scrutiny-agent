@@ -14,6 +14,7 @@ add_library(GitReviewCore STATIC
     src/indexer/Indexer.cpp
     src/fs/FileSystem.cpp
     src/fs/HeadWatcher.cpp
+    src/fs/TreeWatcher.cpp
     src/GitManipBridge.cpp
 )
 
@@ -40,6 +41,12 @@ target_link_libraries(GitReviewCore
 
 if(NOT APPLE AND UNIX)
     target_link_libraries(GitReviewCore PRIVATE pthread)
+endif()
+
+# The working-tree watch is FSEvents on Darwin. PUBLIC so the agent,
+# the tests and the Mac app's link line all pick the framework up.
+if(APPLE)
+    target_link_libraries(GitReviewCore PUBLIC "-framework CoreServices")
 endif()
 
 set_target_properties(GitReviewCore PROPERTIES

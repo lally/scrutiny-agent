@@ -497,6 +497,37 @@ GRCWatch* grc_watch_head_create(const char* clone_path,
 void grc_watch_destroy(GRCWatch* watch);
 
 // ============================================================================
+// Working-tree watch API
+// ============================================================================
+//
+// Watches every file under `root_path` (recursively) for external
+// edits -- an editor, a build, a `git checkout` -- and fires
+// `callback(context, paths, count, reset)` from a Core-managed
+// background thread with the root-relative, '/'-separated, sorted and
+// de-duplicated paths that changed, coalesced over a ~250 ms quiet
+// window (never held longer than ~1 s). `reset` is 1 when the change
+// cannot be named (kernel event overflow, more than 256 paths in one
+// burst, a watched directory replaced): `count` is 0 and the caller
+// re-reads whatever it holds. Paths under `.git` (at any depth, so a
+// submodule's too) and paths git ignores (per the repository's ignore
+// rules, when `root_path` is a working tree) are never reported: an
+// index rewrite or a build-tree write is not an edit the user made.
+// Linux uses inotify (one watch per directory; ignored and `.git`
+// directories are not watched, and past 32768 directories the rest of
+// the tree is not watched either), Darwin FSEvents. Returns NULL if
+// `root_path` is not a directory. `grc_watch_tree_destroy` stops the
+// thread and is idempotent; it returns promptly even mid-burst.
+typedef struct GRCTreeWatch GRCTreeWatch;
+typedef void (*GRCTreeChangeCallback)(void* context,
+                                      const char* const* paths,
+                                      int count, int reset);
+
+GRCTreeWatch* grc_watch_tree_create(const char* root_path,
+                                    GRCTreeChangeCallback callback,
+                                    void* context);
+void grc_watch_tree_destroy(GRCTreeWatch* watch);
+
+// ============================================================================
 // Full Index API
 // ============================================================================
 

@@ -2,7 +2,7 @@
 
 ;; Author: Lally Singh
 ;; URL: https://github.com/five-rivers/scrutiny-agent
-;; Version: 0.2.4
+;; Version: 0.2.5
 ;; (The package's requirements are declared in scrutiny-agent.el;
 ;; a Package-Requires header outside the main file has no effect.)
 ;; Keywords: tools, processes
@@ -597,16 +597,23 @@ ends the run."
         (ignore-errors (scrutiny-agent-tunnel-close tunnel))))))
 
 (defun scrutiny-agent-verify--watch (conn repo)
-  (scrutiny-agent-verify--check '("watch.head" "watch.stop")
+  (scrutiny-agent-verify--check '("watch.head" "watch.tree" "watch.stop")
     (unless repo (scrutiny-agent-verify--skip "no repository given"))
-    (let ((watch-id (scrutiny-agent-ops-watch-head conn repo)))
+    (let ((watch-id (scrutiny-agent-ops-watch-head conn repo))
+          (tree-id (scrutiny-agent-ops-watch-tree conn repo)))
       (scrutiny-agent-verify--expect
        (stringp watch-id) "watch.head returned %S" watch-id)
+      (scrutiny-agent-verify--expect
+       (stringp tree-id) "watch.tree returned %S" tree-id)
+      (scrutiny-agent-verify--expect
+       (not (equal watch-id tree-id)) "the two watches share id %s" watch-id)
       (scrutiny-agent-ops-watch-stop conn watch-id)
+      (scrutiny-agent-ops-watch-stop conn tree-id)
       ;; Confirm the connection is still healthy after the stop
-      ;; notification, which is the only observable the client gets.
+      ;; notifications, which are the only observable the client gets.
       (scrutiny-agent-ops-debug conn 4)
-      (format "watch %s started and stopped" watch-id))))
+      (format "watches %s (HEAD) and %s (tree) started and stopped"
+              watch-id tree-id))))
 
 (defun scrutiny-agent-verify--index (conn workspace language write)
   (scrutiny-agent-verify--check

@@ -320,6 +320,34 @@
       ;; The connection stays healthy after a stop notification.
       (should (scrutiny-agent-ops-debug conn 4)))))
 
+;; The working-tree watch names what changed: an external write lands
+;; as `watch.treeChanged' with the root-relative path, and the
+;; repository's own bookkeeping under .git is never reported.
+(scrutiny-agent-ui-tests--deftest scrutiny-agent-ops-watch-tree-integration
+  (scrutiny-agent-ui-tests--with-agent (conn repo)
+    (let* ((seen nil)
+           (watch-id (scrutiny-agent-ops-watch-tree conn repo))
+           (scrutiny-agent-notification-functions
+            (list (lambda (_c method params)
+                    (when (and (equal method "watch.treeChanged")
+                               (equal (plist-get params :watchId) watch-id))
+                      ;; JSON arrays arrive as vectors; keep a list.
+                      (setq seen (append seen (plist-get params :paths) nil)))))))
+      (should (stringp watch-id))
+      (let ((deadline (+ (float-time) 1)))
+        (while (< (float-time) deadline) (accept-process-output nil 0.05)))
+      (with-temp-file (expand-file-name ".git/scratch-note" repo)
+        (insert "bookkeeping\n"))
+      (with-temp-file (expand-file-name "fresh.txt" repo)
+        (insert "written from outside\n"))
+      (let ((deadline (+ (float-time) 20)))
+        (while (and (not (member "fresh.txt" seen)) (< (float-time) deadline))
+          (accept-process-output nil 0.05)))
+      (should (member "fresh.txt" seen))
+      (should-not (cl-some (lambda (p) (string-prefix-p ".git" p)) seen))
+      (scrutiny-agent-ops-watch-stop conn watch-id)
+      (should (scrutiny-agent-ops-debug conn 4)))))
+
 ;; ---------------------------------------------------------------------
 ;; ops: LSP (skips cleanly with no server installed)
 ;; ---------------------------------------------------------------------

@@ -27,7 +27,6 @@
 
 FROM buildpack-deps:bullseye AS build
 
-ARG AGENT_VERSION=0.1.0
 ENV DEBIAN_FRONTEND=noninteractive
 
 # bullseye is past end of life. deb.debian.org has dropped the
@@ -95,6 +94,11 @@ RUN conan profile detect --force \
 ENV SCRUTINY_CXX_STATIC="-nostdlib++ -static-libgcc -fuse-ld=lld -l:libc++.a -l:libc++abi.a -lpthread -ldl -lm"
 
 COPY . /src
+# Declared here, not at the top: a build arg invalidates every layer
+# after its declaration, so with it first a version bump re-ran the
+# apt and LLVM layers against snapshot.debian.org (slow, and it times
+# out). Only the compile layer depends on the version.
+ARG AGENT_VERSION=0.1.0
 
 # `--build="*"` (build EVERYTHING from source, incl. tool_requires like
 # b2): Conan Center's prebuilt binaries are built on newer glibc and

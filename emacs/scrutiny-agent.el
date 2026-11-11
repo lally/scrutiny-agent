@@ -2,7 +2,7 @@
 
 ;; Author: Lally Singh
 ;; URL: https://github.com/five-rivers/scrutiny-agent
-;; Version: 0.2.4
+;; Version: 0.2.5
 ;; Package-Requires: ((emacs "29.1"))
 ;;
 ;; 29.1 is the PACKAGE's floor, because scrutiny-agent-ui.el uses
@@ -76,7 +76,7 @@ integration).  PLIST keys:
                  sends none."
   :type '(alist :key-type string :value-type plist))
 
-(defcustom scrutiny-agent-binary-version "0.2.4"
+(defcustom scrutiny-agent-binary-version "0.2.5"
   "Release version of the agent binary to bootstrap onto remotes."
   :type 'string)
 
@@ -130,9 +130,9 @@ string fails the underlying git operation."
 Each function is called with (CONN METHOD PARAMS).  The client
 handles `rpc.chunk', `cred.request' and the `lsp.tunnel*' family
 itself; those are dispatched first and are not offered here.  The
-remaining ones -- `watch.headChanged', `index.progress' -- are how
-the agent tells a client that remote state moved, so a UI can react
-instead of polling.")
+remaining ones -- `watch.headChanged', `watch.treeChanged',
+`index.progress' -- are how the agent tells a client that remote
+state moved, so a UI can react instead of polling.")
 
 (defvar scrutiny-agent-notification-handlers nil
   "Alist of (METHOD . FUNCTION) for notifications with a dedicated consumer.

@@ -2,7 +2,7 @@
 
 ;; Author: Lally Singh
 ;; URL: https://github.com/five-rivers/scrutiny-agent
-;; Version: 0.2.4
+;; Version: 0.2.5
 ;; (The package's requirements are declared in scrutiny-agent.el;
 ;; a Package-Requires header outside the main file has no effect.)
 ;; Keywords: tools, vc, processes
@@ -776,6 +776,17 @@ commit, which moves the branch ref rather than the HEAD file."
             (entry (assoc watch-id scrutiny-agent-ui--watches)))
        (message "scrutiny-agent: HEAD changed in %s"
                 (if entry (cddr entry) watch-id))))
+    ("watch.treeChanged"
+     (let* ((watch-id (plist-get params :watchId))
+            (entry (assoc watch-id scrutiny-agent-ui--watches))
+            (paths (plist-get params :paths))
+            (where (if entry (cddr entry) watch-id)))
+       (if (eq (plist-get params :reset) t)
+           (message "scrutiny-agent: working tree changed in %s (re-read it)"
+                    where)
+         (message "scrutiny-agent: %d file%s changed in %s: %s"
+                  (length paths) (if (= (length paths) 1) "" "s") where
+                  (mapconcat #'identity (seq-take paths 5) " ")))))
     ("index.progress"
      (let ((current (plist-get params :current))
            (total (plist-get params :total)))
